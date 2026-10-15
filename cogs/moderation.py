@@ -244,7 +244,8 @@ class ModerationCog(commands.Cog, name="Moderation"):
         review_message: discord.Message,
     ) -> None:
         """Executes publishing via webhook, calculates expiry, updates DB and notifies user."""
-        await interaction.response.defer(ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
 
         submission = await self.bot.db.get_submission(submission_id)
         if not submission or submission.get("status") != "PENDING":
