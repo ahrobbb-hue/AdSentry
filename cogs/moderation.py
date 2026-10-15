@@ -324,22 +324,37 @@ class ModerationCog(commands.Cog, name="Moderation"):
         except Exception as e:
             logger.error(f"Failed to persist approval state to Supabase: {e}", exc_info=True)
 
-        # Notify submitter via DM
+        # Notify submitter via DM in their preferred language
         try:
             user = await self.bot.fetch_user(submission["user_id"])
             if user:
-                expiry_text = f"<t:{int(expires_at.timestamp())}:F>" if expires_at else "Permanent (No Expiry)"
-                dm_embed = discord.Embed(
-                    title="🎉 Your Advertisement Has Been Approved!",
-                    description=(
-                        f"Great news! Your ad **{submission.get('title')}** has been approved and published to {announcement_channel.mention}.\n\n"
-                        f"**Category:** {submission.get('category')}\n"
-                        f"**Duration / Expiry:** {expiry_text}\n"
-                        f"**Link to Ad:** [View Announcement]({published_msg.jump_url})"
-                    ),
-                    color=discord.Color.green(),
-                )
-                dm_embed.set_footer(text="AdSentry Notification Service")
+                is_arabic = (submission.get("language") == "ar") or any('\u0600' <= c <= '\u06FF' for c in (submission.get("category") or ""))
+                if is_arabic:
+                    expiry_text = f"<t:{int(expires_at.timestamp())}:F>" if expires_at else "دائم (بدون انتهاء)"
+                    dm_embed = discord.Embed(
+                        title="🎉 تمت الموافقة على إعلانك!",
+                        description=(
+                            f"أخبار سارة! تمت الموافقة على إعلانك **{submission.get('title')}** ونشره في {announcement_channel.mention}.\n\n"
+                            f"**القسم:** {submission.get('category')}\n"
+                            f"**مدة النشر:** {expiry_text}\n"
+                            f"**رابط الإعلان:** [عرض الإعلان في القناة]({published_msg.jump_url})"
+                        ),
+                        color=discord.Color.green(),
+                    )
+                    dm_embed.set_footer(text="نظام إشعارات AdSentry")
+                else:
+                    expiry_text = f"<t:{int(expires_at.timestamp())}:F>" if expires_at else "Permanent (No Expiry)"
+                    dm_embed = discord.Embed(
+                        title="🎉 Your Advertisement Has Been Approved!",
+                        description=(
+                            f"Great news! Your ad **{submission.get('title')}** has been approved and published to {announcement_channel.mention}.\n\n"
+                            f"**Category:** {submission.get('category')}\n"
+                            f"**Duration / Expiry:** {expiry_text}\n"
+                            f"**Link to Ad:** [View Announcement]({published_msg.jump_url})"
+                        ),
+                        color=discord.Color.green(),
+                    )
+                    dm_embed.set_footer(text="AdSentry Notification Service")
                 await user.send(embed=dm_embed)
         except discord.Forbidden:
             logger.info(f"Could not send DM to User {submission['user_id']} (DMs closed).")
@@ -411,20 +426,33 @@ class ModerationCog(commands.Cog, name="Moderation"):
         except Exception as e:
             logger.error(f"Failed to update rejection in Supabase: {e}", exc_info=True)
 
-        # Notify submitter via DM
+        # Notify submitter via DM in their preferred language
         try:
             user = await self.bot.fetch_user(submission["user_id"])
             if user:
-                dm_embed = discord.Embed(
-                    title="❌ Your Advertisement Submission Was Rejected",
-                    description=(
-                        f"Your submission **{submission.get('title')}** was reviewed by server staff and could not be approved at this time.\n\n"
-                        f"**Rejection Reason:**\n> {reason}\n\n"
-                        "Please adjust your ad to comply with server guidelines and re-submit once your cooldown concludes."
-                    ),
-                    color=discord.Color.red(),
-                )
-                dm_embed.set_footer(text="AdSentry Moderation Team")
+                is_arabic = (submission.get("language") == "ar") or any('\u0600' <= c <= '\u06FF' for c in (submission.get("category") or ""))
+                if is_arabic:
+                    dm_embed = discord.Embed(
+                        title="❌ تم رفض طلب الإعلان الخاص بك",
+                        description=(
+                            f"نأسف لإبلاغك بأنه تمت مراجعة إعلانك **{submission.get('title')}** ولم يتم اعتماده في الوقت الحالي.\n\n"
+                            f"**سبب الرفض:**\n> {reason}\n\n"
+                            "يرجى تعديل إعلانك ليتوافق مع قوانين السيرفر وإعادة التقديم بعد انتهاء فترة الانتظار."
+                        ),
+                        color=discord.Color.red(),
+                    )
+                    dm_embed.set_footer(text="فريق إدارة AdSentry")
+                else:
+                    dm_embed = discord.Embed(
+                        title="❌ Your Advertisement Submission Was Rejected",
+                        description=(
+                            f"Your submission **{submission.get('title')}** was reviewed by server staff and could not be approved at this time.\n\n"
+                            f"**Rejection Reason:**\n> {reason}\n\n"
+                            "Please adjust your ad to comply with server guidelines and re-submit once your cooldown concludes."
+                        ),
+                        color=discord.Color.red(),
+                    )
+                    dm_embed.set_footer(text="AdSentry Moderation Team")
                 await user.send(embed=dm_embed)
         except discord.Forbidden:
             logger.info(f"Could not send rejection DM to User {submission['user_id']} (DMs closed).")

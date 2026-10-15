@@ -164,6 +164,7 @@ class SupabaseDatabase:
         content: str,
         title: str | None = None,
         guild_id: int | None = None,
+        language: str = "en",
     ) -> dict[str, Any] | None:
         """Creates a new PENDING ad submission in Supabase."""
         client = await self.get_client()
@@ -175,14 +176,25 @@ class SupabaseDatabase:
             "category": category,
             "title": title,
             "content": content,
+            "language": language,
             "status": "PENDING",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
         try:
-            response = await client.table("submissions").insert(payload).execute()
+            try:
+                response = await client.table("submissions").insert(payload).execute()
+            except Exception as insert_err:
+                # Fallback if 'language' column hasn't been migrated yet in Supabase
+                if "language" in str(insert_err).lower():
+                    logger.warning("Supabase submissions table missing 'language' column. Falling back without it.")
+                    payload.pop("language", None)
+                    response = await client.table("submissions").insert(payload).execute()
+                else:
+                    raise insert_err
+
             if response.data and len(response.data) > 0:
-                logger.info(f"Created submission #{response.data[0].get('id')} for User {user_id}")
+                logger.info(f"Created submission #{response.data[0].get('id')} for User {user_id} (Lang: {language})")
                 return response.data[0]
             return None
         except Exception as e:

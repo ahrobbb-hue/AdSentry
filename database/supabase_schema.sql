@@ -29,9 +29,13 @@ CREATE TABLE IF NOT EXISTS public.submissions (
     review_message_id BIGINT,              -- Discord message ID in staff review channel
     reviewed_by BIGINT,                   -- Moderator User ID
     rejection_reason TEXT,                 -- Reason sent to user upon rejection
+    language TEXT NOT NULL DEFAULT 'en',   -- Submission language: 'ar' or 'en'
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     reviewed_at TIMESTAMPTZ
 );
+
+-- Schema Migration for language column:
+ALTER TABLE public.submissions ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'en';
 
 -- 3. User Cooldowns Table: Tracks anti-spam and submission rate limits
 CREATE TABLE IF NOT EXISTS public.user_cooldowns (
