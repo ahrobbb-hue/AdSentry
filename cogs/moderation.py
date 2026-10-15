@@ -367,6 +367,14 @@ class ModerationCog(commands.Cog, name="Moderation"):
         except Exception as e:
             logger.warning(f"Failed to update review message: {e}")
 
+        # Auto-Repost & Relocate submission panel to the bottom of the announcement channel
+        try:
+            submissions_cog = self.bot.get_cog("Submissions")
+            if submissions_cog and hasattr(submissions_cog, "relocate_panel"):
+                await submissions_cog.relocate_panel(announcement_channel)
+        except Exception as e:
+            logger.error(f"Failed to auto-relocate submission panel in #{announcement_channel.name}: {e}", exc_info=True)
+
         await interaction.followup.send(
             f"✅ Ad #{submission_id} has been approved, published to {announcement_channel.mention}, and tracked for auto-expiry!",
             ephemeral=True,

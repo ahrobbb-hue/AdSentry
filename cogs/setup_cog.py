@@ -165,7 +165,13 @@ class SetupCog(commands.Cog, name="Server Setup"):
             value=f"{rev_channel.mention if rev_channel else '⚠️ Channel Not Found'} (`{rev_id}`)",
             inline=True,
         )
-        embed.set_footer(text="To change channels, run /ad-setup")
+        panel_id = config.get("last_panel_message_id")
+        embed.add_field(
+            name="📋 Active Submission Panel",
+            value=f"`Message ID: {panel_id}` (Auto-relocates on approval)" if panel_id else "Not deployed yet (Use `/ad-panel` to deploy)",
+            inline=False,
+        )
+        embed.set_footer(text="To change channels, run /ad-setup • To deploy panel, run /ad-panel")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 

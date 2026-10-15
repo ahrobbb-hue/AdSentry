@@ -97,13 +97,17 @@ class SupabaseDatabase:
         guild_id: int,
         announcement_channel_id: int,
         staff_review_channel_id: int,
+        last_panel_message_id: int | None = None,
     ) -> dict[str, Any]:
         """Saves or updates dynamic server channel settings in Supabase and updates local cache."""
         client = await self.get_client()
+        existing = self._guild_configs_cache.get(guild_id) or {}
+        panel_id = last_panel_message_id if last_panel_message_id is not None else existing.get("last_panel_message_id")
         payload = {
             "guild_id": guild_id,
             "announcement_channel_id": announcement_channel_id,
             "staff_review_channel_id": staff_review_channel_id,
+            "last_panel_message_id": panel_id,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -112,12 +116,40 @@ class SupabaseDatabase:
             self._guild_configs_cache[guild_id] = payload
             logger.info(
                 f"Configured guild {guild_id}: Announcement Channel={announcement_channel_id}, "
-                f"Review Channel={staff_review_channel_id}"
+                f"Review Channel={staff_review_channel_id}, Panel Message ID={panel_id}"
             )
             return payload
         except Exception as e:
             logger.error(f"Failed to save server_configs for guild {guild_id}: {e}", exc_info=True)
             raise
+
+    async def update_panel_message_id(self, guild_id: int, message_id: int | None) -> None:
+        """Updates the last active ad submission panel message ID for a guild."""
+        client = await self.get_client()
+        try:
+            config = await self.get_guild_config(guild_id)
+            if config:
+                await client.table("server_configs").update({
+                    "last_panel_message_id": message_id,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("guild_id", guild_id).execute()
+
+                if guild_id in self._guild_configs_cache:
+                    self._guild_configs_cache[guild_id]["last_panel_message_id"] = message_id
+            else:
+                payload = {
+                    "guild_id": guild_id,
+                    "announcement_channel_id": 0,
+                    "staff_review_channel_id": 0,
+                    "last_panel_message_id": message_id,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                await client.table("server_configs").upsert(payload).execute()
+                self._guild_configs_cache[guild_id] = payload
+
+            logger.info(f"Updated last_panel_message_id for guild {guild_id} -> {message_id}")
+        except Exception as e:
+            logger.error(f"Failed to update last_panel_message_id for guild {guild_id}: {e}", exc_info=True)
 
     # -------------------------------------------------------------
     # Submissions Operations

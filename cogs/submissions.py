@@ -384,10 +384,8 @@ class SubmissionsCog(commands.Cog, name="Submissions"):
         view = CategorySelectView(self.bot)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    @ad_group.command(name="panel", description="Post the persistent Ad Submission panel (Admin/Staff only)")
-    @app_commands.default_permissions(administrator=True)
-    async def post_panel(self, interaction: discord.Interaction) -> None:
-        """Sends a persistent ad submission embed with a button into the current channel."""
+    def create_panel_embed(self) -> discord.Embed:
+        """Constructs the standard advertisement submission portal embed."""
         embed = discord.Embed(
             title="📢 Server Advertisement Portal",
             description=(
@@ -401,12 +399,91 @@ class SubmissionsCog(commands.Cog, name="Submissions"):
             ),
             color=discord.Color.blue(),
         )
-        embed.set_thumbnail(url=self.bot.user.display_avatar.url if self.bot.user else None)
+        if self.bot.user:
+            embed.set_thumbnail(url=self.bot.user.display_avatar.url)
         embed.set_footer(text="Powered by AdSentry • Safe & Moderated Advertising")
+        return embed
 
+    async def relocate_panel(self, channel: discord.TextChannel) -> discord.Message | None:
+        """
+        Deletes the previous submission panel (if exists) and posts a fresh panel
+        at the bottom of the channel, updating server_configs.last_panel_message_id.
+        """
+        guild_id = channel.guild.id
+        config = await self.bot.db.get_guild_config(guild_id)
+        old_panel_id = config.get("last_panel_message_id") if config else None
+
+        # 1. Attempt to delete prior panel message
+        if old_panel_id:
+            try:
+                old_message = await channel.fetch_message(old_panel_id)
+                await old_message.delete()
+                logger.info(f"Deleted old submission panel message {old_panel_id} in #{channel.name}")
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                logger.debug(f"Could not delete old panel message {old_panel_id}: {e}")
+
+        # 2. Deploy fresh submission panel at the bottom
+        embed = self.create_panel_embed()
         view = AdSubmissionPanelView(self.bot)
-        await interaction.channel.send(embed=embed, view=view)
-        await interaction.response.send_message("Advertisement panel posted successfully!", ephemeral=True)
+        try:
+            new_panel_msg = await channel.send(embed=embed, view=view)
+            await self.bot.db.update_panel_message_id(guild_id, new_panel_msg.id)
+            logger.info(f"Relocated submission panel #{new_panel_msg.id} in #{channel.name} ({guild_id})")
+            return new_panel_msg
+        except Exception as e:
+            logger.error(f"Failed to post relocated submission panel in #{channel.name}: {e}", exc_info=True)
+            return None
+
+    @ad_group.command(name="panel", description="Deploy or relocate the Ad Submission panel (Admin only)")
+    @app_commands.default_permissions(administrator=True)
+    async def post_panel(self, interaction: discord.Interaction) -> None:
+        """Sends or relocates the persistent ad submission panel in the current channel."""
+        if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message("❌ This command must be run in a guild text channel.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        new_panel = await self.relocate_panel(interaction.channel)
+        if new_panel:
+            await interaction.followup.send(
+                f"✅ Advertisement submission panel has been deployed to {interaction.channel.mention}!\n"
+                f"Tracking ID: `{new_panel.id}`.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send("❌ Failed to deploy submission panel. Please verify bot permissions.", ephemeral=True)
+
+    @app_commands.command(
+        name="ad-panel",
+        description="Deploy or relocate the persistent Ad Submission panel (Admin only)",
+    )
+    @app_commands.describe(target_channel="The channel to post the panel in (defaults to current channel)")
+    @app_commands.default_permissions(administrator=True)
+    async def ad_panel_standalone(
+        self,
+        interaction: discord.Interaction,
+        target_channel: discord.TextChannel | None = None,
+    ) -> None:
+        """Standalone shortcut command to deploy or relocate the persistent ad submission panel."""
+        if not interaction.guild:
+            await interaction.response.send_message("❌ This command must be executed within a server.", ephemeral=True)
+            return
+
+        channel = target_channel or interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("❌ Please specify or run this command within a valid text channel.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        new_panel = await self.relocate_panel(channel)
+        if new_panel:
+            await interaction.followup.send(
+                f"✅ Advertisement submission panel has been deployed to {channel.mention}!\n"
+                f"Previous panel was cleaned up, and tracking ID is `{new_panel.id}`.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send("❌ Failed to deploy submission panel. Please check permissions.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:
