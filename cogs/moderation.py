@@ -395,6 +395,8 @@ class ModerationCog(commands.Cog, name="Moderation"):
                 content=submission.get("content", ""),
                 user_id=submission.get("user_id"),
                 image_url=submission.get("image_url"),
+                reviewer_id=interaction.user.id,
+                submission_id=submission_id,
             )
         except Exception as e:
             logger.error(f"Failed to publish ad #{submission_id} via webhook: {e}", exc_info=True)

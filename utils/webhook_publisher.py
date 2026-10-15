@@ -101,10 +101,12 @@ async def publish_ad_via_webhook(
     post_id: int | None = None,
     user_id: int | None = None,
     image_url: str | None = None,
+    reviewer_id: int | None = None,
+    submission_id: int | None = None,
 ) -> tuple[discord.WebhookMessage, discord.Thread | None, str]:
     """
     Publishes a premium, modern advertisement card via webhook disguised as the submitter.
-    Includes banner images, user avatars, structured badges, and spawns discussion threads.
+    Includes banner images, user avatars, structured badges, staff audit, and spawns discussion threads.
     Returns: (published_message, discussion_thread, webhook_url)
     """
     from cogs.features import AdInterestView, TranslateView
@@ -161,11 +163,19 @@ async def publish_ad_via_webhook(
             inline=True,
         )
 
-    embed.add_field(
-        name="🛡️ الفحص | Status",
-        value="`✅ موثّق / Verified`",
-        inline=True,
-    )
+    # 5. Official Staff Verification Audit Field
+    if reviewer_id:
+        embed.add_field(
+            name="🛡️ التوثيق والاعتماد | Staff Audit",
+            value=f"✅ معتمد رسمياً بواسطة: <@{reviewer_id}>\n`🔖 كود الترخيص: #ADS-{submission_id or 'OFFICIAL'}`",
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="🛡️ الفحص | Status",
+            value="`✅ موثّق / Verified`",
+            inline=True,
+        )
 
     # 5. Footer & Timestamp
     guild_name = channel.guild.name if channel.guild else "Discord"

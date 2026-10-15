@@ -6,6 +6,7 @@ Anti-phishing is handled in utils/automod.py (screen_content).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -128,12 +129,119 @@ class AdInterestButton(discord.ui.Button):
             pass  # Non-critical
 
 
+class AdVerifyButton(discord.ui.Button):
+    """Persistent button that checks live database audit records to confirm staff approval."""
+
+    def __init__(self, post_id: int = 0) -> None:
+        super().__init__(
+            label="🛡️ فحص التوثيق | Verify",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"adsentry:verify:{post_id}",
+            row=0,
+        )
+        self.post_id = post_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        bot: commands.Bot = interaction.client  # type: ignore
+
+        # Extract post_id from custom_id if available
+        post_id = self.post_id
+        if interaction.data and "custom_id" in interaction.data:
+            parts = str(interaction.data["custom_id"]).split(":")
+            if len(parts) >= 3 and parts[2].isdigit():
+                parsed_id = int(parts[2])
+                if parsed_id > 0:
+                    post_id = parsed_id
+
+        msg_id = interaction.message.id if interaction.message else None
+
+        client = await bot.db.get_client()
+        post_data = None
+        try:
+            query = (
+                client.table("active_posts")
+                .select("id, published_at, submissions(id, title, category, status, reviewed_by, reviewed_at, created_at, user_id, user_name)")
+            )
+            if post_id and post_id > 0:
+                res = await query.eq("id", post_id).limit(1).execute()
+                if res.data:
+                    post_data = res.data[0]
+
+            if not post_data and msg_id:
+                res = await query.eq("message_id", msg_id).limit(1).execute()
+                if res.data:
+                    post_data = res.data[0]
+        except Exception as e:
+            logger.error(f"Error checking ad verification audit: {e}", exc_info=True)
+
+        sub = (post_data.get("submissions") if post_data else None) or {}
+        is_approved = sub.get("status") == "APPROVED"
+
+        if post_data and is_approved:
+            sub_id = sub.get("id") or "N/A"
+            reviewer_id = sub.get("reviewed_by")
+            reviewed_at = sub.get("reviewed_at") or post_data.get("published_at")
+            title = sub.get("title") or "إعلان"
+            submitter_id = sub.get("user_id")
+
+            # Parse reviewed_at to unix timestamp
+            reviewed_ts_str = "غير محدد"
+            if reviewed_at:
+                try:
+                    dt = datetime.fromisoformat(reviewed_at.replace("Z", "+00:00"))
+                    reviewed_ts_str = f"<t:{int(dt.timestamp())}:F> (<t:{int(dt.timestamp())}:R>)"
+                except Exception:
+                    reviewed_ts_str = str(reviewed_at)[:19]
+
+            # Generate deterministic security hash
+            hash_seed = f"{sub_id}-{reviewer_id}-{sub.get('created_at')}"
+            audit_hash = hashlib.sha256(hash_seed.encode()).hexdigest()[:12].upper()
+
+            reviewer_text = f"<@{reviewer_id}>" if reviewer_id else "مشرف معتمد (Staff)"
+            submitter_text = f"<@{submitter_id}>" if submitter_id else sub.get("user_name", "Unknown")
+
+            embed = discord.Embed(
+                title="🛡️ شهادة التدقيق والتوثيق الأمني | Official Security Audit",
+                description=(
+                    "✅ **إعلان موثّق ومصرّح به رسمياً من إدارة السيرفر بنسبة 100%!**\n"
+                    "تم فحص سجلات النظام والتأكد من مراجعة واعتماد هذا الإعلان نظامياً.\n\n"
+                    f"• **عنوان الإعلان:** {title}\n"
+                    f"• **صاحب الإعلان:** {submitter_text}\n"
+                    f"• **المشرف المسؤول عن الاعتماد:** {reviewer_text}\n"
+                    f"• **تاريخ ووقت الاعتماد:** {reviewed_ts_str}\n"
+                    f"• **رقم رخصة الإعلان:** `ADS-{sub_id}`\n"
+                    f"• **البصمة الرقمية للتحقق:** `SHA256-{audit_hash}`\n\n"
+                    "🔒 **سلامة المحتوى:** تم اجتياز فحص الروابط المشبوهة وحماية الأعضاء ضد الاحتيال."
+                ),
+                color=discord.Color.green(),
+            )
+            embed.set_footer(text="AdSentry Security Protocol • نظام الحماية والتوثيق المعتمد")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            embed = discord.Embed(
+                title="🚨 تحذير أمني: إعلان غير موثّق! | Security Warning",
+                description=(
+                    "⚠️ **تنبيه: لم يتم العثور على ترخيص رسمي معتمد لهذا الإعلان في سجلات النظام!**\n\n"
+                    "قد يكون هذا الإعلان نُشر بطريقة غير مصرّح بها أو تم حذفه/إلغاؤه من قبل الإدارة.\n\n"
+                    "🔴 **إرشادات الأمان:**\n"
+                    "• لا تقم بالضغط على أي روابط خارجية داخل الإعلان.\n"
+                    "• لا تقم بإرسال أي معلومات شخصية أو مالية.\n"
+                    "• يرجى إبلاغ طاقم إدارة السيرفر فوراً لاتخاذ الإجراءات اللازمة."
+                ),
+                color=discord.Color.red(),
+            )
+            embed.set_footer(text="AdSentry Security Alert • إشعار أمني لحماية الأعضاء")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 class AdInterestView(discord.ui.View):
-    """Persistent view containing the ⭐ interest button and optional thread link for a published ad."""
+    """Persistent view containing ⭐ interest, 🛡️ verify audit, and optional thread link."""
 
     def __init__(self, post_id: int, interest_count: int = 0, thread_url: str | None = None) -> None:
         super().__init__(timeout=None)
         self.add_item(AdInterestButton(post_id, interest_count))
+        self.add_item(AdVerifyButton(post_id))
         if thread_url:
             self.add_item(
                 discord.ui.Button(
