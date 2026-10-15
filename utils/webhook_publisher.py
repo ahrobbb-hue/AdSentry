@@ -6,6 +6,9 @@ banner images, category-based theming, and spawning discussion threads.
 
 from __future__ import annotations
 
+from typing import Any
+
+
 import logging
 import re
 from datetime import datetime, timezone
