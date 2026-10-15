@@ -2,13 +2,15 @@
 AdSentry AI Translator Utility
 Hybrid translation using Google Gemini Flash (preferred) or deep-translator (fallback).
 Supports Arabic <-> English bilingual translation for ad content.
+
+NOTE: Uses the new `google-genai` SDK (google.genai), NOT the deprecated
+`google-generativeai` (google.generativeai) package.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from typing import Literal
 
 logger = logging.getLogger("AdSentry.Translator")
@@ -31,45 +33,51 @@ def detect_language(text: str) -> Literal["ar", "en"]:
 # ---------------------------------------------------------------------------
 
 async def _translate_with_gemini(text: str, target_lang: Literal["ar", "en"]) -> str | None:
-    """Translates text using Google Gemini Flash API (context-aware, ideal for Discord ads)."""
+    """Translates text using Google Gemini 2.0 Flash (new google-genai SDK v2.31+)."""
     try:
-        import google.generativeai as genai  # type: ignore
+        from google import genai  # type: ignore  # pip: google-genai
         from config import Config
 
         if not Config.GEMINI_API_KEY:
+            logger.debug("GEMINI_API_KEY not set – skipping Gemini translation.")
             return None
 
-        genai.configure(api_key=Config.GEMINI_API_KEY)
+        client = genai.Client(api_key=Config.GEMINI_API_KEY)
 
         lang_name = "Arabic" if target_lang == "ar" else "English"
         prompt = (
             f"Translate the following Discord advertisement text to {lang_name}. "
-            f"Preserve all emojis, markdown formatting (**bold**, links, bullet points), "
-            f"and Discord-specific terms (e.g. Server, Bot, DM, Nitro) without translating them. "
-            f"Return ONLY the translated text, nothing else.\n\n"
+            "Preserve all emojis, markdown formatting (**bold**, links, bullet points), "
+            "and Discord-specific terms (e.g. Server, Bot, DM, Nitro) without translating them. "
+            "Return ONLY the translated text, nothing else.\n\n"
             f"Text:\n{text}"
         )
 
-        # Try gemini-3.8-flash first, then gemini-flash-latest
-        model_name = "gemini-3.8-flash"
-        model = genai.GenerativeModel(model_name)
-
         loop = asyncio.get_event_loop()
         response = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: model.generate_content(prompt)),
-            timeout=3.5,
+            loop.run_in_executor(
+                None,
+                lambda: client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=prompt,
+                ),
+            ),
+            timeout=12.0,
         )
 
-        translated = response.text.strip() if response.text else None
+        translated: str | None = None
+        if response and response.text:
+            translated = response.text.strip() or None
+
         if translated:
-            logger.info(f"Gemini translation successful ({model_name}) -> {target_lang}")
+            logger.info(f"Gemini translation successful (gemini-2.0-flash) -> {target_lang}")
         return translated
 
     except ImportError:
-        logger.warning("google-generativeai not installed. Falling back to deep-translator.")
+        logger.warning("google-genai not installed. Falling back to deep-translator.")
         return None
     except Exception as e:
-        logger.warning(f"Gemini translation failed: {e}. Falling back.")
+        logger.warning(f"Gemini translation failed: {e}. Falling back to deep-translator.")
         return None
 
 
@@ -91,9 +99,9 @@ async def _translate_with_deep(text: str, target_lang: Literal["ar", "en"]) -> s
         result = await asyncio.wait_for(
             loop.run_in_executor(
                 None,
-                lambda: GoogleTranslator(source="auto", target=target).translate(text)
+                lambda: GoogleTranslator(source="auto", target=target).translate(text),
             ),
-            timeout=3.5,
+            timeout=8.0,
         )
         if result:
             logger.info(f"deep-translator (Google) translation successful -> {target_lang}")
@@ -111,9 +119,9 @@ async def _translate_with_deep(text: str, target_lang: Literal["ar", "en"]) -> s
         result = await asyncio.wait_for(
             loop.run_in_executor(
                 None,
-                lambda: MyMemoryTranslator(source=source_code, target=target_code).translate(text)
+                lambda: MyMemoryTranslator(source=source_code, target=target_code).translate(text),
             ),
-            timeout=4.0,
+            timeout=8.0,
         )
         if result:
             logger.info(f"deep-translator (MyMemory) translation successful -> {target_lang}")
