@@ -106,6 +106,15 @@ class AdSentryBot(commands.Bot):
         )
         await self.change_presence(status=discord.Status.online, activity=activity)
 
+        # Synchronize slash commands directly to connected guilds for instant availability
+        for guild in self.guilds:
+            try:
+                self.tree.copy_global_to(guild=guild)
+                synced_guild = await self.tree.sync(guild=guild)
+                logger.info(f"Instant synced {len(synced_guild)} slash command(s) to guild: {guild.name} ({guild.id})")
+            except Exception as e:
+                logger.warning(f"Could not instant-sync commands to guild {guild.id}: {e}")
+
     async def close(self) -> None:
         """Gracefully cleanup connections upon bot shutdown."""
         logger.info("Shutting down AdSentry...")

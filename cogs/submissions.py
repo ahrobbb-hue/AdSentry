@@ -934,6 +934,57 @@ class SubmissionsCog(commands.Cog, name="Submissions"):
         embed.set_footer(text="AdSentry Cooldown Manager • نظام تصفير فترات الانتظار")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+    @ad_group.command(
+        name="check-cooldown",
+        description="Check if a member (or yourself) is on ad cooldown",
+    )
+    @app_commands.describe(
+        member="The member to check (leave empty to check your own cooldown)",
+    )
+    async def check_cooldown_cmd(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member | None = None,
+    ) -> None:
+        """Slash command to check cooldown status for a member."""
+        target = member or interaction.user
+        await interaction.response.defer(ephemeral=True)
+
+        existing_cd = await self.bot.db.get_user_cooldown(target.id)
+        has_pending = await self.bot.db.has_pending_submission(target.id)
+
+        if existing_cd:
+            unix_ts = int(existing_cd.timestamp())
+            embed = discord.Embed(
+                title="⏳ وقت الانتظار نشط | Active Cooldown",
+                description=(
+                    f"العضو: {target.mention} (`{target.id}`)\n\n"
+                    f"⛔ **لا يمكنه التقديم حالياً.**\n"
+                    f"**موعد انتهاء الانتظار:** <t:{unix_ts}:F> (<t:{unix_ts}:R>)"
+                ),
+                color=discord.Color.orange(),
+            )
+        else:
+            embed = discord.Embed(
+                title="✅ لا يوجد وقت انتظار | No Cooldown",
+                description=(
+                    f"العضو: {target.mention} (`{target.id}`)\n\n"
+                    "🎉 **يمكنه تقديم إعلان جديد الآن دون أي وقت انتظار!**"
+                ),
+                color=discord.Color.green(),
+            )
+
+        embed.add_field(
+            name="📋 الطلبات المعلقة | Pending Status",
+            value="⚠️ لديه إعلان قيد مراجعة الإدارة حالياً." if has_pending else "✅ لا توجد طلبات معلقة.",
+            inline=False,
+        )
+        if target.display_avatar:
+            embed.set_thumbnail(url=target.display_avatar.url)
+        embed.set_footer(text="AdSentry Cooldown Manager")
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
     def create_panel_embed(self) -> discord.Embed:
         """Constructs the standard bilingual advertisement submission portal embed."""
         embed = discord.Embed(

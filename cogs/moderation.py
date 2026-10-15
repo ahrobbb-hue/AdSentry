@@ -123,11 +123,84 @@ class ExpiryDurationView(discord.ui.View):
         self.add_item(ExpiryDurationSelect(cog, submission_id, review_message))
 
 
+class RejectionReasonSelect(discord.ui.Select):
+    """Dropdown for staff to select a rejection reason or choose custom modal."""
+
+    def __init__(self, cog: ModerationCog, submission_id: int, review_message: discord.Message) -> None:
+        options = [
+            discord.SelectOption(
+                label="محتوى مخالف لسياسات النشر | Prohibited Content",
+                value="المحتوى يخالف سياسات وقوانين نشر الإعلانات في السيرفر (Prohibited/Inappropriate Content)",
+                description="Contains NSFW, harmful, or prohibited content",
+                emoji="🚫",
+            ),
+            discord.SelectOption(
+                label="روابط معطلة أو منتهية | Broken / Invalid Link",
+                value="رابط الدعوة أو الموقع غير صالح أو منتهي الصلاحية (Invalid/Expired Invite Link)",
+                description="The provided Discord invite or URL is broken",
+                emoji="🔗",
+            ),
+            discord.SelectOption(
+                label="قسم غير مناسب للإعلان | Miscategorized Ad",
+                value="تم تقديم الإعلان في تصنيف غير مناسب لمحتواه (Submitted in wrong category)",
+                description="Please re-submit in the proper channel/category",
+                emoji="📌",
+            ),
+            discord.SelectOption(
+                label="إعلان مكرر أو سبام | Duplicate or Spam",
+                value="إعلان مكرر أو محاولة سبام غير مصرح بها (Duplicate or spam submission)",
+                description="Repeated submissions within a short timeframe",
+                emoji="⚠️",
+            ),
+            discord.SelectOption(
+                label="كتابة سبب مخصص يدوي | Custom Reason...",
+                value="CUSTOM_MODAL",
+                description="Open a text box to write custom rejection feedback",
+                emoji="✍️",
+            ),
+        ]
+        super().__init__(
+            placeholder="اختر سبب الرفض | Select Rejection Reason...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.cog = cog
+        self.submission_id = submission_id
+        self.review_message = review_message
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        """Processes the chosen rejection reason."""
+        selected_reason = self.values[0]
+        if selected_reason == "CUSTOM_MODAL":
+            modal = RejectionModal(self.cog, self.submission_id, self.review_message)
+            await interaction.response.send_modal(modal)
+            return
+
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+
+        await self.cog.complete_rejection(
+            interaction=interaction,
+            submission_id=self.submission_id,
+            reason=selected_reason,
+            review_message=self.review_message,
+        )
+
+
+class RejectionReasonView(discord.ui.View):
+    """Ephemeral view presenting the rejection reason dropdown."""
+
+    def __init__(self, cog: ModerationCog, submission_id: int, review_message: discord.Message) -> None:
+        super().__init__(timeout=180)
+        self.add_item(RejectionReasonSelect(cog, submission_id, review_message))
+
+
 class RejectionModal(discord.ui.Modal):
     """Modal prompting the staff member for an ad rejection rationale."""
 
     def __init__(self, cog: ModerationCog, submission_id: int, review_message: discord.Message) -> None:
-        super().__init__(title=f"Reject Submission #{submission_id}")
+        super().__init__(title=f"Reject Submission #{submission_id}"[:45])
         self.cog = cog
         self.submission_id = submission_id
         self.review_message = review_message
@@ -190,52 +263,71 @@ class ModerationCog(commands.Cog, name="Moderation"):
 
         submission_id = int(raw_id)
 
-        # Enforce staff authorization
-        if not is_staff(interaction.user):
-            embed = discord.Embed(
-                title="⛔ Access Denied",
-                description="You do not possess the required staff roles or permissions to review ad submissions.",
-                color=discord.Color.red(),
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
+        try:
+            # Enforce staff authorization
+            if not is_staff(interaction.user):
+                embed = discord.Embed(
+                    title="⛔ Access Denied",
+                    description="You do not possess the required staff roles or permissions to review ad submissions.",
+                    color=discord.Color.red(),
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
 
-        # Fetch submission state from Supabase
-        submission = await self.bot.db.get_submission(submission_id)
-        if not submission:
-            await interaction.response.send_message(
-                f"❌ Error: Submission #{submission_id} could not be located in the database.",
-                ephemeral=True,
-            )
-            return
+            # Fetch submission state from Supabase
+            submission = await self.bot.db.get_submission(submission_id)
+            if not submission:
+                await interaction.response.send_message(
+                    f"❌ Error: Submission #{submission_id} could not be located in the database.",
+                    ephemeral=True,
+                )
+                return
 
-        if submission.get("status") != "PENDING":
-            status = submission.get("status")
-            await interaction.response.send_message(
-                f"⚠️ This submission has already been resolved as **{status}**.",
-                ephemeral=True,
-            )
-            return
+            if submission.get("status") != "PENDING":
+                status = submission.get("status")
+                await interaction.response.send_message(
+                    f"⚠️ This submission has already been resolved as **{status}**.",
+                    ephemeral=True,
+                )
+                return
 
-        assert interaction.message is not None
+            if not interaction.message:
+                await interaction.response.send_message("❌ Error: Message context not found.", ephemeral=True)
+                return
 
-        if action == "approve":
-            # Present duration selection
-            view = ExpiryDurationView(self, submission_id, interaction.message)
-            embed = discord.Embed(
-                title="⏱️ Select Advertisement Duration",
-                description=(
-                    f"Approving Submission **#{submission_id}** ({submission.get('title')}).\n\n"
-                    "Please choose how long this ad will remain visible in the announcement channel before being automatically cleaned up:"
-                ),
-                color=discord.Color.blue(),
-            )
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+            if action == "approve":
+                # Present duration selection
+                view = ExpiryDurationView(self, submission_id, interaction.message)
+                embed = discord.Embed(
+                    title="⏱️ Select Advertisement Duration",
+                    description=(
+                        f"Approving Submission **#{submission_id}** ({submission.get('title')}).\n\n"
+                        "Please choose how long this ad will remain visible in the announcement channel before being automatically cleaned up:"
+                    ),
+                    color=discord.Color.blue(),
+                )
+                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-        elif action == "reject":
-            # Present rejection modal
-            modal = RejectionModal(self, submission_id, interaction.message)
-            await interaction.response.send_modal(modal)
+            elif action == "reject":
+                # Present rejection reasons view (instant response, zero timeout risk)
+                view = RejectionReasonView(self, submission_id, interaction.message)
+                embed = discord.Embed(
+                    title="❌ رفض طلب الإعلان | Reject Submission",
+                    description=(
+                        f"أنت بصدد رفض الإعلان رقم **#{submission_id}** (`{submission.get('title')}`).\n\n"
+                        "اختر سبب الرفض من القائمة أدناه ليتم إرساله تلقائياً لصاحب الإعلان، أو اختر **'كتابة سبب مخصص'** لكتابة تفاصيل إضافية:"
+                    ),
+                    color=discord.Color.red(),
+                )
+                embed.set_footer(text="AdSentry Moderation • اختر سبباً لإتمام الرفض فوراً")
+                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error handling staff review interaction for #{submission_id}: {e}", exc_info=True)
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"❌ An unexpected error occurred while processing this action: `{e}`",
+                    ephemeral=True,
+                )
 
     # -------------------------------------------------------------
     # 2. Approval Flow & Webhook Publishing Execution
