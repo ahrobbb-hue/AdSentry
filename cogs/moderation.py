@@ -139,6 +139,8 @@ class RejectionModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         """Processes rejection, sends user DM, and updates database records."""
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
         reason = self.reason_input.value.strip()
         await self.cog.complete_rejection(
             interaction=interaction,
@@ -381,7 +383,8 @@ class ModerationCog(commands.Cog, name="Moderation"):
         review_message: discord.Message,
     ) -> None:
         """Records rejection reason, notifies user via DM, and updates review message."""
-        await interaction.response.defer(ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
 
         submission = await self.bot.db.get_submission(submission_id)
         if not submission or submission.get("status") != "PENDING":

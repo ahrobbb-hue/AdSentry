@@ -27,7 +27,7 @@ class AdSubmissionModal(discord.ui.Modal):
         self.ad_title = discord.ui.TextInput(
             label="Ad Headline / Title",
             placeholder="e.g. Apex Coding Hub - Join top developers",
-            min_length=5,
+            min_length=2,
             max_length=100,
             required=True,
         )
@@ -37,7 +37,7 @@ class AdSubmissionModal(discord.ui.Modal):
             label="Advertisement Content & Links",
             style=discord.TextStyle.paragraph,
             placeholder="Describe your server, bot, or service in detail, including features and links...",
-            min_length=20,
+            min_length=10,
             max_length=1800,
             required=True,
         )
@@ -45,163 +45,173 @@ class AdSubmissionModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         """Processes the ad submission with auto-moderation, cooldown checks, and DB storage."""
-        title = self.ad_title.value.strip()
-        content = self.ad_content.value.strip()
-        full_text = f"{title} {content}".lower()
-
-        # -------------------------------------------------------------
-        # 1. Auto-Moderation & Link Filtering Check
-        # -------------------------------------------------------------
-        flagged_words = [word for word in Config.FORBIDDEN_WORDS if word in full_text]
-        if flagged_words:
-            embed = discord.Embed(
-                title="🛡️ Submission Blocked by Auto-Mod",
-                description=(
-                    "Your advertisement could not be submitted because it contains restricted terms or unauthorized links:\n"
-                    f"**Detected forbidden patterns:** `{', '.join(flagged_words)}`\n\n"
-                    "Please revise your submission in accordance with our server advertising guidelines."
-                ),
-                color=discord.Color.red(),
-            )
-            embed.set_footer(text="AdSentry Auto-Moderation Guard")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            logger.warning(
-                f"Blocked submission from {interaction.user} (ID: {interaction.user.id}) due to forbidden words: {flagged_words}"
-            )
-            return
-
-        # -------------------------------------------------------------
-        # 2. Anti-Spam / Cooldown & Duplicate Pending Checks
-        # -------------------------------------------------------------
-        cooldown_until = await self.bot.db.get_user_cooldown(interaction.user.id)
-        if cooldown_until:
-            unix_ts = int(cooldown_until.timestamp())
-            embed = discord.Embed(
-                title="⏳ Cooldown Active",
-                description=(
-                    "You have recently submitted an advertisement and are currently on cooldown.\n\n"
-                    f"**Next submission available:** <t:{unix_ts}:F> (<t:{unix_ts}:R>)"
-                ),
-                color=discord.Color.orange(),
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-
-        has_pending = await self.bot.db.has_pending_submission(interaction.user.id)
-        if has_pending:
-            embed = discord.Embed(
-                title="⚠️ Submission Already Pending",
-                description=(
-                    "You already have an advertisement submission awaiting staff review.\n"
-                    "Please wait for your previous submission to be approved or rejected before submitting a new one."
-                ),
-                color=discord.Color.gold(),
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-
-        # Defer response while writing to Supabase and forwarding to review channel
+        # Defer immediately to prevent Discord's 3-second modal timeout
         await interaction.response.defer(ephemeral=True)
 
-        guild_id = interaction.guild_id
-        guild_config = await self.bot.db.get_guild_config(guild_id) if guild_id else None
-
-        if not guild_config or not guild_config.get("staff_review_channel_id"):
-            embed = discord.Embed(
-                title="⚙️ Server Setup Required",
-                description=(
-                    "This server has not configured an advertisement review channel yet.\n"
-                    "An administrator must run `/ad-setup` before submissions can be processed."
-                ),
-                color=discord.Color.gold(),
-            )
-            await interaction.followup.send(embed=embed, ephemeral=True)
-            return
-
-        # -------------------------------------------------------------
-        # 3. Save to Supabase Submissions Table
-        # -------------------------------------------------------------
-        submission = None
         try:
-            submission = await self.bot.db.create_submission(
-                user_id=interaction.user.id,
-                user_name=str(interaction.user),
-                user_avatar_url=interaction.user.display_avatar.url,
-                category=self.category,
-                title=title,
-                content=content,
-                guild_id=guild_id,
+            title = self.ad_title.value.strip()
+            content = self.ad_content.value.strip()
+            full_text = f"{title} {content}".lower()
+
+            # -------------------------------------------------------------
+            # 1. Auto-Moderation & Link Filtering Check
+            # -------------------------------------------------------------
+            flagged_words = [word for word in Config.FORBIDDEN_WORDS if word in full_text]
+            if flagged_words:
+                embed = discord.Embed(
+                    title="🛡️ Submission Blocked by Auto-Mod",
+                    description=(
+                        "Your advertisement could not be submitted because it contains restricted terms or unauthorized links:\n"
+                        f"**Detected forbidden patterns:** `{', '.join(flagged_words)}`\n\n"
+                        "Please revise your submission in accordance with our server advertising guidelines."
+                    ),
+                    color=discord.Color.red(),
+                )
+                embed.set_footer(text="AdSentry Auto-Moderation Guard")
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                logger.warning(
+                    f"Blocked submission from {interaction.user} (ID: {interaction.user.id}) due to forbidden words: {flagged_words}"
+                )
+                return
+
+            # -------------------------------------------------------------
+            # 2. Anti-Spam / Cooldown & Duplicate Pending Checks
+            # -------------------------------------------------------------
+            cooldown_until = await self.bot.db.get_user_cooldown(interaction.user.id)
+            if cooldown_until:
+                unix_ts = int(cooldown_until.timestamp())
+                embed = discord.Embed(
+                    title="⏳ Cooldown Active",
+                    description=(
+                        "You have recently submitted an advertisement and are currently on cooldown.\n\n"
+                        f"**Next submission available:** <t:{unix_ts}:F> (<t:{unix_ts}:R>)"
+                    ),
+                    color=discord.Color.orange(),
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+
+            has_pending = await self.bot.db.has_pending_submission(interaction.user.id)
+            if has_pending:
+                embed = discord.Embed(
+                    title="⚠️ Submission Already Pending",
+                    description=(
+                        "You already have an advertisement submission awaiting staff review.\n"
+                        "Please wait for your previous submission to be approved or rejected before submitting a new one."
+                    ),
+                    color=discord.Color.gold(),
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+
+            guild_id = interaction.guild_id
+            guild_config = await self.bot.db.get_guild_config(guild_id) if guild_id else None
+
+            if not guild_config or not guild_config.get("staff_review_channel_id"):
+                embed = discord.Embed(
+                    title="⚙️ Server Setup Required",
+                    description=(
+                        "This server has not configured an advertisement review channel yet.\n"
+                        "An administrator must run `/ad-setup` before submissions can be processed."
+                    ),
+                    color=discord.Color.gold(),
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+
+            # -------------------------------------------------------------
+            # 3. Save to Supabase Submissions Table
+            # -------------------------------------------------------------
+            submission = None
+            try:
+                submission = await self.bot.db.create_submission(
+                    user_id=interaction.user.id,
+                    user_name=str(interaction.user),
+                    user_avatar_url=interaction.user.display_avatar.url,
+                    category=self.category,
+                    title=title,
+                    content=content,
+                    guild_id=guild_id,
+                )
+            except Exception as e:
+                logger.error(f"Failed to record submission in Supabase: {e}", exc_info=True)
+                embed = discord.Embed(
+                    title="❌ Database Error",
+                    description="An error occurred while saving your submission. Please try again later or contact an administrator.",
+                    color=discord.Color.red(),
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+
+            # -------------------------------------------------------------
+            # 4. Activate User Cooldown in Database
+            # -------------------------------------------------------------
+            try:
+                await self.bot.db.set_user_cooldown(interaction.user.id)
+            except Exception as e:
+                logger.error(f"Failed to set user cooldown: {e}", exc_info=True)
+
+            submission_id = submission.get("id", "N/A") if submission else "N/A"
+
+            # -------------------------------------------------------------
+            # 5. Forward to Staff Review Channel (Dynamically Configured)
+            # -------------------------------------------------------------
+            review_channel_id = guild_config.get("staff_review_channel_id")
+            review_channel = self.bot.get_channel(review_channel_id)
+            if not review_channel and review_channel_id:
+                try:
+                    review_channel = await self.bot.fetch_channel(review_channel_id)
+                except Exception:
+                    review_channel = None
+
+            if review_channel and isinstance(review_channel, discord.TextChannel):
+                review_embed = discord.Embed(
+                    title=f"📥 New Ad Submission #{submission_id}",
+                    description=f"**Headline:** {title}\n\n**Category:** {self.category}\n\n```{content}```",
+                    color=discord.Color.blue(),
+                )
+                review_embed.set_author(
+                    name=f"{interaction.user} ({interaction.user.id})",
+                    icon_url=interaction.user.display_avatar.url,
+                )
+                review_embed.add_field(name="Category", value=self.category, inline=True)
+                review_embed.add_field(name="Status", value="🟡 Pending Staff Review", inline=True)
+                review_embed.set_footer(text=f"Submission ID: {submission_id} • AdSentry Review Queue")
+
+                try:
+                    review_view = StaffReviewView(submission_id) if isinstance(submission_id, int) else None
+                    review_msg = await review_channel.send(embed=review_embed, view=review_view)
+                    if submission and isinstance(submission_id, int):
+                        await self.bot.db.update_review_message_id(submission_id, review_msg.id)
+                except Exception as e:
+                    logger.error(f"Failed to send submission to review channel: {e}", exc_info=True)
+            else:
+                logger.warning(f"Configured review channel ID {review_channel_id} could not be resolved.")
+
+            # -------------------------------------------------------------
+            # 6. Notify User of Successful Submission
+            # -------------------------------------------------------------
+            success_embed = discord.Embed(
+                title="✅ Advertisement Submitted!",
+                description=(
+                    f"Your advertisement for **{self.category}** has been successfully received!\n\n"
+                    f"**Headline:** {title}\n"
+                    f"**Tracking ID:** `#{submission_id}`\n\n"
+                    "Our moderation team will review your ad shortly. You will be notified via DM when a decision is made."
+                ),
+                color=discord.Color.green(),
             )
+            success_embed.set_footer(text="AdSentry Announcement Service")
+            await interaction.followup.send(embed=success_embed, ephemeral=True)
+
         except Exception as e:
-            logger.error(f"Failed to record submission in Supabase: {e}", exc_info=True)
+            logger.error(f"Unexpected error in AdSubmissionModal.on_submit: {e}", exc_info=True)
             embed = discord.Embed(
-                title="❌ Database Error",
-                description="An error occurred while saving your submission. Please try again later or contact an administrator.",
+                title="❌ Error Processing Submission",
+                description=f"An unexpected error occurred while processing your ad:\n`{e}`\n\nPlease try again.",
                 color=discord.Color.red(),
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
-            return
-
-        # -------------------------------------------------------------
-        # 4. Activate User Cooldown in Database
-        # -------------------------------------------------------------
-        try:
-            await self.bot.db.set_user_cooldown(interaction.user.id)
-        except Exception as e:
-            logger.error(f"Failed to set user cooldown: {e}", exc_info=True)
-
-        submission_id = submission.get("id", "N/A") if submission else "N/A"
-
-        # -------------------------------------------------------------
-        # 5. Forward to Staff Review Channel (Dynamically Configured)
-        # -------------------------------------------------------------
-        review_channel_id = guild_config.get("staff_review_channel_id")
-        review_channel = self.bot.get_channel(review_channel_id)
-        if not review_channel and review_channel_id:
-            try:
-                review_channel = await self.bot.fetch_channel(review_channel_id)
-            except Exception:
-                review_channel = None
-
-        if review_channel and isinstance(review_channel, discord.TextChannel):
-            review_embed = discord.Embed(
-                title=f"📥 New Ad Submission #{submission_id}",
-                description=f"**Headline:** {title}\n\n**Category:** {self.category}\n\n```{content}```",
-                color=discord.Color.blue(),
-            )
-            review_embed.set_author(
-                name=f"{interaction.user} ({interaction.user.id})",
-                icon_url=interaction.user.display_avatar.url,
-            )
-            review_embed.add_field(name="Category", value=self.category, inline=True)
-            review_embed.add_field(name="Status", value="🟡 Pending Staff Review", inline=True)
-            review_embed.set_footer(text=f"Submission ID: {submission_id} • AdSentry Review Queue")
-
-            try:
-                review_view = StaffReviewView(submission_id) if isinstance(submission_id, int) else None
-                review_msg = await review_channel.send(embed=review_embed, view=review_view)
-                if submission and isinstance(submission_id, int):
-                    await self.bot.db.update_review_message_id(submission_id, review_msg.id)
-            except Exception as e:
-                logger.error(f"Failed to send submission to review channel: {e}", exc_info=True)
-        else:
-            logger.warning(f"Configured review channel ID {review_channel_id} could not be resolved.")
-
-        # -------------------------------------------------------------
-        # 6. Notify User of Successful Submission
-        # -------------------------------------------------------------
-        success_embed = discord.Embed(
-            title="✅ Advertisement Submitted!",
-            description=(
-                f"Your advertisement for **{self.category}** has been successfully received!\n\n"
-                f"**Headline:** {title}\n"
-                f"**Tracking ID:** `#{submission_id}`\n\n"
-                "Our moderation team will review your ad shortly. You will be notified via DM when a decision is made."
-            ),
-            color=discord.Color.green(),
-        )
-        success_embed.set_footer(text="AdSentry Announcement Service")
-        await interaction.followup.send(embed=success_embed, ephemeral=True)
 
 
 class CategorySelect(discord.ui.Select):
