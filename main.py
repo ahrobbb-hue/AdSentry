@@ -5,8 +5,10 @@ Main Entry Point & Bot Core Lifecycle Setup
 
 from __future__ import annotations
 
+import os
 import asyncio
 from pathlib import Path
+from aiohttp import web
 import discord
 from discord.ext import commands
 
@@ -15,6 +17,25 @@ from database import SupabaseDatabase
 from utils import setup_logger
 
 logger = setup_logger("AdSentry", level=Config.LOG_LEVEL)
+
+
+async def start_health_check_server() -> None:
+    """Starts an asynchronous HTTP server to satisfy Render Web Service port checks."""
+    port_str = os.getenv("PORT")
+    if not port_str:
+        return
+    try:
+        port = int(port_str)
+        app = web.Application()
+        app.router.add_get("/", lambda r: web.Response(text="AdSentry Bot is Online and Healthy!"))
+        app.router.add_get("/health", lambda r: web.Response(text="OK"))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        logger.info(f"Render Web Service health-check listening on port {port}")
+    except Exception as e:
+        logger.warning(f"Could not bind health-check server on PORT {port_str}: {e}")
 
 
 class AdSentryBot(commands.Bot):
@@ -67,6 +88,9 @@ class AdSentryBot(commands.Bot):
         else:
             synced = await self.tree.sync()
             logger.info(f"Synced {len(synced)} global slash command(s).")
+
+        # 4. Start Render Web Service Health-Check Server (if PORT is set)
+        await start_health_check_server()
 
     async def on_ready(self) -> None:
         """Triggered when the bot is connected and ready."""
