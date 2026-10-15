@@ -446,27 +446,35 @@ class SupabaseDatabase:
         """
         client = await self.get_client()
         try:
+            # Note: We omit 'language' from submissions(...) as some Supabase schemas
+            # do not have that column migrated yet.
             query = (
                 client.table("active_posts")
-                .select("id, channel_id, message_id, thread_id, expires_at, published_at, submissions(id, user_name, title, category, content, language, user_avatar_url)")
+                .select("id, guild_id, channel_id, message_id, thread_id, expires_at, published_at, submissions(id, user_name, title, category, content, user_avatar_url)")
                 .eq("is_expired", False)
                 .order("published_at", desc=True)
             )
             if guild_id:
-                query = query.eq("guild_id", guild_id)
+                query = query.or_(f"guild_id.eq.{guild_id},guild_id.is.null")
 
             response = await query.execute()
             posts = response.data or []
 
             # If category_query is provided and not 'ALL', filter matching posts
             if category_query and category_query.upper() != "ALL":
-                tokens = [t.strip().lower() for t in category_query.split("|") if t.strip()]
+                def norm(t: str) -> str:
+                    t = (t or "").lower()
+                    for c_from, c_to in [("أ", "ا"), ("إ", "ا"), ("آ", "ا"), ("ة", "ه"), ("ى", "ي")]:
+                        t = t.replace(c_from, c_to)
+                    return t
+
+                tokens = [norm(t.strip()) for t in category_query.split("|") if t.strip()]
                 filtered = []
                 for p in posts:
                     sub = p.get("submissions")
                     if sub and isinstance(sub, dict):
-                        cat = (sub.get("category") or "").lower()
-                        title = (sub.get("title") or "").lower()
+                        cat = norm(sub.get("category") or "")
+                        title = norm(sub.get("title") or "")
                         if any(token in cat or token in title for token in tokens):
                             filtered.append(p)
                 return filtered[:limit]
