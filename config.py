@@ -23,6 +23,16 @@ class Config:
     DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "").strip()
     GUILD_ID: int | None = int(os.getenv("GUILD_ID")) if os.getenv("GUILD_ID") else None
 
+    # Supabase Credentials
+    SUPABASE_URL: str = os.getenv("SUPABASE_URL", "https://ydwsqjfethnwebkdsmd.supabase.co").strip()
+    SUPABASE_ANON_KEY: str = os.getenv("SUPABASE_ANON_KEY", "").strip()
+    SUPABASE_SERVICE_ROLE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+    # Prefer Service Role Key for server-side bot backend operations (bypasses RLS)
+    @classmethod
+    def get_supabase_key(cls) -> str:
+        return cls.SUPABASE_SERVICE_ROLE_KEY or cls.SUPABASE_ANON_KEY
+
     # Channel IDs
     STAFF_REVIEW_CHANNEL_ID: int = int(os.getenv("STAFF_REVIEW_CHANNEL_ID", "0"))
     ANNOUNCEMENT_CHANNEL_ID: int = int(os.getenv("ANNOUNCEMENT_CHANNEL_ID", "0"))
@@ -33,12 +43,9 @@ class Config:
         int(r.strip()) for r in _raw_staff_roles.split(",") if r.strip().isdigit()
     ]
 
-    # Database
-    DATABASE_PATH: Path = BASE_DIR / os.getenv("DATABASE_PATH", "database/adsentry.db")
-
     # Moderation & Cooldowns
     COOLDOWN_HOURS: int = int(os.getenv("COOLDOWN_HOURS", "24"))
-    _raw_forbidden = os.getenv("FORBIDDEN_WORDS", "discord.gg/,t.me/,@everyone,@here")
+    _raw_forbidden = os.getenv("FORBIDDEN_WORDS", "discord.gg/,t.me/,invite.gg/,@everyone,@here")
     FORBIDDEN_WORDS: list[str] = [
         word.strip().lower() for word in _raw_forbidden.split(",") if word.strip()
     ]
@@ -53,8 +60,6 @@ class Config:
         missing = []
         if not cls.DISCORD_TOKEN:
             missing.append("DISCORD_TOKEN is missing or empty.")
-        if cls.STAFF_REVIEW_CHANNEL_ID == 0:
-            missing.append("STAFF_REVIEW_CHANNEL_ID must be configured.")
-        if cls.ANNOUNCEMENT_CHANNEL_ID == 0:
-            missing.append("ANNOUNCEMENT_CHANNEL_ID must be configured.")
+        if not cls.SUPABASE_URL or not cls.get_supabase_key():
+            missing.append("SUPABASE_URL or API keys are missing.")
         return missing

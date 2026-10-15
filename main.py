@@ -11,7 +11,7 @@ import discord
 from discord.ext import commands
 
 from config import Config
-from database import Database
+from database import SupabaseDatabase
 from utils import setup_logger
 
 logger = setup_logger("AdSentry", level=Config.LOG_LEVEL)
@@ -31,19 +31,19 @@ class AdSentryBot(commands.Bot):
             help_command=None,
         )
 
-        self.db = Database(Config.DATABASE_PATH)
+        self.db = SupabaseDatabase()
 
     async def setup_hook(self) -> None:
         """Executes asynchronous setup before the bot connects to Discord gateway."""
         logger.info("Initializing AdSentry Core Systems...")
 
-        # 1. Initialize SQLite Database Schema
+        # 1. Initialize Supabase Database Connection
         try:
-            await self.db.init_db()
-            logger.info("Database initialized successfully.")
+            await self.db.connect()
+            await self.db.check_connection()
+            logger.info("Supabase database handler initialized.")
         except Exception as e:
-            logger.critical(f"Failed to initialize database: {e}", exc_info=True)
-            raise
+            logger.warning(f"Notice during Supabase initialization: {e}")
 
         # 2. Dynamic Cog / Extension Loading
         cogs_dir = Path(__file__).parent / "cogs"
