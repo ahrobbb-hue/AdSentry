@@ -13,6 +13,7 @@ from discord.ext import commands
 
 from config import Config
 from cogs.moderation import StaffReviewView, is_staff
+from utils import screen_content
 
 logger = logging.getLogger("AdSentry.Submissions")
 
@@ -67,31 +68,32 @@ class AdSubmissionModal(discord.ui.Modal):
         try:
             title = self.ad_title.value.strip()
             content = self.ad_content.value.strip()
-            full_text = f"{title} {content}".lower()
 
             # -------------------------------------------------------------
-            # 1. Auto-Moderation & Link Filtering Check
+            # 1. Advanced Auto-Moderation & Content Guard Screening
             # -------------------------------------------------------------
-            flagged_words = [word for word in Config.FORBIDDEN_WORDS if word in full_text]
-            if flagged_words:
+            is_flagged, flagged_terms = screen_content(title, content)
+            if is_flagged:
                 if self.lang == "ar":
                     embed = discord.Embed(
-                        title="🛡️ تم حظر الإعلان بواسطة نظام الحماية التلقائي",
+                        title="🛡️ تم حظر الإعلان فوراً بواسطة درع الحماية التلقائي",
                         description=(
-                            "تعذر إرسال إعلانك لأنه يحتوي على مصطلحات مقيدة أو روابط غير مصرح بها:\n"
-                            f"**الأنماط المكتشفة:** `{', '.join(flagged_words)}`\n\n"
-                            "يرجى تعديل إعلانك وفقاً لقوانين إعلانات السيرفر."
+                            "🚫 **تم رفض الإعلان تلقائياً ولم يتم إرساله للإدارة.**\n\n"
+                            "تم رصد محتوى ينتهك سياسات المجتمع (محتوى جنسي أو إباحي، ألفاظ مسيئة أو عنصرية، أو روابط محظورة).\n\n"
+                            f"⚠️ **الأنماط المخالفة المكتشفة:** `{', '.join(flagged_terms[:6])}`\n\n"
+                            "يرجى الالتزام بقواعد النشر وسياسات الخادم وعدم تكرار المحتوى المخالف."
                         ),
                         color=discord.Color.red(),
                     )
-                    embed.set_footer(text="نظام حماية AdSentry")
+                    embed.set_footer(text="نظام حماية وتصفية الإعلانات • AdSentry AutoMod")
                 else:
                     embed = discord.Embed(
-                        title="🛡️ Submission Blocked by Auto-Mod",
+                        title="🛡️ Submission Blocked by Content Guard",
                         description=(
-                            "Your advertisement could not be submitted because it contains restricted terms or unauthorized links:\n"
-                            f"**Detected forbidden patterns:** `{', '.join(flagged_words)}`\n\n"
-                            "Please revise your submission in accordance with our server advertising guidelines."
+                            "🚫 **Your advertisement was automatically rejected and not sent to staff.**\n\n"
+                            "Detected content that violates our community standards (sexual/NSFW terms, profanity, hate speech, or prohibited links).\n\n"
+                            f"⚠️ **Detected violations:** `{', '.join(flagged_terms[:6])}`\n\n"
+                            "Please revise your submission in accordance with server advertising guidelines."
                         ),
                         color=discord.Color.red(),
                     )
@@ -99,7 +101,7 @@ class AdSubmissionModal(discord.ui.Modal):
 
                 await interaction.followup.send(embed=embed, ephemeral=True)
                 logger.warning(
-                    f"Blocked submission from {interaction.user} (ID: {interaction.user.id}) due to forbidden words: {flagged_words}"
+                    f"Blocked offending submission from {interaction.user} (ID: {interaction.user.id}) due to: {flagged_terms}"
                 )
                 return
 
