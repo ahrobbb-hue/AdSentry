@@ -165,6 +165,7 @@ class SupabaseDatabase:
         title: str | None = None,
         guild_id: int | None = None,
         language: str = "en",
+        image_url: str | None = None,
     ) -> dict[str, Any] | None:
         """Creates a new PENDING ad submission in Supabase."""
         client = await self.get_client()
@@ -180,15 +181,24 @@ class SupabaseDatabase:
             "status": "PENDING",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
+        if image_url:
+            payload["image_url"] = image_url
 
         try:
             try:
                 response = await client.table("submissions").insert(payload).execute()
             except Exception as insert_err:
-                # Fallback if 'language' column hasn't been migrated yet in Supabase
-                if "language" in str(insert_err).lower():
+                err_str = str(insert_err).lower()
+                modified = False
+                if "image_url" in err_str:
+                    logger.warning("Supabase submissions table missing 'image_url' column. Falling back without it.")
+                    payload.pop("image_url", None)
+                    modified = True
+                if "language" in err_str:
                     logger.warning("Supabase submissions table missing 'language' column. Falling back without it.")
                     payload.pop("language", None)
+                    modified = True
+                if modified:
                     response = await client.table("submissions").insert(payload).execute()
                 else:
                     raise insert_err

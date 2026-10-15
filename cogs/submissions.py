@@ -6,6 +6,7 @@ Handles category selection, submission modals, auto-moderation, anti-spam cooldo
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 import discord
 from discord import app_commands
@@ -72,6 +73,21 @@ class AdSubmissionModal(discord.ui.Modal):
         )
         self.add_item(self.ad_content)
 
+        if lang == "ar":
+            image_label = "رابط بنر أو صورة الإعلان (اختياري)"
+            image_placeholder = "https://i.imgur.com/... أو رابط ينتهي بـ png/jpg/gif"
+        else:
+            image_label = "Banner / Image URL (Optional)"
+            image_placeholder = "https://i.imgur.com/... or direct image link"
+
+        self.ad_image = discord.ui.TextInput(
+            label=image_label,
+            placeholder=image_placeholder,
+            required=False,
+            max_length=400,
+        )
+        self.add_item(self.ad_image)
+
     async def on_submit(self, interaction: discord.Interaction) -> None:
         """Processes the ad submission with auto-moderation, cooldown checks, and DB storage."""
         # Defer immediately to prevent Discord's 3-second modal timeout
@@ -80,6 +96,20 @@ class AdSubmissionModal(discord.ui.Modal):
         try:
             title = self.ad_title.value.strip()
             content = self.ad_content.value.strip()
+
+            # Process optional image URL from input field or content
+            raw_img = self.ad_image.value.strip() if self.ad_image.value else ""
+            image_url = None
+            if raw_img and (raw_img.startswith("http://") or raw_img.startswith("https://")):
+                image_url = raw_img
+            else:
+                img_match = re.search(
+                    r'(https?://[^\s<>"\'{}|\\^`]+(?:\.(?:png|jpe?g|gif|webp)|cdn\.discordapp\.com/attachments/|media\.discordapp\.net/attachments/|i\.imgur\.com/)[^\s<>"\'{}|\\^`]*)',
+                    content,
+                    re.IGNORECASE,
+                )
+                if img_match:
+                    image_url = img_match.group(1).strip()
 
             # Verify admin/owner privileges for server promotions
             is_admin = self.is_admin or is_server_admin_or_owner(interaction.user, interaction.guild)
@@ -274,6 +304,7 @@ class AdSubmissionModal(discord.ui.Modal):
                     content=content,
                     guild_id=guild_id,
                     language=self.lang,
+                    image_url=image_url,
                 )
             except Exception as e:
                 logger.error(f"Failed to record submission in Supabase: {e}", exc_info=True)
@@ -322,6 +353,10 @@ class AdSubmissionModal(discord.ui.Modal):
                     name=f"{interaction.user} ({interaction.user.id})",
                     icon_url=interaction.user.display_avatar.url,
                 )
+                review_embed.set_thumbnail(url=interaction.user.display_avatar.url)
+                if image_url:
+                    review_embed.set_image(url=image_url)
+
                 review_embed.add_field(name="Category", value=self.category, inline=True)
                 review_embed.add_field(name="Language", value=lang_tag, inline=True)
                 review_embed.add_field(name="Status", value="🟡 Pending Staff Review", inline=True)

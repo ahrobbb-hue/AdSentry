@@ -34,8 +34,9 @@ CREATE TABLE IF NOT EXISTS public.submissions (
     reviewed_at TIMESTAMPTZ
 );
 
--- Schema Migration for language column:
+-- Schema Migration for language and image_url columns:
 ALTER TABLE public.submissions ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'en';
+ALTER TABLE public.submissions ADD COLUMN IF NOT EXISTS image_url TEXT;
 
 -- 3. User Cooldowns Table: Tracks anti-spam and submission rate limits
 CREATE TABLE IF NOT EXISTS public.user_cooldowns (

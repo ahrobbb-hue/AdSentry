@@ -393,6 +393,8 @@ class ModerationCog(commands.Cog, name="Moderation"):
                 title=submission.get("title") or "Announcement",
                 category=submission.get("category", "General"),
                 content=submission.get("content", ""),
+                user_id=submission.get("user_id"),
+                image_url=submission.get("image_url"),
             )
         except Exception as e:
             logger.error(f"Failed to publish ad #{submission_id} via webhook: {e}", exc_info=True)
@@ -418,7 +420,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
                 thread_id=thread.id if thread else None,
                 guild_id=guild_id,
             )
-            # Update button on published ad with the database post_id
+            # Update button on published ad with the database post_id and thread link
             if active_post and "id" in active_post:
                 try:
                     from cogs.features import AdInterestView
@@ -426,7 +428,11 @@ class ModerationCog(commands.Cog, name="Moderation"):
                     wh = await get_or_create_webhook(announcement_channel)
                     await wh.edit_message(
                         message_id=published_msg.id,
-                        view=AdInterestView(post_id=active_post["id"], interest_count=0),
+                        view=AdInterestView(
+                            post_id=active_post["id"],
+                            interest_count=0,
+                            thread_url=thread.jump_url if thread else None,
+                        ),
                     )
                 except Exception as ex:
                     logger.debug(f"Could not update published message view with post_id: {ex}")

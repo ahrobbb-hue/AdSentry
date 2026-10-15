@@ -129,11 +129,20 @@ class AdInterestButton(discord.ui.Button):
 
 
 class AdInterestView(discord.ui.View):
-    """Persistent view containing the ⭐ interest button for a published ad."""
+    """Persistent view containing the ⭐ interest button and optional thread link for a published ad."""
 
-    def __init__(self, post_id: int, interest_count: int = 0) -> None:
+    def __init__(self, post_id: int, interest_count: int = 0, thread_url: str | None = None) -> None:
         super().__init__(timeout=None)
         self.add_item(AdInterestButton(post_id, interest_count))
+        if thread_url:
+            self.add_item(
+                discord.ui.Button(
+                    label="💬 روم النقاش / Discussion",
+                    url=thread_url,
+                    style=discord.ButtonStyle.link,
+                    row=0,
+                )
+            )
 
 
 # ---------------------------------------------------------------------------

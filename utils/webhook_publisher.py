@@ -1,14 +1,72 @@
 """
 AdSentry Webhook Publisher Utility
-Handles creating/retrieving webhooks, posting ads as the user, and spawning discussion threads.
+Handles creating/retrieving webhooks, posting ads with modern marketing-grade embed cards,
+banner images, category-based theming, and spawning discussion threads.
 """
 
 from __future__ import annotations
 
 import logging
+import re
+from datetime import datetime, timezone
 import discord
 
 logger = logging.getLogger("AdSentry.WebhookPublisher")
+
+# Regex to detect direct image URLs from common hosting services or extensions
+IMAGE_URL_PATTERN = re.compile(
+    r'(https?://[^\s<>"\'{}|\\^`]+(?:\.(?:png|jpe?g|gif|webp)|cdn\.discordapp\.com/attachments/|media\.discordapp\.net/attachments/|i\.imgur\.com/)[^\s<>"\'{}|\\^`]*)',
+    re.IGNORECASE,
+)
+
+
+def resolve_category_theme(category: str) -> dict[str, Any]:
+    """Resolves matching color, emoji, and badges for a given category name."""
+    cat_lower = (category or "").lower()
+
+    if any(k in cat_lower for k in ("program", "برمج", "dev", "code")):
+        return {
+            "emoji": "💻",
+            "color": discord.Color.from_rgb(0, 210, 106),  # Emerald Cyber Green
+            "badge": "💻 البرمجة والتطوير | Programming",
+        }
+    if any(k in cat_lower for k in ("server", "سيرفر", "مجتمع", "communit")):
+        return {
+            "emoji": "🌐",
+            "color": discord.Color.from_rgb(88, 101, 242),  # Discord Blurple
+            "badge": "🌐 سيرفرات ديسكورد | Discord Servers",
+        }
+    if any(k in cat_lower for k in ("job", "وظائف", "توظيف", "hiring", "work", "عمل", "خدم", "service")):
+        return {
+            "emoji": "💼",
+            "color": discord.Color.from_rgb(241, 196, 15),  # Executive Amber Gold
+            "badge": "💼 وظائف وخدمات | Jobs & Services",
+        }
+
+    return {
+        "emoji": "📌",
+        "color": discord.Color.from_rgb(52, 152, 219),  # Modern Electric Blue
+        "badge": f"📌 {category}",
+    }
+
+
+def extract_and_clean_image(content: str, explicit_image: str | None = None) -> tuple[str | None, str]:
+    """
+    Extracts an image URL (from explicit input or regex in content).
+    Returns (image_url, cleaned_content).
+    """
+    if explicit_image and (explicit_image.startswith("http://") or explicit_image.startswith("https://")):
+        return explicit_image.strip(), content
+
+    # Search for embedded image link in the content
+    match = IMAGE_URL_PATTERN.search(content)
+    if match:
+        extracted_url = match.group(1).strip()
+        # Clean URL if it's on its own line
+        cleaned_content = re.sub(re.escape(extracted_url), "", content).strip()
+        return extracted_url, cleaned_content
+
+    return None, content
 
 
 async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook:
@@ -18,13 +76,12 @@ async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook
         for wh in webhooks:
             if wh.name.startswith("AdSentry") or wh.token is not None:
                 return wh
-        
-        # None found, create a new webhook
+
         webhook = await channel.create_webhook(
             name="AdSentry Publisher",
             reason="AdSentry announcement publishing system",
         )
-        logger.info(f"Created new webhook '{webhook.name}' in channel #{channel.name} (ID: {channel.id})")
+        logger.info(f"Created new webhook '{webhook.name}' in #{channel.name} (ID: {channel.id})")
         return webhook
     except discord.Forbidden:
         logger.error(f"Missing 'Manage Webhooks' permission in #{channel.name} (ID: {channel.id})")
@@ -42,39 +99,88 @@ async def publish_ad_via_webhook(
     category: str,
     content: str,
     post_id: int | None = None,
+    user_id: int | None = None,
+    image_url: str | None = None,
 ) -> tuple[discord.WebhookMessage, discord.Thread | None, str]:
     """
-    Publishes an ad via webhook disguised as the submitter, then initializes a discussion thread.
-    Attaches ⭐ Interest and 🌐 Translate persistent buttons to the published message.
+    Publishes a premium, modern advertisement card via webhook disguised as the submitter.
+    Includes banner images, user avatars, structured badges, and spawns discussion threads.
     Returns: (published_message, discussion_thread, webhook_url)
     """
-    # Import here to avoid circular imports
     from cogs.features import AdInterestView, TranslateView
 
     webhook = await get_or_create_webhook(channel)
 
-    # Category icons map
-    category_emojis = {
-        "Programming": "💻",
-        "Discord Servers": "🌐",
-        "Services": "🚀",
-        "Others": "📌",
-    }
-    emoji = category_emojis.get(category, "📢")
+    # Resolve theme styling
+    theme = resolve_category_theme(category)
+    emoji = theme["emoji"]
+    color = theme["color"]
+    badge_label = theme["badge"]
 
-    # Build sleek announcement presentation
+    # Extract & clean image if present
+    final_image_url, clean_content = extract_and_clean_image(content, image_url)
+
+    # Build the card
     embed = discord.Embed(
-        title=f"{emoji} {title}",
-        description=content,
-        color=discord.Color.from_rgb(41, 128, 185),
+        title=f"{emoji} {title.strip()}",
+        description=f"{clean_content}\n\n──────────────────────────────",
+        color=color,
     )
-    embed.add_field(name="Category", value=f"{emoji} {category}", inline=True)
-    embed.set_footer(text="Verified Announcement • AdSentry Moderation")
 
-    # Attach ⭐ interest button (uses post_id=0 as placeholder; updated after DB insert)
+    # 1. Author Header with User Badge
+    embed.set_author(
+        name=f"{user_name}  •  إعلان موثّق | Verified Ad",
+        icon_url=user_avatar_url,
+    )
+
+    # 2. Thumbnail (submitter avatar) in upper corner
+    if user_avatar_url:
+        embed.set_thumbnail(url=user_avatar_url)
+
+    # 3. Large Banner Image (if provided)
+    if final_image_url:
+        embed.set_image(url=final_image_url)
+
+    # 4. Inline Structured Fields
+    embed.add_field(
+        name="🏷️ القسم | Category",
+        value=f"`{badge_label}`",
+        inline=True,
+    )
+
+    if user_id:
+        embed.add_field(
+            name="👤 المعلن | Advertiser",
+            value=f"<@{user_id}>",
+            inline=True,
+        )
+    else:
+        embed.add_field(
+            name="👤 المعلن | Advertiser",
+            value=f"**{user_name}**",
+            inline=True,
+        )
+
+    embed.add_field(
+        name="🛡️ الفحص | Status",
+        value="`✅ موثّق / Verified`",
+        inline=True,
+    )
+
+    # 5. Footer & Timestamp
+    guild_name = channel.guild.name if channel.guild else "Discord"
+    guild_icon = channel.guild.icon.url if (channel.guild and channel.guild.icon) else None
+    embed.set_footer(
+        text=f"AdSentry Moderation • {guild_name}",
+        icon_url=guild_icon,
+    )
+    embed.timestamp = datetime.now(timezone.utc)
+
+    # Initial persistent view
     _temp_post_id = post_id or 0
     interest_view = AdInterestView(post_id=_temp_post_id, interest_count=0)
 
+    # Send announcement via Webhook
     published_message = await webhook.send(
         embed=embed,
         username=user_name,
@@ -92,26 +198,42 @@ async def publish_ad_via_webhook(
             auto_archive_duration=1440,  # 24 hours
             reason="AdSentry discussion thread for published ad",
         )
-        
-        welcome_embed = discord.Embed(
-            title="💬 Announcement Discussion",
-            description=(
-                f"This thread is dedicated for inquiries, questions, and discussions regarding **{title}**.\n\n"
-                "• Feel free to ask the poster questions.\n"
-                "• Keep discussions respectful and in line with server rules."
-            ),
-            color=discord.Color.dark_theme(),
-        )
-        welcome_embed.set_footer(text="AdSentry Thread Manager")
 
-        # Add 🌐 translate button in thread welcome message
+        # Welcome message inside thread
+        welcome_embed = discord.Embed(
+            title="💬 روم النقاش والاستفسارات | Discussion & Inquiries",
+            description=(
+                f"أهلاً بكم في المساحة المخصصة للتواصل والنقاش حول إعلان **{title}**.\n"
+                f"Welcome to the dedicated discussion thread for **{title}**.\n\n"
+                f"• يمكنكم طرح الأسئلة والتواصل مع المعلن: {f'<@{user_id}>' if user_id else f'**{user_name}**'}\n"
+                "• يرجى الالتزام بالاحترام المتبادل وقوانين السيرفر.\n"
+                "• Feel free to ask questions or discuss terms directly here."
+            ),
+            color=color,
+        )
+        if user_avatar_url:
+            welcome_embed.set_thumbnail(url=user_avatar_url)
+        welcome_embed.set_footer(text="AdSentry Thread Manager • يغلق تلقائياً بعد 24 ساعة من عدم التفاعل")
+
         translate_view = TranslateView(
             post_id=_temp_post_id,
-            ad_content=content,
+            ad_content=clean_content,
             ad_title=title,
         )
         await thread.send(embed=welcome_embed, view=translate_view)
         logger.info(f"Created discussion thread '{thread.name}' for published ad #{published_message.id}")
+
+        # Update the main message to attach a direct link button to the newly created thread
+        try:
+            view_with_thread = AdInterestView(
+                post_id=_temp_post_id,
+                interest_count=0,
+                thread_url=thread.jump_url,
+            )
+            await webhook.edit_message(message_id=published_message.id, view=view_with_thread)
+        except Exception as e:
+            logger.debug(f"Could not update webhook message with thread link button: {e}")
+
     except discord.Forbidden:
         logger.warning(f"Bot lacks permission to create threads in #{channel.name}.")
     except Exception as e:
