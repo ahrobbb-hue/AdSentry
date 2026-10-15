@@ -64,3 +64,15 @@ CREATE INDEX IF NOT EXISTS idx_submissions_status ON public.submissions(status);
 CREATE INDEX IF NOT EXISTS idx_submissions_user_id ON public.submissions(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_cooldowns_until ON public.user_cooldowns(cooldown_until);
 CREATE INDEX IF NOT EXISTS idx_active_posts_expiry ON public.active_posts(expires_at, is_expired);
+
+-- 5. Ad Interests Table: Tracks user bookmarks / interests for published ads (⭐ button)
+CREATE TABLE IF NOT EXISTS public.ad_interests (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    post_id BIGINT NOT NULL REFERENCES public.active_posts(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(post_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ad_interests_post ON public.ad_interests(post_id);
+CREATE INDEX IF NOT EXISTS idx_ad_interests_user ON public.ad_interests(user_id);

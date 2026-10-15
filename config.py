@@ -54,6 +54,9 @@ class Config:
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
+    # AI Translation (Google Gemini Flash)
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
+
     @classmethod
     def validate(cls) -> list[str]:
         """Validates critical configuration values and returns a list of missing items."""

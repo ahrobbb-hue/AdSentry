@@ -79,7 +79,15 @@ class AdSentryBot(commands.Bot):
                 except Exception as e:
                     logger.error(f"Failed to load extension {cog_name}: {e}", exc_info=True)
 
-        # 3. Synchronize Application (Slash) Commands
+        # 3. Register Persistent Views (survive bot restarts)
+        # These views have timeout=None and use stable custom_id patterns
+        from cogs.features import AdInterestView, TranslateView
+        # Register generic persistent view instances — Discord matches them by custom_id prefix
+        self.add_view(AdInterestView(post_id=0))
+        self.add_view(TranslateView(post_id=0, ad_content="", ad_title=""))
+        logger.info("Registered persistent AdInterestView and TranslateView.")
+
+        # 4. Synchronize Application (Slash) Commands
         if Config.GUILD_ID:
             guild = discord.Object(id=Config.GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -89,7 +97,7 @@ class AdSentryBot(commands.Bot):
             synced = await self.tree.sync()
             logger.info(f"Synced {len(synced)} global slash command(s).")
 
-        # 4. Start Render Web Service Health-Check Server (if PORT is set)
+        # 5. Start Render Web Service Health-Check Server (if PORT is set)
         await start_health_check_server()
 
     async def on_ready(self) -> None:

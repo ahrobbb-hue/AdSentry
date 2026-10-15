@@ -41,11 +41,16 @@ async def publish_ad_via_webhook(
     title: str,
     category: str,
     content: str,
+    post_id: int | None = None,
 ) -> tuple[discord.WebhookMessage, discord.Thread | None, str]:
     """
     Publishes an ad via webhook disguised as the submitter, then initializes a discussion thread.
+    Attaches ⭐ Interest and 🌐 Translate persistent buttons to the published message.
     Returns: (published_message, discussion_thread, webhook_url)
     """
+    # Import here to avoid circular imports
+    from cogs.features import AdInterestView, TranslateView
+
     webhook = await get_or_create_webhook(channel)
 
     # Category icons map
@@ -66,11 +71,16 @@ async def publish_ad_via_webhook(
     embed.add_field(name="Category", value=f"{emoji} {category}", inline=True)
     embed.set_footer(text="Verified Announcement • AdSentry Moderation")
 
+    # Attach ⭐ interest button (uses post_id=0 as placeholder; updated after DB insert)
+    _temp_post_id = post_id or 0
+    interest_view = AdInterestView(post_id=_temp_post_id, interest_count=0)
+
     published_message = await webhook.send(
         embed=embed,
         username=user_name,
         avatar_url=user_avatar_url,
         wait=True,
+        view=interest_view,
     )
 
     # Create associated discussion thread
@@ -79,7 +89,7 @@ async def publish_ad_via_webhook(
         thread_title = f"💬 {title[:70]} - Discussion"
         thread = await published_message.create_thread(
             name=thread_title,
-            auto_archive_duration=1440, # 24 hours
+            auto_archive_duration=1440,  # 24 hours
             reason="AdSentry discussion thread for published ad",
         )
         
@@ -93,7 +103,14 @@ async def publish_ad_via_webhook(
             color=discord.Color.dark_theme(),
         )
         welcome_embed.set_footer(text="AdSentry Thread Manager")
-        await thread.send(embed=welcome_embed)
+
+        # Add 🌐 translate button in thread welcome message
+        translate_view = TranslateView(
+            post_id=_temp_post_id,
+            ad_content=content,
+            ad_title=title,
+        )
+        await thread.send(embed=welcome_embed, view=translate_view)
         logger.info(f"Created discussion thread '{thread.name}' for published ad #{published_message.id}")
     except discord.Forbidden:
         logger.warning(f"Bot lacks permission to create threads in #{channel.name}.")

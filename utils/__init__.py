@@ -1,5 +1,13 @@
 from .logger import setup_logger
 from .webhook_publisher import publish_ad_via_webhook, get_or_create_webhook
 from .automod import screen_content
+from .translator import translate_ad, detect_language
 
-__all__ = ["setup_logger", "publish_ad_via_webhook", "get_or_create_webhook", "screen_content"]
+__all__ = [
+    "setup_logger",
+    "publish_ad_via_webhook",
+    "get_or_create_webhook",
+    "screen_content",
+    "translate_ad",
+    "detect_language",
+]

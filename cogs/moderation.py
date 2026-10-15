@@ -409,7 +409,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
                 status="APPROVED",
                 reviewed_by=interaction.user.id,
             )
-            await self.bot.db.create_active_post(
+            active_post = await self.bot.db.create_active_post(
                 submission_id=submission_id,
                 channel_id=announcement_channel.id,
                 message_id=published_msg.id,
@@ -418,6 +418,18 @@ class ModerationCog(commands.Cog, name="Moderation"):
                 thread_id=thread.id if thread else None,
                 guild_id=guild_id,
             )
+            # Update button on published ad with the database post_id
+            if active_post and "id" in active_post:
+                try:
+                    from cogs.features import AdInterestView
+                    from utils.webhook_publisher import get_or_create_webhook
+                    wh = await get_or_create_webhook(announcement_channel)
+                    await wh.edit_message(
+                        message_id=published_msg.id,
+                        view=AdInterestView(post_id=active_post["id"], interest_count=0),
+                    )
+                except Exception as ex:
+                    logger.debug(f"Could not update published message view with post_id: {ex}")
         except Exception as e:
             logger.error(f"Failed to persist approval state to Supabase: {e}", exc_info=True)
 

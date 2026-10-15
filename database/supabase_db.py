@@ -483,3 +483,202 @@ class SupabaseDatabase:
         except Exception as e:
             logger.error(f"Error searching active ads: {e}", exc_info=True)
             return []
+
+    # -------------------------------------------------------------
+    # Ad Statistics (for /ad-stats command)
+    # -------------------------------------------------------------
+
+    async def get_ad_stats(self, guild_id: int, days: int = 7) -> dict[str, Any]:
+        """
+        Returns admin stats for a guild covering the past N days:
+        - approved_count, rejected_count
+        - top_categories (list of (category, count))
+        - top_reviewers (list of (reviewer_id, count))
+        """
+        client = await self.get_client()
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+            # Fetch all submissions in the window for this guild
+            response = (
+                await client.table("submissions")
+                .select("status, category, reviewed_by")
+                .eq("guild_id", guild_id)
+                .gte("created_at", cutoff)
+                .execute()
+            )
+            rows = response.data or []
+
+            approved = [r for r in rows if r.get("status") == "APPROVED"]
+            rejected = [r for r in rows if r.get("status") == "REJECTED"]
+
+            # Count categories
+            cat_counts: dict[str, int] = {}
+            for r in rows:
+                cat = (r.get("category") or "Other").split(" ")[0]  # strip emoji suffix
+                cat_counts[cat] = cat_counts.get(cat, 0) + 1
+            top_categories = sorted(cat_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+
+            # Count reviewer activity
+            reviewer_counts: dict[str, int] = {}
+            for r in rows:
+                rev = r.get("reviewed_by")
+                if rev:
+                    rev_str = str(rev)
+                    reviewer_counts[rev_str] = reviewer_counts.get(rev_str, 0) + 1
+            top_reviewers = sorted(reviewer_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+
+            return {
+                "approved_count": len(approved),
+                "rejected_count": len(rejected),
+                "total_count": len(rows),
+                "top_categories": top_categories,
+                "top_reviewers": top_reviewers,
+                "days": days,
+            }
+        except Exception as e:
+            logger.error(f"Error fetching ad stats for guild {guild_id}: {e}", exc_info=True)
+            return {"approved_count": 0, "rejected_count": 0, "total_count": 0,
+                    "top_categories": [], "top_reviewers": [], "days": days}
+
+    # -------------------------------------------------------------
+    # User Active Ads (for /my-ads command)
+    # -------------------------------------------------------------
+
+    async def get_user_active_ads(self, user_id: int, guild_id: int) -> list[dict[str, Any]]:
+        """Fetches all active (non-expired) posts belonging to a specific user in a guild."""
+        client = await self.get_client()
+        try:
+            # Get all approved submissions for this user in this guild
+            sub_res = (
+                await client.table("submissions")
+                .select("id, title, category")
+                .eq("user_id", user_id)
+                .eq("guild_id", guild_id)
+                .eq("status", "APPROVED")
+                .execute()
+            )
+            if not sub_res.data:
+                return []
+
+            sub_ids = [s["id"] for s in sub_res.data]
+            sub_map = {s["id"]: s for s in sub_res.data}
+
+            # Get active_posts matching those submission IDs
+            posts_res = (
+                await client.table("active_posts")
+                .select("id, submission_id, channel_id, message_id, thread_id, expires_at, published_at")
+                .in_("submission_id", sub_ids)
+                .eq("is_expired", False)
+                .order("published_at", desc=True)
+                .execute()
+            )
+            posts = posts_res.data or []
+
+            # Merge submission metadata into each post
+            for p in posts:
+                sub_info = sub_map.get(p.get("submission_id"), {})
+                p["title"] = sub_info.get("title", "Ad")
+                p["category"] = sub_info.get("category", "")
+
+            return posts
+        except Exception as e:
+            logger.error(f"Error fetching active ads for user {user_id}: {e}", exc_info=True)
+            return []
+
+    async def delete_active_post(self, post_id: int) -> bool:
+        """Deletes an active post record from the database (used when user self-deletes an ad)."""
+        client = await self.get_client()
+        try:
+            await client.table("active_posts").delete().eq("id", post_id).execute()
+            logger.info(f"Deleted active post #{post_id} from database.")
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting active post #{post_id}: {e}", exc_info=True)
+            return False
+
+    # -------------------------------------------------------------
+    # Ad Interest / Save System (⭐ button)
+    # -------------------------------------------------------------
+
+    async def toggle_ad_interest(
+        self,
+        post_id: int,
+        user_id: int,
+        message_id: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        Toggles the 'interested' status for a user on a post.
+        Resolves post_id via message_id if post_id is missing or 0.
+        Returns dict with keys: 'action' ('added'|'removed'), 'count' (total interests), 'post_id'.
+        """
+        client = await self.get_client()
+        try:
+            # If post_id is not valid, attempt lookup via message_id
+            if (not post_id or post_id <= 0) and message_id:
+                lookup = await client.table("active_posts").select("id").eq("message_id", message_id).limit(1).execute()
+                if lookup.data:
+                    post_id = lookup.data[0]["id"]
+
+            if not post_id or post_id <= 0:
+                logger.warning(f"toggle_ad_interest: could not resolve post_id (post_id={post_id}, message_id={message_id})")
+                return {"action": "error", "count": 0}
+
+            # Check if already interested
+            existing = (
+                await client.table("ad_interests")
+                .select("id")
+                .eq("post_id", post_id)
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+
+            if existing.data:
+                # Remove interest
+                await client.table("ad_interests").delete().eq("post_id", post_id).eq("user_id", user_id).execute()
+                action = "removed"
+            else:
+                # Add interest
+                await client.table("ad_interests").insert({
+                    "post_id": post_id,
+                    "user_id": user_id,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }).execute()
+                action = "added"
+
+            # Count total interests for post
+            count_res = (
+                await client.table("ad_interests")
+                .select("id", count="exact")
+                .eq("post_id", post_id)
+                .execute()
+            )
+            total = count_res.count or 0
+            logger.info(f"Ad interest {action} for post #{post_id} by user {user_id}. Total: {total}")
+            return {"action": action, "count": total, "post_id": post_id}
+        except Exception as e:
+            logger.error(f"Error toggling ad interest for post #{post_id}: {e}", exc_info=True)
+            return {"action": "error", "count": 0}
+
+    async def get_ad_interest_count(self, post_id: int, message_id: int | None = None) -> int:
+        """Returns the total number of users interested in a specific ad post."""
+        client = await self.get_client()
+        try:
+            if (not post_id or post_id <= 0) and message_id:
+                lookup = await client.table("active_posts").select("id").eq("message_id", message_id).limit(1).execute()
+                if lookup.data:
+                    post_id = lookup.data[0]["id"]
+            if not post_id or post_id <= 0:
+                return 0
+
+            res = (
+                await client.table("ad_interests")
+                .select("id", count="exact")
+                .eq("post_id", post_id)
+                .execute()
+            )
+            return res.count or 0
+        except Exception as e:
+            logger.error(f"Error getting interest count for post #{post_id}: {e}", exc_info=True)
+            return 0
