@@ -113,20 +113,63 @@ class AdInterestButton(discord.ui.Button):
                 ephemeral=True,
             )
 
-        # Update button label on the message
+        # Update button label on the message via Webhook
         try:
             view = discord.ui.View.from_message(interaction.message)  # type: ignore
             for item in view.children:
                 if isinstance(item, discord.ui.Button) and (
-                    item.custom_id == f"adsentry:interest:{self.post_id}" or
-                    item.custom_id == f"adsentry:interest:{resolved_post_id}" or
-                    (item.custom_id and item.custom_id.startswith("adsentry:interest:"))
+                    (item.custom_id and item.custom_id.startswith("adsentry:interest:")) or
+                    (item.label and "مهتم" in item.label)
                 ):
                     item.label = f"⭐ مهتم / Interested ({count})"
                     item.custom_id = f"adsentry:interest:{resolved_post_id}"
-            await interaction.message.edit(view=view)  # type: ignore
-        except Exception:
-            pass  # Non-critical
+
+            channel = interaction.channel
+            text_channel = channel.parent if isinstance(channel, discord.Thread) else channel
+
+            wh: discord.Webhook | None = None
+
+            # 1. First try loading saved webhook_url from active_posts
+            try:
+                client = await bot.db.get_client()
+                ap_res = await client.table("active_posts").select("webhook_url").eq("message_id", interaction.message.id).limit(1).execute()
+                if ap_res.data and ap_res.data[0].get("webhook_url"):
+                    wh = discord.Webhook.from_url(ap_res.data[0]["webhook_url"], client=bot)
+            except Exception as e:
+                logger.debug(f"Could not load webhook_url from active_posts: {e}")
+
+            # 2. If not found, look up channel webhooks matching author ID or AdSentry
+            if not wh and isinstance(text_channel, discord.TextChannel):
+                try:
+                    all_wh = await text_channel.webhooks()
+                    for w in all_wh:
+                        if w.id == interaction.message.author.id and w.token is not None:
+                            wh = w
+                            break
+                    if not wh:
+                        for w in all_wh:
+                            if w.token is not None and w.name.startswith("AdSentry"):
+                                wh = w
+                                break
+                    if not wh:
+                        for w in all_wh:
+                            if w.token is not None:
+                                wh = w
+                                break
+                except Exception as e:
+                    logger.debug(f"Could not fetch channel webhooks: {e}")
+
+            # 3. Apply the edit
+            if wh:
+                if isinstance(channel, discord.Thread):
+                    await wh.edit_message(message_id=interaction.message.id, view=view, thread=channel)
+                else:
+                    await wh.edit_message(message_id=interaction.message.id, view=view)
+                logger.info(f"Updated interest button on msg #{interaction.message.id} -> count={count}")
+            else:
+                await interaction.message.edit(view=view)  # type: ignore
+        except Exception as e:
+            logger.error(f"Failed to update ad interest button label on message: {e}", exc_info=True)
 
 
 class AdVerifyButton(discord.ui.Button):
