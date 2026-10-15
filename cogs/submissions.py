@@ -18,13 +18,25 @@ from utils import screen_content
 logger = logging.getLogger("AdSentry.Submissions")
 
 
+def is_server_admin_or_owner(user: discord.Member | discord.User, guild: discord.Guild | None) -> bool:
+    """Checks whether the user is server owner, administrator, or authorized staff."""
+    if not isinstance(user, discord.Member):
+        return False
+    if guild and guild.owner_id == user.id:
+        return True
+    if user.guild_permissions.administrator:
+        return True
+    return is_staff(user)
+
+
 class AdSubmissionModal(discord.ui.Modal):
     """Modal for collecting advertisement title and content from the user in their chosen language."""
 
-    def __init__(self, category: str, bot: commands.Bot, lang: str = "en") -> None:
+    def __init__(self, category: str, bot: commands.Bot, lang: str = "en", is_admin: bool = False) -> None:
         self.lang = lang
         self.category = category
         self.bot = bot
+        self.is_admin = is_admin
 
         if lang == "ar":
             modal_title = f"تقديم إعلان: {category}"[:45]
@@ -69,11 +81,79 @@ class AdSubmissionModal(discord.ui.Modal):
             title = self.ad_title.value.strip()
             content = self.ad_content.value.strip()
 
+            # Verify admin/owner privileges for server promotions
+            is_admin = self.is_admin or is_server_admin_or_owner(interaction.user, interaction.guild)
+
+            # Block non-admins from submitting under Discord Servers category
+            if ("سيرفرات" in self.category or "Servers" in self.category) and not is_admin:
+                if self.lang == "ar":
+                    embed = discord.Embed(
+                        title="⛔ الترويج لسيرفرات الديسكورد مخصص للإدارة فقط",
+                        description=(
+                            "عذراً، **الترويج لسيرفرات الديسكورد مقتصر حصرياً على مالك وإدارة السيرفر**.\n\n"
+                            "لا يمكن للأعضاء العاديين نشر إعلانات ترويجية لسيرفرات ديسكورد أخرى.\n"
+                            "يمكنك الترويج لمشاريعك البرمجية، بوتاتك، أو خدماتك فقط."
+                        ),
+                        color=discord.Color.red(),
+                    )
+                else:
+                    embed = discord.Embed(
+                        title="⛔ Discord Server Promotion is Admin-Only",
+                        description=(
+                            "Advertising Discord servers is strictly reserved for Server Administrators and Owners.\n\n"
+                            "Regular members cannot submit advertisements promoting other Discord servers.\n"
+                            "You are welcome to promote your software projects, bots, or services."
+                        ),
+                        color=discord.Color.red(),
+                    )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+
             # -------------------------------------------------------------
             # 1. Advanced Auto-Moderation & Content Guard Screening
             # -------------------------------------------------------------
-            is_flagged, flagged_terms = screen_content(title, content)
+            is_flagged, flagged_terms = screen_content(title, content, allow_discord_invites=is_admin)
             if is_flagged:
+                # Check if flagged specifically for unauthorized Discord server invite
+                has_invite_violation = any(
+                    "invite" in str(f).lower() or "discord.gg" in str(f).lower() for f in flagged_terms
+                )
+                if has_invite_violation and not is_admin:
+                    if self.lang == "ar":
+                        embed = discord.Embed(
+                            title="⛔ روابط سيرفرات الديسكورد مخصصة للإدارة فقط",
+                            description=(
+                                "🚫 **لا يُسمح للأعضاء بنشر روابط دعوة لسيرفرات ديسكورد أخرى.**\n\n"
+                                "الترويج لسيرفرات الديسكورد مقتصر حصرياً على **مالك وإدارة السيرفر**.\n\n"
+                                "💡 **ما يمكنك الترويج له بحرية كعضو:**\n"
+                                "• مشاريعك ومواقعك البرمجية\n"
+                                "• بوتاتك وأدواتك التقنية\n"
+                                "• خدماتك والعمل الحر\n"
+                                "• قنوات اليوتيوب والمصادر التعليمية\n\n"
+                                "يرجى تعديل الإعلان وحذف رابط سيرفر الديسكورد ثم إعادة الإرسال."
+                            ),
+                            color=discord.Color.red(),
+                        )
+                        embed.set_footer(text="سياسات النشر • AdSentry Content Guard")
+                    else:
+                        embed = discord.Embed(
+                            title="⛔ Discord Server Invites Prohibited",
+                            description=(
+                                "🚫 **Regular members may not post Discord server invite links.**\n\n"
+                                "Promoting Discord servers is strictly reserved for **Server Administrators & Owners**.\n\n"
+                                "💡 **What you can advertise as a member:**\n"
+                                "• Software projects & websites\n"
+                                "• Discord bots & tools\n"
+                                "• Freelance developer services\n"
+                                "• Tutorials & educational resources\n\n"
+                                "Please remove the Discord invite link and submit your ad again."
+                            ),
+                            color=discord.Color.red(),
+                        )
+                        embed.set_footer(text="Advertising Guidelines • AdSentry Content Guard")
+                    await interaction.followup.send(embed=embed, ephemeral=True)
+                    return
+
                 if self.lang == "ar":
                     embed = discord.Embed(
                         title="🛡️ تم حظر الإعلان فوراً بواسطة درع الحماية التلقائي",
@@ -300,9 +380,10 @@ class AdSubmissionModal(discord.ui.Modal):
 class CategorySelect(discord.ui.Select):
     """Dropdown menu for choosing the advertisement category in the user's selected language."""
 
-    def __init__(self, bot: commands.Bot, lang: str = "en") -> None:
+    def __init__(self, bot: commands.Bot, lang: str = "en", is_admin: bool = False) -> None:
         self.bot = bot
         self.lang = lang
+        self.is_admin = is_admin
 
         if lang == "ar":
             options = [
@@ -318,12 +399,18 @@ class CategorySelect(discord.ui.Select):
                     description="بوتات ديسكورد، أدوات تقنية، أتمتة، مكاتب برمجية",
                     emoji="🤖",
                 ),
-                discord.SelectOption(
-                    label="سيرفرات ومجتمعات",
-                    value="سيرفرات ومجتمعات 🌐",
-                    description="سيرفرات ديسكورد، مجتمعات تقنية، وألعاب",
-                    emoji="🌐",
-                ),
+            ]
+            # Only include Discord servers category for Admins / Server Owners
+            if is_admin:
+                options.append(
+                    discord.SelectOption(
+                        label="سيرفرات ديسكورد ومجتمعات",
+                        value="سيرفرات ومجتمعات 🌐",
+                        description="سيرفرات ديسكورد ومجتمعات تقنية (خاص بالإدارة والمالك)",
+                        emoji="🌐",
+                    )
+                )
+            options.extend([
                 discord.SelectOption(
                     label="خدمات وعمل حر",
                     value="خدمات وعمل حر 💼",
@@ -354,7 +441,7 @@ class CategorySelect(discord.ui.Select):
                     description="إعلانات عامة وترويج متنوع",
                     emoji="📌",
                 ),
-            ]
+            ])
             placeholder = "اختر تصنيف إعلانك من القائمة..."
         else:
             options = [
@@ -370,12 +457,18 @@ class CategorySelect(discord.ui.Select):
                     description="Discord bots, developer tools, automation, APIs",
                     emoji="🤖",
                 ),
-                discord.SelectOption(
-                    label="Servers & Communities",
-                    value="Servers & Communities 🌐",
-                    description="Discord servers, tech communities, gaming hubs",
-                    emoji="🌐",
-                ),
+            ]
+            # Only include Discord servers category for Admins / Server Owners
+            if is_admin:
+                options.append(
+                    discord.SelectOption(
+                        label="Discord Servers & Communities",
+                        value="Servers & Communities 🌐",
+                        description="Discord servers & communities (Admin/Owner only)",
+                        emoji="🌐",
+                    )
+                )
+            options.extend([
                 discord.SelectOption(
                     label="Services & Freelance",
                     value="Services & Freelance 💼",
@@ -406,7 +499,7 @@ class CategorySelect(discord.ui.Select):
                     description="General announcements and miscellaneous promos",
                     emoji="📌",
                 ),
-            ]
+            ])
             placeholder = "Select your ad category..."
 
         super().__init__(
@@ -469,17 +562,18 @@ class CategorySelect(discord.ui.Select):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        # Launch the ad submission modal in the chosen language
-        modal = AdSubmissionModal(category=selected_category, bot=self.bot, lang=self.lang)
+        # Verify admin permissions and launch the ad submission modal
+        is_admin = self.is_admin or is_server_admin_or_owner(interaction.user, interaction.guild)
+        modal = AdSubmissionModal(category=selected_category, bot=self.bot, lang=self.lang, is_admin=is_admin)
         await interaction.response.send_modal(modal)
 
 
 class CategorySelectView(discord.ui.View):
     """View hosting the category selection dropdown."""
 
-    def __init__(self, bot: commands.Bot, lang: str = "en") -> None:
+    def __init__(self, bot: commands.Bot, lang: str = "en", is_admin: bool = False) -> None:
         super().__init__(timeout=120)
-        self.add_item(CategorySelect(bot, lang=lang))
+        self.add_item(CategorySelect(bot, lang=lang, is_admin=is_admin))
 
 
 class LocalizedPanelView(discord.ui.View):
@@ -502,6 +596,7 @@ class LocalizedPanelView(discord.ui.View):
 
     async def open_categories(self, interaction: discord.Interaction) -> None:
         """Opens the category selection dropdown in the specified language."""
+        is_admin = is_server_admin_or_owner(interaction.user, interaction.guild)
         if self.lang == "ar":
             embed = discord.Embed(
                 title="📢 اختر قسم الإعلان",
@@ -523,7 +618,7 @@ class LocalizedPanelView(discord.ui.View):
 
         await interaction.response.send_message(
             embed=embed,
-            view=CategorySelectView(self.bot, lang=self.lang),
+            view=CategorySelectView(self.bot, lang=self.lang, is_admin=is_admin),
             ephemeral=True,
         )
 

@@ -150,10 +150,22 @@ def check_arabic_word_boundary(term: str, text: str) -> bool:
     return bool(re.search(pattern, text))
 
 
-def screen_content(title: str, content: str) -> Tuple[bool, List[str]]:
+# Discord Invite Links Regex
+DISCORD_INVITE_REGEX = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:discord\.(?:gg|io|me|li)|discord(?:app)?\.com/invite)/[a-zA-Z0-9\-]+",
+    re.IGNORECASE,
+)
+
+
+def screen_content(
+    title: str,
+    content: str,
+    allow_discord_invites: bool = False,
+) -> Tuple[bool, List[str]]:
     """
     Screens ad title and content against sexual/NSFW, hate speech, slurs,
     scam links, mass mentions, and configured forbidden patterns.
+    Optionally permits Discord server invites if authored by server Admins/Owners.
 
     Returns:
         (is_flagged: bool, flagged_reasons: List[str])
@@ -171,9 +183,24 @@ def screen_content(title: str, content: str) -> Tuple[bool, List[str]]:
         if re.search(pattern, raw_combined, re.IGNORECASE):
             flagged.append("Scam/Phishing link pattern")
 
-    # 3. Check Config-level forbidden words (.env)
+    # 3. Check Discord Server Invites (Restricted to Admins/Owners only)
+    if not allow_discord_invites:
+        if (
+            DISCORD_INVITE_REGEX.search(raw_combined)
+            or "discord.gg/" in raw_combined.lower()
+            or "invite.gg/" in raw_combined.lower()
+            or "discord.com/invite" in raw_combined.lower()
+        ):
+            flagged.append("Discord server invite link (Admin/Owner exclusive)")
+
+    # 4. Check Config-level forbidden words (.env)
     for word in Config.FORBIDDEN_WORDS:
-        if word and word.lower() in raw_combined.lower():
+        if not word:
+            continue
+        # Skip discord invite patterns if caller is authorized Admin/Owner
+        if allow_discord_invites and any(inv in word.lower() for inv in ["discord.gg", "invite.gg"]):
+            continue
+        if word.lower() in raw_combined.lower():
             flagged.append(word)
 
     # 4. Standardize texts for Arabic and English checks
