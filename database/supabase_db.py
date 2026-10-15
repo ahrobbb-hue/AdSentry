@@ -395,3 +395,45 @@ class SupabaseDatabase:
         except Exception as e:
             logger.error(f"Error marking active post #{post_id} as expired: {e}", exc_info=True)
             return False
+
+    async def search_active_ads(
+        self,
+        guild_id: int | None = None,
+        category_query: str | None = None,
+        limit: int = 15,
+    ) -> list[dict[str, Any]]:
+        """
+        Searches active (non-expired) announcement posts, optionally filtered
+        by guild_id and category query (matching Arabic/English category keywords).
+        """
+        client = await self.get_client()
+        try:
+            query = (
+                client.table("active_posts")
+                .select("id, channel_id, message_id, thread_id, expires_at, published_at, submissions(id, user_name, title, category, content, language, user_avatar_url)")
+                .eq("is_expired", False)
+                .order("published_at", desc=True)
+            )
+            if guild_id:
+                query = query.eq("guild_id", guild_id)
+
+            response = await query.execute()
+            posts = response.data or []
+
+            # If category_query is provided and not 'ALL', filter matching posts
+            if category_query and category_query.upper() != "ALL":
+                tokens = [t.strip().lower() for t in category_query.split("|") if t.strip()]
+                filtered = []
+                for p in posts:
+                    sub = p.get("submissions")
+                    if sub and isinstance(sub, dict):
+                        cat = (sub.get("category") or "").lower()
+                        title = (sub.get("title") or "").lower()
+                        if any(token in cat or token in title for token in tokens):
+                            filtered.append(p)
+                return filtered[:limit]
+
+            return posts[:limit]
+        except Exception as e:
+            logger.error(f"Error searching active ads: {e}", exc_info=True)
+            return []

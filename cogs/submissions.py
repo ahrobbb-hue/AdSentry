@@ -6,6 +6,7 @@ Handles category selection, submission modals, auto-moderation, anti-spam cooldo
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -525,6 +526,148 @@ class LocalizedPanelView(discord.ui.View):
         )
 
 
+class SearchCategorySelect(discord.ui.Select):
+    """Dropdown for selecting category to search active published ads."""
+
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+        options = [
+            discord.SelectOption(
+                label="جميع الإعلانات النشطة | All Active Ads",
+                value="ALL",
+                description="عرض أحدث الإعلانات النشطة في السيرفر",
+                emoji="🌟",
+            ),
+            discord.SelectOption(
+                label="برمجة وتطوير | Programming & Dev",
+                value="برمجة|Programming",
+                description="Software, apps, websites, scripts, code",
+                emoji="💻",
+            ),
+            discord.SelectOption(
+                label="بوتات وأدوات | Bots & Tools",
+                value="بوتات|Bots|Tools",
+                description="Discord bots, developer tools, automation",
+                emoji="🤖",
+            ),
+            discord.SelectOption(
+                label="سيرفرات ومجتمعات | Servers & Communities",
+                value="سيرفرات|Servers|Communities",
+                description="Discord servers, tech communities, gaming hubs",
+                emoji="🌐",
+            ),
+            discord.SelectOption(
+                label="خدمات وعمل حر | Services & Freelance",
+                value="خدمات|Services|Freelance",
+                description="Freelance dev, design, commissions, support",
+                emoji="💼",
+            ),
+            discord.SelectOption(
+                label="استضافة وسحابيات | Hosting & Cloud",
+                value="استضافة|Hosting|Cloud",
+                description="Bot hosting, VPS servers, domains & cloud",
+                emoji="☁️",
+            ),
+            discord.SelectOption(
+                label="تعليم ومصادر | Learning & Resources",
+                value="تعليم|Learning|Resources",
+                description="Tutorials, developer courses, guides & assets",
+                emoji="📚",
+            ),
+            discord.SelectOption(
+                label="وظائف وتوظيف | Jobs & Hiring",
+                value="وظائف|Jobs|Hiring",
+                description="Paid gigs, job openings, recruitment",
+                emoji="🎯",
+            ),
+            discord.SelectOption(
+                label="أخرى ومنوعات | Others & General",
+                value="أخرى|Others|General",
+                description="General announcements and miscellaneous",
+                emoji="📌",
+            ),
+        ]
+        super().__init__(
+            placeholder="اختر التصنيف للبحث / Select category to search...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        """Processes the chosen search category and displays matching active ads."""
+        await interaction.response.defer(ephemeral=True)
+        selected_value = self.values[0]
+        selected_label = next((opt.label for opt in self.options if opt.value == selected_value), selected_value)
+
+        results = await self.bot.db.search_active_ads(
+            guild_id=interaction.guild_id,
+            category_query=selected_value,
+            limit=10,
+        )
+
+        if not results:
+            embed = discord.Embed(
+                title="🔍 نتائج البحث | Search Results",
+                description=(
+                    f"لا توجد إعلانات نشطة حالياً في تصنيف **{selected_label}**.\n"
+                    f"No active advertisements currently found in **{selected_label}**.\n\n"
+                    "💡 *يمكنك تقديم إعلانك الآن عبر الضغط على علم لغتك في اللوحة الرئيسية!*"
+                ),
+                color=discord.Color.gold(),
+            )
+            embed.set_footer(text="AdSentry Search Directory")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title=f"🔍 الإعلانات النشطة: {selected_label}",
+            description=f"تم العثور على **{len(results)}** إعلان نشط في هذا التصنيف:\n\n",
+            color=discord.Color.green(),
+        )
+
+        for i, post in enumerate(results, 1):
+            sub = post.get("submissions") or {}
+            title = sub.get("title") or "إعلان بدون عنوان"
+            author = sub.get("user_name") or "Anonymous"
+            category = sub.get("category") or selected_label
+            channel_id = post.get("channel_id")
+            message_id = post.get("message_id")
+            jump_url = f"https://discord.com/channels/{interaction.guild_id}/{channel_id}/{message_id}"
+
+            expires_at_raw = post.get("expires_at")
+            if expires_at_raw:
+                try:
+                    dt = datetime.fromisoformat(expires_at_raw.replace("Z", "+00:00"))
+                    ts = int(dt.timestamp())
+                    expiry_str = f"ينتهي <t:{ts}:R>"
+                except Exception:
+                    expiry_str = "مؤقت (Temporary)"
+            else:
+                expiry_str = "دائم (Permanent)"
+
+            embed.add_field(
+                name=f"{i}. {title}",
+                value=(
+                    f"👤 **الناشر:** {author} • 🏷️ **القسم:** `{category}`\n"
+                    f"⏳ **الصلاحية:** {expiry_str}\n"
+                    f"🔗 **[اضغط هنا للانتقال مباشرة للإعلان]({jump_url})**"
+                ),
+                inline=False,
+            )
+
+        embed.set_footer(text="AdSentry Directory • اضغط على الرابط لعرض الإعلان الكامل ومناقشته")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class SearchCategorySelectView(discord.ui.View):
+    """Ephemeral view presenting the category dropdown for searching ads."""
+
+    def __init__(self, bot: commands.Bot) -> None:
+        super().__init__(timeout=180)
+        self.add_item(SearchCategorySelect(bot))
+
+
 class LanguageSelectView(discord.ui.View):
     """Persistent bilingual language selection view displayed in the main channel."""
 
@@ -537,6 +680,7 @@ class LanguageSelectView(discord.ui.View):
         style=discord.ButtonStyle.primary,
         emoji="🇸🇦",
         custom_id="adsentry:lang:ar",
+        row=0,
     )
     async def arabic_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -567,6 +711,7 @@ class LanguageSelectView(discord.ui.View):
         style=discord.ButtonStyle.secondary,
         emoji="🇬🇧",
         custom_id="adsentry:lang:en",
+        row=0,
     )
     async def english_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -590,6 +735,33 @@ class LanguageSelectView(discord.ui.View):
         embed.set_footer(text="Powered by AdSentry • Safe & Moderated Advertising")
 
         view = LocalizedPanelView(bot=self.bot, lang="en")
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @discord.ui.button(
+        label="بحث / Search",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔍",
+        custom_id="adsentry:main_search",
+        row=0,
+    )
+    async def search_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """Presents category dropdown to browse and search active published ads."""
+        embed = discord.Embed(
+            title="🔍 Search Advertisements | البحث في الإعلانات",
+            description=(
+                "**Select a category below to browse active announcements in this server:**\n"
+                "**اختر تصنيفاً من القائمة أدناه لعرض الإعلانات النشطة حالياً في السيرفر:**\n\n"
+                "يمكنك تصفح إعلانات البرمجة، البوتات، السيرفرات، الخدمات، وغيرها مع روابط مباشرة للوصول إليها."
+            ),
+            color=discord.Color.blurple(),
+        )
+        if self.bot.user:
+            embed.set_thumbnail(url=self.bot.user.display_avatar.url)
+        embed.set_footer(text="AdSentry Search Engine • دليل الإعلانات النشطة")
+
+        view = SearchCategorySelectView(self.bot)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
@@ -669,17 +841,32 @@ class SubmissionsCog(commands.Cog, name="Submissions"):
         view = LanguageSelectView(self.bot)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
+    @ad_group.command(name="search", description="Browse and search active advertisements by category")
+    async def search_ads_cmd(self, interaction: discord.Interaction) -> None:
+        """Slash command to browse and search active published ads."""
+        embed = discord.Embed(
+            title="🔍 Search Advertisements | البحث في الإعلانات",
+            description=(
+                "**Select a category below to browse active announcements in this server:**\n"
+                "**اختر تصنيفاً من القائمة أدناه لعرض الإعلانات النشطة حالياً في السيرفر:**"
+            ),
+            color=discord.Color.blurple(),
+        )
+        view = SearchCategorySelectView(self.bot)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
     def create_panel_embed(self) -> discord.Embed:
         """Constructs the standard bilingual advertisement submission portal embed."""
         embed = discord.Embed(
             title="📢 Server Advertisement Portal | بوابة نشر الإعلانات",
             description=(
-                "**Choose your preferred language to submit an advertisement:**\n"
-                "**اختر لغتك المفضلة لبدء تقديم طلب إعلان جديد:**\n\n"
+                "**Welcome to our advertising showcase! | مرحبًا بك في منصة الإعلانات!**\n\n"
                 "🇸🇦 **العربية:**\n"
-                "مرحبًا بك! لنشر سيرفرك، مشروعك، أو خدماتك في الروم، اضغط على زر **العربية 🇸🇦** بالأسفل لفتح استمارة التقديم.\n\n"
+                "• اضغط على **العربية 🇸🇦** للاطلاع على القواعد واختيار القسم وتقديم طلب إعلان جديد.\n"
+                "• اضغط على **بحث / Search 🔍** لتصفح واستكشاف الإعلانات النشطة حالياً في السيرفر.\n\n"
                 "🇬🇧 **English:**\n"
-                "Welcome! To promote your server, project, or freelance services, click **English 🇬🇧** below to begin your submission."
+                "• Click **English 🇬🇧** to review guidelines, choose your category, and submit an ad.\n"
+                "• Click **بحث / Search 🔍** to explore currently active advertisements in this server."
             ),
             color=discord.Color.blue(),
         )
