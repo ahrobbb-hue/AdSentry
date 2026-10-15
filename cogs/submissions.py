@@ -12,7 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import Config
-from cogs.moderation import StaffReviewView
+from cogs.moderation import StaffReviewView, is_staff
 
 logger = logging.getLogger("AdSentry.Submissions")
 
@@ -854,6 +854,83 @@ class SubmissionsCog(commands.Cog, name="Submissions"):
         )
         view = SearchCategorySelectView(self.bot)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @ad_group.command(
+        name="reset-cooldown",
+        description="Reset ad submission cooldown for a member or yourself (Staff only)",
+    )
+    @app_commands.describe(
+        member="The member whose cooldown to reset (leave empty to reset your own cooldown)",
+        clear_pending="Whether to also clear any pending ad awaiting review (default: True)",
+    )
+    async def reset_cooldown_cmd(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member | None = None,
+        clear_pending: bool = True,
+    ) -> None:
+        """Slash command to reset cooldown for a user."""
+        if not is_staff(interaction.user):
+            await interaction.response.send_message(
+                "❌ **عذراً، هذا الأمر مخصص للإدارة والمشرفين فقط.**\n"
+                "You do not have staff permissions to reset cooldowns.",
+                ephemeral=True,
+            )
+            return
+
+        target = member or interaction.user
+        await interaction.response.defer(ephemeral=True)
+
+        existing_cd = await self.bot.db.get_user_cooldown(target.id)
+        has_pending = await self.bot.db.has_pending_submission(target.id)
+
+        # Reset cooldown in database
+        await self.bot.db.reset_user_cooldown(target.id)
+
+        # Cancel pending submissions if requested
+        cancelled_count = 0
+        if clear_pending and has_pending:
+            cancelled_count = await self.bot.db.cancel_pending_submissions(target.id)
+
+        embed = discord.Embed(
+            title="🔄 تم تصفير وقت الانتظار | Cooldown Reset",
+            description=(
+                f"✅ **تم تصفير وقت الانتظار بنجاح للعضو:** {target.mention} (`{target.id}`)\n"
+                f"**بواسطة المشرف:** {interaction.user.mention}\n\n"
+                "يمكن للعضو الآن تقديم إعلان جديد فوراً دون الحاجة للانتظار! 🎉"
+            ),
+            color=discord.Color.green(),
+        )
+        if target.display_avatar:
+            embed.set_thumbnail(url=target.display_avatar.url)
+
+        if existing_cd:
+            unix_ts = int(existing_cd.timestamp())
+            embed.add_field(
+                name="⏳ وقت الانتظار السابق | Previous Cooldown",
+                value=f"كان ينتهي في: <t:{unix_ts}:F> (<t:{unix_ts}:R>)",
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="⏳ حالة الانتظار | Cooldown Status",
+                value="لم يكن العضو في فترة انتظار نشطة (تم تنظيف السجل بالكامل).",
+                inline=False,
+            )
+
+        if clear_pending:
+            embed.add_field(
+                name="📋 الطلبات المعلقة | Pending Ads",
+                value=(
+                    f"تم تنظيف وإلغاء `{cancelled_count}` طلب إعلان كان معلقاً قيد المراجعة."
+                    if cancelled_count > 0
+                    else "لا توجد طلبات إعلانات معلقة."
+                ),
+                inline=False,
+            )
+
+        embed.set_footer(text="AdSentry Cooldown Manager • نظام تصفير فترات الانتظار")
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     def create_panel_embed(self) -> discord.Embed:
         """Constructs the standard bilingual advertisement submission portal embed."""

@@ -290,6 +290,44 @@ class SupabaseDatabase:
             logger.error(f"Error setting cooldown for User {user_id}: {e}", exc_info=True)
             raise
 
+    async def reset_user_cooldown(self, user_id: int) -> bool:
+        """
+        Resets (removes/clears) the anti-spam cooldown for a user.
+        Allows the user to submit advertisements immediately.
+        """
+        client = await self.get_client()
+        try:
+            await client.table("user_cooldowns").delete().eq("user_id", user_id).execute()
+            logger.info(f"Cooldown successfully reset for User {user_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error resetting cooldown for User {user_id}: {e}", exc_info=True)
+            return False
+
+    async def cancel_pending_submissions(self, user_id: int) -> int:
+        """
+        Cancels any PENDING submissions for a user so they are not blocked by duplicate submission checks.
+        Returns the count of cancelled submissions.
+        """
+        client = await self.get_client()
+        try:
+            res = (
+                await client.table("submissions")
+                .update({
+                    "status": "REJECTED",
+                    "rejection_reason": "Cleared by Staff/Admin (Cooldown Reset)",
+                })
+                .eq("user_id", user_id)
+                .eq("status", "PENDING")
+                .execute()
+            )
+            count = len(res.data) if res.data else 0
+            logger.info(f"Cancelled {count} pending submission(s) for User {user_id}")
+            return count
+        except Exception as e:
+            logger.error(f"Error cancelling pending submissions for User {user_id}: {e}", exc_info=True)
+            return 0
+
     # -------------------------------------------------------------
     # Review & Moderation Operations
     # -------------------------------------------------------------

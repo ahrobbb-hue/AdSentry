@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 
 from config import Config
@@ -22,7 +23,11 @@ def is_staff(user: discord.Member | discord.User) -> bool:
     """Checks whether the user has staff roles or moderation permissions."""
     if not isinstance(user, discord.Member):
         return False
-    if user.guild_permissions.administrator or user.guild_permissions.manage_messages:
+    if (
+        user.guild_permissions.administrator
+        or user.guild_permissions.manage_messages
+        or user.guild_permissions.manage_guild
+    ):
         return True
     user_roles = {r.id for r in user.roles}
     return bool(user_roles.intersection(set(Config.STAFF_ROLE_IDS)))
@@ -540,6 +545,144 @@ class ModerationCog(commands.Cog, name="Moderation"):
     async def before_expiry_sweeper(self) -> None:
         """Ensures bot is ready before starting the sweeper loop."""
         await self.bot.wait_until_ready()
+
+    # -------------------------------------------------------------
+    # 5. Cooldown Management Slash Commands (Admin / Staff)
+    # -------------------------------------------------------------
+
+    cooldown_group = app_commands.Group(
+        name="ad-cooldown",
+        description="Manage member advertisement cooldowns (Staff/Admin only)",
+        default_permissions=discord.Permissions(manage_guild=True),
+    )
+
+    @cooldown_group.command(
+        name="reset",
+        description="Reset ad submission cooldown for a member or yourself (Staff only)",
+    )
+    @app_commands.describe(
+        member="The member whose cooldown to reset (leave empty to reset your own cooldown)",
+        clear_pending="Whether to also clear any pending ad awaiting review (default: True)",
+    )
+    async def reset_cooldown(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member | None = None,
+        clear_pending: bool = True,
+    ) -> None:
+        """Resets the submission cooldown for a target member."""
+        if not is_staff(interaction.user):
+            await interaction.response.send_message(
+                "❌ **عذراً، هذا الأمر مخصص للإدارة والمشرفين فقط.**\n"
+                "You do not have staff permissions to reset cooldowns.",
+                ephemeral=True,
+            )
+            return
+
+        target = member or interaction.user
+        await interaction.response.defer(ephemeral=True)
+
+        existing_cd = await self.bot.db.get_user_cooldown(target.id)
+        has_pending = await self.bot.db.has_pending_submission(target.id)
+
+        # Reset cooldown in database
+        await self.bot.db.reset_user_cooldown(target.id)
+
+        # Cancel pending submissions if requested
+        cancelled_count = 0
+        if clear_pending and has_pending:
+            cancelled_count = await self.bot.db.cancel_pending_submissions(target.id)
+
+        embed = discord.Embed(
+            title="🔄 تم تصفير وقت الانتظار | Cooldown Reset",
+            description=(
+                f"✅ **تم تصفير وقت الانتظار بنجاح للعضو:** {target.mention} (`{target.id}`)\n"
+                f"**بواسطة المشرف:** {interaction.user.mention}\n\n"
+                "يمكن للعضو الآن تقديم إعلان جديد فوراً دون الحاجة للانتظار! 🎉"
+            ),
+            color=discord.Color.green(),
+        )
+        if target.display_avatar:
+            embed.set_thumbnail(url=target.display_avatar.url)
+
+        if existing_cd:
+            unix_ts = int(existing_cd.timestamp())
+            embed.add_field(
+                name="⏳ وقت الانتظار السابق | Previous Cooldown",
+                value=f"كان ينتهي في: <t:{unix_ts}:F> (<t:{unix_ts}:R>)",
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="⏳ حالة الانتظار | Cooldown Status",
+                value="لم يكن العضو في فترة انتظار نشطة (تم تنظيف السجل بالكامل).",
+                inline=False,
+            )
+
+        if clear_pending:
+            embed.add_field(
+                name="📋 الطلبات المعلقة | Pending Ads",
+                value=(
+                    f"تم تنظيف وإلغاء `{cancelled_count}` طلب إعلان كان معلقاً قيد المراجعة."
+                    if cancelled_count > 0
+                    else "لا توجد طلبات إعلانات معلقة."
+                ),
+                inline=False,
+            )
+
+        embed.set_footer(text="AdSentry Cooldown Manager • نظام تصفير فترات الانتظار")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @cooldown_group.command(
+        name="check",
+        description="Check if a member (or yourself) is currently on ad submission cooldown",
+    )
+    @app_commands.describe(
+        member="The member to check (leave empty to check your own cooldown)",
+    )
+    async def check_cooldown(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member | None = None,
+    ) -> None:
+        """Checks the current cooldown status for a target member."""
+        target = member or interaction.user
+        await interaction.response.defer(ephemeral=True)
+
+        existing_cd = await self.bot.db.get_user_cooldown(target.id)
+        has_pending = await self.bot.db.has_pending_submission(target.id)
+
+        if existing_cd:
+            unix_ts = int(existing_cd.timestamp())
+            embed = discord.Embed(
+                title="⏳ وقت الانتظار نشط | Active Cooldown",
+                description=(
+                    f"العضو: {target.mention} (`{target.id}`)\n\n"
+                    f"⛔ **لا يمكنه التقديم حالياً.**\n"
+                    f"**موعد انتهاء الانتظار:** <t:{unix_ts}:F> (<t:{unix_ts}:R>)"
+                ),
+                color=discord.Color.orange(),
+            )
+        else:
+            embed = discord.Embed(
+                title="✅ لا يوجد وقت انتظار | No Cooldown",
+                description=(
+                    f"العضو: {target.mention} (`{target.id}`)\n\n"
+                    "🎉 **يمكنه تقديم إعلان جديد الآن دون أي وقت انتظار!**"
+                ),
+                color=discord.Color.green(),
+            )
+
+        embed.add_field(
+            name="📋 الطلبات المعلقة | Pending Status",
+            value="⚠️ لديه إعلان قيد مراجعة الإدارة حالياً." if has_pending else "✅ لا توجد طلبات معلقة.",
+            inline=False,
+        )
+        if target.display_avatar:
+            embed.set_thumbnail(url=target.display_avatar.url)
+        embed.set_footer(text="AdSentry Cooldown Manager")
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:
