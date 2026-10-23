@@ -2,6 +2,8 @@
 
 Run `database/eventhub_staffflow_migration.sql` once in the Supabase SQL Editor before using these features. The bot must use `SUPABASE_SERVICE_ROLE_KEY`; the tables have RLS enabled and expose no client-side policies. Configure the private staff review channel with `/ad-setup` before using StaffFlow requests.
 
+Staff can use `/dashboard` and open the EventHub or StaffFlow page to use graphical buttons and forms for the core actions below. The slash commands remain available as shortcuts.
+
 ## EventHub (`/event`)
 
 - `/event create` publishes an event with an ISO 8601 start time, capacity (1–500), channel, and optional reminder lead time.
