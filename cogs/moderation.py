@@ -272,10 +272,10 @@ class ModerationCog(commands.Cog, name="Moderation"):
 
         try:
             # Enforce staff authorization
-            if not is_admin(interaction.user):
+            if not is_staff(interaction.user):
                 embed = discord.Embed(
                     title="⛔ Access Denied",
-                    description="You do not possess the required staff roles or permissions to review ad submissions.",
+                    description="Your account does not have an approved staff role or moderation permission to review ad submissions.",
                     color=discord.Color.red(),
                 )
                 await interaction.response.send_message(embed=embed, ephemeral=True)

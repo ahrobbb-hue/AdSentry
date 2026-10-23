@@ -44,7 +44,7 @@ class SystemDashboardView(discord.ui.View):
             await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await self.cog.show_events(interaction, edit=True)
 
-    @discord.ui.button(label="إدارة الطاقم", emoji="🛡️", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="تقديم إجازة", emoji="🌴", style=discord.ButtonStyle.primary, row=0)
     async def staffflow(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction):
             await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
@@ -78,7 +78,7 @@ class PersistentDashboardView(discord.ui.View):
         if not _staff(interaction): await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await self.cog.show_events(interaction)
 
-    @discord.ui.button(label="إدارة الطاقم", emoji="🛡️", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:staff", row=0)
+    @discord.ui.button(label="تقديم إجازة", emoji="🌴", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:staff", row=0)
     async def staffflow(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction): await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await self.cog.show_staffflow(interaction)
@@ -357,9 +357,9 @@ async def submit_staff_case(
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         config = await cog.bot.db.get_guild_config(interaction.guild.id)
-        channel = interaction.guild.get_channel(int((config or {}).get("staff_review_channel_id") or 0))
+        channel = interaction.guild.get_channel(int((config or {}).get("staffflow_review_channel_id") or 0))
         if not isinstance(channel, discord.TextChannel):
-            await interaction.followup.send("لم تُضبط قناة مراجعة الطاقم. استخدم `/ad-setup`.", ephemeral=True)
+            await interaction.followup.send("لم يحدد المسؤول قناة طلبات StaffFlow بعد. اطلب من المالك أو Administrator ضبطها من لوحة الطاقم.", ephemeral=True)
             return
         client = await cog.bot.db.get_client()
         result = await client.table("staff_cases").insert({
@@ -379,7 +379,9 @@ async def submit_staff_case(
         embed.add_field(name="الموضوع", value=subject, inline=False)
         if start and end:
             embed.add_field(name="الفترة", value=f"{start} إلى {end}", inline=False)
-        message = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        decision_view = StaffCaseDecisionView(cog, int(case["id"]))
+        message = await channel.send(embed=embed, view=decision_view, allowed_mentions=discord.AllowedMentions.none())
+        cog.bot.add_view(decision_view, message_id=message.id)
         await client.table("staff_cases").update({"review_channel_id": channel.id, "review_message_id": message.id}).eq("id", case["id"]).execute()
         await interaction.followup.send(f"وصل طلبك إلى الإدارة برقم #{case['id']}.", ephemeral=True)
     except Exception:
@@ -534,17 +536,26 @@ class ShiftCreateModal(discord.ui.Modal, title="جدولة مناوبة"):
 
 
 class StaffDecisionModal(discord.ui.Modal):
-    note = discord.ui.TextInput(label="ملاحظة القرار", style=discord.TextStyle.paragraph, max_length=900)
-
     def __init__(self, cog: "DashboardCog", case_id: int, decision: str) -> None:
         super().__init__(title="مراجعة طلب الطاقم")
         self.cog, self.case_id, self.decision = cog, case_id, decision
+        self.note = discord.ui.TextInput(
+            label="سبب الرفض" if decision == "REJECTED" else "ملاحظة (اختيارية)",
+            style=discord.TextStyle.paragraph,
+            max_length=900,
+            required=decision == "REJECTED",
+            placeholder="اكتب سببًا واضحًا ليصل للمتقدم برسالة خاصة.",
+        )
+        self.add_item(self.note)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not interaction.guild or not _admin(interaction): await interaction.response.send_message("للإدارة فقط.", ephemeral=True); return
         await interaction.response.defer(ephemeral=True, thinking=True)
         client = await self.cog.bot.db.get_client()
-        response = await client.rpc("review_staff_case", {"p_case_id": self.case_id, "p_guild_id": interaction.guild.id, "p_reviewer_id": interaction.user.id, "p_decision": self.decision, "p_note": self.note.value.strip()}).execute()
+        note = self.note.value.strip()
+        if self.decision == "REJECTED" and not note:
+            await interaction.followup.send("سبب الرفض مطلوب.", ephemeral=True); return
+        response = await client.rpc("review_staff_case", {"p_case_id": self.case_id, "p_guild_id": interaction.guild.id, "p_reviewer_id": interaction.user.id, "p_decision": self.decision, "p_note": note}).execute()
         row = response.data[0] if isinstance(response.data, list) and response.data else response.data
         if not isinstance(row, dict) or not row.get("changed"):
             await interaction.followup.send("الطلب غير موجود أو سبق اتخاذ قرار فيه.", ephemeral=True); return
@@ -555,10 +566,76 @@ class StaffDecisionModal(discord.ui.Modal):
                 card = await channel.fetch_message(int(case["review_message_id"]))
                 embed = card.embeds[0] if card.embeds else discord.Embed(title=f"طلب الطاقم #{self.case_id}")
                 embed.color = discord.Color.green() if self.decision == "APPROVED" else discord.Color.red()
-                embed.add_field(name="القرار", value=f"{self.decision} · {interaction.user}\n{self.note.value}", inline=False)
-                await card.edit(embed=embed)
+                decision_label = "مقبول" if self.decision == "APPROVED" else "مرفوض"
+                embed.add_field(name="القرار", value=f"{decision_label} · {interaction.user}\n{note or 'لا توجد ملاحظة'}", inline=False)
+                await card.edit(embed=embed, view=None)
             except discord.HTTPException: logger.exception("Could not update staff case card")
-        await interaction.followup.send(f"تم حفظ القرار على الطلب #{self.case_id}.", ephemeral=True)
+        try:
+            applicant = await self.cog.bot.fetch_user(int(case["user_id"]))
+            result_text = "تم قبول طلبك" if self.decision == "APPROVED" else "تم رفض طلبك"
+            dm = discord.Embed(title=f"نتيجة طلب {case.get('kind', 'الطاقم')}", description=f"{result_text} رقم **#{self.case_id}** في سيرفر **{interaction.guild.name}**.", color=discord.Color.green() if self.decision == "APPROVED" else discord.Color.red())
+            if self.decision == "REJECTED": dm.add_field(name="سبب الرفض", value=note, inline=False)
+            elif note: dm.add_field(name="ملاحظة الإدارة", value=note, inline=False)
+            await applicant.send(embed=dm)
+            dm_status = " وتم إشعار المتقدم خاصًا."
+        except (discord.Forbidden, discord.HTTPException):
+            dm_status = " لكن تعذر إرسال رسالة خاصة للمتقدم (قد تكون رسائله الخاصة مغلقة)."
+        await interaction.followup.send(f"تم حفظ القرار على الطلب #{self.case_id}.{dm_status}", ephemeral=True)
+
+
+class StaffCaseDecisionView(discord.ui.View):
+    def __init__(self, cog: "DashboardCog", case_id: int) -> None:
+        super().__init__(timeout=None)
+        self.cog, self.case_id = cog, case_id
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.custom_id = f"adsentry:staff-case:{case_id}:{item.label.lower()}"
+
+    @discord.ui.button(label="قبول", emoji="✅", style=discord.ButtonStyle.success)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _admin(interaction):
+            await interaction.response.send_message("مراجعة طلبات الإجازة متاحة للمالك وAdministrator فقط.", ephemeral=True); return
+        await interaction.response.send_modal(StaffDecisionModal(self.cog, self.case_id, "APPROVED"))
+
+    @discord.ui.button(label="رفض", emoji="❌", style=discord.ButtonStyle.danger)
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _admin(interaction):
+            await interaction.response.send_message("مراجعة طلبات الإجازة متاحة للمالك وAdministrator فقط.", ephemeral=True); return
+        await interaction.response.send_modal(StaffDecisionModal(self.cog, self.case_id, "REJECTED"))
+
+
+class StaffFlowChannelSetupView(discord.ui.View):
+    def __init__(self, cog: "DashboardCog") -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+        picker = discord.ui.ChannelSelect(channel_types=[discord.ChannelType.text], placeholder="اختر قناة طلبات الإجازة")
+        picker.callback = self.save_channel  # type: ignore[method-assign]
+        self.add_item(picker)
+
+    async def save_channel(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not _admin(interaction):
+            await interaction.response.send_message("هذا الإعداد للمالك وAdministrator فقط.", ephemeral=True); return
+        guild = interaction.guild
+        channel = guild.get_channel(int(interaction.data["values"][0]))
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("اختر قناة نصية من هذا السيرفر.", ephemeral=True); return
+        bot_member = guild.me
+        if bot_member is None or not channel.permissions_for(bot_member).manage_channels:
+            await interaction.response.send_message("يحتاج البوت صلاحية Manage Channels لتأمين قناة الطلبات.", ephemeral=True); return
+        try:
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                bot_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True, manage_messages=True),
+            }
+            await channel.edit(overwrites=overwrites, reason=f"Private StaffFlow review channel configured by {interaction.user}")
+            await self.cog.bot.db.set_staffflow_review_channel(guild.id, channel.id)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Could not secure StaffFlow review channel")
+            await interaction.response.send_message("تعذر تأمين القناة أو حفظ إعدادها. تحقق من صلاحيات البوت وقاعدة البيانات.", ephemeral=True); return
+        except Exception:
+            logger.exception("Could not persist StaffFlow review channel")
+            await interaction.response.send_message("تم تحديث صلاحيات القناة لكن تعذر حفظ إعدادها في قاعدة البيانات.", ephemeral=True); return
+        await interaction.response.send_message(f"تم ضبط {channel.mention} لقضايا StaffFlow. أصبحت مخفية عن @everyone؛ المالك وأصحاب Administrator يستطيعون رؤيتها بصلاحيات Discord.", ephemeral=True)
 
 
 class StaffCaseQueueView(discord.ui.View):
@@ -592,6 +669,7 @@ class StaffDashboardView(discord.ui.View):
             self.remove_item(self.review)
             self.remove_item(self.shift_create)
             self.remove_item(self.promote)
+            self.remove_item(self.configure_leave_channel)
 
     @discord.ui.button(label="طلب إجازة", emoji="🌴", style=discord.ButtonStyle.primary, row=0)
     async def leave(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -627,6 +705,12 @@ class StaffDashboardView(discord.ui.View):
             embed.add_field(name=f"#{row['id']} · <@{row['user_id']}> · <t:{int(start.timestamp())}:f>", value=row["duties"], inline=False)
         if not shifts: embed.description = "لا توجد مناوبات مجدولة."
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="ضبط قناة الإجازات", emoji="🔒", style=discord.ButtonStyle.secondary, row=1)
+    async def configure_leave_channel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not interaction.guild or not _admin(interaction):
+            await interaction.response.send_message("هذا الإعداد للمالك وAdministrator فقط.", ephemeral=True); return
+        await interaction.response.send_message("اختر قناة نصية مخصصة. سيضبط البوت صلاحياتها لتكون مخفية عن @everyone.", view=StaffFlowChannelSetupView(self.cog), ephemeral=True)
 
     @discord.ui.button(label="توثيق ترقية", emoji="⬆️", style=discord.ButtonStyle.secondary, row=1)
     async def promote(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -684,6 +768,14 @@ class DashboardCog(commands.Cog):
     async def cog_load(self) -> None:
         # Stable custom IDs make the operations-center buttons survive restarts.
         self.bot.add_view(PersistentDashboardView(self))
+        try:
+            client = await self.bot.db.get_client()
+            cases = (await client.table("staff_cases").select("id,review_message_id").eq("status", "PENDING").not_.is_("review_message_id", "null").execute()).data or []
+            for case in cases:
+                if case.get("review_message_id"):
+                    self.bot.add_view(StaffCaseDecisionView(self, int(case["id"])), message_id=int(case["review_message_id"]))
+        except Exception:
+            logger.exception("Could not restore persistent StaffFlow decision buttons")
 
     async def dashboard_embed(self, guild: discord.Guild) -> discord.Embed:
         try:
@@ -814,7 +906,7 @@ class DashboardCog(commands.Cog):
             logger.exception("Could not load StaffFlow dashboard page")
             description = "تعذر تحميل بيانات الطاقم. تأكد من تشغيل ترحيل StaffFlow."
         embed = discord.Embed(title="StaffFlow · إدارة الطاقم", description=description, color=discord.Color.blurple())
-        await interaction.edit_original_response(embed=embed, view=StaffDashboardView(self, can_manage=_staff(interaction)))
+        await interaction.edit_original_response(embed=embed, view=StaffDashboardView(self, can_manage=_admin(interaction)))
 
     @app_commands.command(name="dashboard", description="فتح أو تثبيت لوحة مركز عمليات AdSentry")
     @app_commands.describe(channel="قناة الإدارة الخاصة لتثبيت لوحة العمليات فيها")

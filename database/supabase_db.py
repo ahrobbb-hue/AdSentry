@@ -229,6 +229,19 @@ class SupabaseDatabase:
             logger.error(f"Failed to save server_configs for guild {guild_id}: {e}", exc_info=True)
             raise
 
+    async def set_staffflow_review_channel(self, guild_id: int, channel_id: int) -> None:
+        """Persist the private destination used for StaffFlow cases."""
+        client = await self.get_client()
+        response = await client.table("server_configs").update({
+            "staffflow_review_channel_id": channel_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("guild_id", guild_id).execute()
+        if not response.data:
+            raise RuntimeError("Guild configuration is missing; run /setup before configuring StaffFlow.")
+        config = self._guild_configs_cache.get(guild_id)
+        if config is not None:
+            config["staffflow_review_channel_id"] = channel_id
+
     async def update_panel_message_id(self, guild_id: int, message_id: int | None) -> None:
         """Updates the last active ad submission panel message ID for a guild."""
         client = await self.get_client()

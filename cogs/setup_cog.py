@@ -22,8 +22,13 @@ class SetupCog(commands.Cog, name="Server Setup"):
         self.bot = bot
 
     @app_commands.command(name="setup", description="إنشاء وربط قنوات AdSentry ولوحة العمليات")
+    @app_commands.describe(announcement_channel="اختر قناة الإعلانات العامة الموجودة لإعادة استخدامها (اختياري)")
     @app_commands.default_permissions(administrator=True)
-    async def setup_server(self, interaction: discord.Interaction) -> None:
+    async def setup_server(
+        self,
+        interaction: discord.Interaction,
+        announcement_channel: discord.TextChannel | None = None,
+    ) -> None:
         """Create or reuse AdSentry channels and wire them to the bot."""
         guild = interaction.guild
         if guild is None or not is_admin(interaction.user):
@@ -55,6 +60,22 @@ class SetupCog(commands.Cog, name="Server Setup"):
 
         stage = "إنشاء الفئات والقنوات"
         try:
+            # Preserve the server's existing announcement destination by default.
+            previous_config = await self.bot.db.get_guild_config(guild.id)
+            selected_announcement = announcement_channel
+            if selected_announcement is None and previous_config:
+                previous_channel_id = previous_config.get("announcement_channel_id")
+                if previous_channel_id:
+                    previous_channel = guild.get_channel(int(previous_channel_id))
+                    if previous_channel is None:
+                        try:
+                            previous_channel = await guild.fetch_channel(int(previous_channel_id))
+                        except (discord.NotFound, discord.Forbidden):
+                            previous_channel = None
+                    if isinstance(previous_channel, discord.TextChannel):
+                        selected_announcement = previous_channel
+            announcement_reused = selected_announcement is not None
+
             public_cat = await category(public_category_name, False)
             staff_cat = await category(staff_category_name, True)
             admin_overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
@@ -62,10 +83,13 @@ class SetupCog(commands.Cog, name="Server Setup"):
                 bot_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True, manage_messages=True),
             }
             panel_overwrites = dict(admin_overwrites)
+            staff_review_overwrites = dict(admin_overwrites)
             for role_id in Config.STAFF_ROLE_IDS:
                 role = guild.get_role(role_id)
                 if role:
-                    panel_overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True)
+                    staff_permissions = discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True)
+                    panel_overwrites[role] = staff_permissions
+                    staff_review_overwrites[role] = staff_permissions
             public_overwrites = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
                 bot_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, manage_webhooks=True, create_public_threads=True),
@@ -73,8 +97,17 @@ class SetupCog(commands.Cog, name="Server Setup"):
 
             channels: dict[str, discord.TextChannel] = {}
             for key, (name, private) in definitions.items():
+                if key == "announcements" and selected_announcement is not None:
+                    # Reuse the existing channel as-is: do not move it, edit its permissions,
+                    # or touch its messages and chat history.
+                    channels[key] = selected_announcement
+                    continue
                 parent = staff_cat if private else public_cat
-                private_overwrites = panel_overwrites if key == "panel" else admin_overwrites
+                private_overwrites = (
+                    panel_overwrites if key == "panel"
+                    else staff_review_overwrites if key == "review"
+                    else admin_overwrites
+                )
                 channel = discord.utils.get(parent.text_channels, name=name)
                 if channel is None:
                     channel = await guild.create_text_channel(
@@ -121,7 +154,8 @@ class SetupCog(commands.Cog, name="Server Setup"):
             summary = "\n".join(f"• {channels[k].mention} — {definitions[k][0]}" for k in definitions)
             missing_roles = not any(guild.get_role(role_id) for role_id in Config.STAFF_ROLE_IDS)
             note = "\n\n⚠️ لم يتم العثور على رتب الطاقم في `STAFF_ROLE_IDS`؛ القنوات الخاصة ستكون للمدراء والبوت فقط." if missing_roles else ""
-            await interaction.followup.send(f"✅ اكتمل إعداد AdSentry. تم تجهيز **6 قنوات** وربطها، وإنشاء/تحديث لوحة العمليات الثابتة.\n\n{summary}{note}", ephemeral=True)
+            reuse_note = "تم الإبقاء على القناة وسجلها كما هما." if announcement_reused else "أُنشئت قناة إعلانات جديدة."
+            await interaction.followup.send(f"✅ اكتمل إعداد AdSentry. قناة الإعلانات العامة: {channels['announcements'].mention} — {reuse_note}\n\n{summary}{note}", ephemeral=True)
         except Exception as exc:
             logger.exception("AdSentry setup failed for guild %s", guild.id)
             detail = str(exc).replace("`", "'")[:700] or "لا توجد تفاصيل إضافية"
