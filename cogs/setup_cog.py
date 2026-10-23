@@ -9,6 +9,7 @@ import logging
 import discord
 from discord import app_commands
 from discord.ext import commands
+from config import Config
 
 logger = logging.getLogger("AdSentry.Setup")
 
@@ -18,6 +19,105 @@ class SetupCog(commands.Cog, name="Server Setup"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    @app_commands.command(name="setup", description="إنشاء وربط قنوات AdSentry ولوحة العمليات")
+    @app_commands.default_permissions(administrator=True)
+    async def setup_server(self, interaction: discord.Interaction) -> None:
+        """Create or reuse AdSentry channels and wire them to the bot."""
+        guild = interaction.guild
+        if guild is None or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("هذا الأمر متاح لمالك السيرفر أو المدير فقط.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        bot_member = guild.me
+        if bot_member is None or not bot_member.guild_permissions.manage_channels:
+            await interaction.followup.send("يحتاج البوت إلى صلاحية **Manage Channels** لإنشاء القنوات.", ephemeral=True)
+            return
+
+        public_category_name = "AdSentry · عام"
+        staff_category_name = "AdSentry · الإدارة"
+        definitions = {
+            "announcements": ("إعلانات-البوت", False),
+            "review": ("مراجعة-الإعلانات-والطاقم", True),
+            "app1": ("طلبات-الانضمام-1", True),
+            "app2": ("طلبات-الانضمام-2", True),
+            "app3": ("طلبات-الانضمام-3", True),
+            "panel": ("مركز-العمليات", True),
+        }
+
+        async def category(name: str, private: bool) -> discord.CategoryChannel:
+            found = discord.utils.get(guild.categories, name=name)
+            if found:
+                return found
+            overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)} if private else None
+            return await guild.create_category(name, overwrites=overwrites, reason="AdSentry channel setup")
+
+        try:
+            public_cat = await category(public_category_name, False)
+            staff_cat = await category(staff_category_name, True)
+            staff_overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                bot_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True, manage_messages=True),
+            }
+            for role_id in Config.STAFF_ROLE_IDS:
+                role = guild.get_role(role_id)
+                if role:
+                    staff_overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True)
+            public_overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
+                bot_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, manage_webhooks=True, create_public_threads=True),
+            }
+
+            channels: dict[str, discord.TextChannel] = {}
+            for key, (name, private) in definitions.items():
+                parent = staff_cat if private else public_cat
+                channel = discord.utils.get(parent.text_channels, name=name)
+                if channel is None:
+                    channel = await guild.create_text_channel(
+                        name, category=parent,
+                        overwrites=staff_overwrites if private else public_overwrites,
+                        reason="AdSentry channel setup",
+                    )
+                else:
+                    # Reassert bot-managed access controls on channels inside our named categories.
+                    await channel.edit(overwrites=staff_overwrites if private else public_overwrites, reason="AdSentry channel setup")
+                channels[key] = channel
+
+            await self.bot.db.set_guild_config(guild_id=guild.id, announcement_channel_id=channels["announcements"].id, staff_review_channel_id=channels["review"].id)
+            client = await self.bot.db.get_client()
+            await client.rpc("set_recruitment_review_channels", {
+                "p_guild_id": guild.id,
+                "p_channel_ids": [channels[k].id for k in ("app1", "app2", "app3")],
+                "p_configured_by": interaction.user.id,
+            }).execute()
+
+            dashboard = self.bot.get_cog("DashboardCog")
+            if dashboard is None:
+                raise RuntimeError("DashboardCog is not loaded")
+            # Reuse the existing persistent panel if it already lives in the configured channel.
+            saved = (await client.table("staff_dashboard_panels").select("channel_id,message_id").eq("guild_id", guild.id).limit(1).execute()).data or []
+            from cogs.dashboard import PersistentDashboardView
+            if saved and saved[0].get("message_id") and int(saved[0]["channel_id"]) == channels["panel"].id:
+                try:
+                    message = await channels["panel"].fetch_message(int(saved[0]["message_id"]))
+                    await message.edit(embed=await dashboard.dashboard_embed(guild), view=PersistentDashboardView(dashboard))
+                except discord.NotFound:
+                    saved = []
+            if not saved or int(saved[0]["channel_id"]) != channels["panel"].id or not saved[0].get("message_id"):
+                panel_message = await channels["panel"].send(embed=await dashboard.dashboard_embed(guild), view=PersistentDashboardView(dashboard), allowed_mentions=discord.AllowedMentions.none())
+                await client.table("staff_dashboard_panels").upsert({"guild_id": guild.id, "channel_id": channels["panel"].id, "message_id": panel_message.id, "updated_by": interaction.user.id}).execute()
+                try:
+                    await panel_message.pin(reason="AdSentry permanent operations center")
+                except discord.HTTPException:
+                    pass
+
+            summary = "\n".join(f"• {channels[k].mention} — {definitions[k][0]}" for k in definitions)
+            missing_roles = not any(guild.get_role(role_id) for role_id in Config.STAFF_ROLE_IDS)
+            note = "\n\n⚠️ لم يتم العثور على رتب الطاقم في `STAFF_ROLE_IDS`؛ القنوات الخاصة ستكون للمدراء والبوت فقط." if missing_roles else ""
+            await interaction.followup.send(f"✅ اكتمل إعداد AdSentry. تم تجهيز **6 قنوات** وربطها، وإنشاء/تحديث لوحة العمليات الثابتة.\n\n{summary}{note}", ephemeral=True)
+        except Exception as exc:
+            logger.exception("AdSentry setup failed for guild %s", guild.id)
+            await interaction.followup.send(f"تعذر إكمال الربط: `{type(exc).__name__}`. القنوات التي أُنشئت ستبقى كما هي؛ أصلح إعداد قاعدة البيانات ثم أعد `/setup` بأمان.", ephemeral=True)
 
     @app_commands.command(
         name="ad-setup",
