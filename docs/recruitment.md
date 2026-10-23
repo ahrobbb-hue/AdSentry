@@ -1,5 +1,11 @@
 # Staff recruitment
 
+## Interactive dashboard
+
+Staff can open `/dashboard` to see current system counts and enter the recruitment, EventHub, or StaffFlow page. In the dashboard, use **إعداد قنوات التقديم** to select up to three private review channels. The recruitment page's **إنشاء تقديم جديد** flow then asks which configured channel should receive that opening's applicant cards, followed by the existing role and opening form. The public announcement uses the announcement channel configured through `/ad-setup`.
+
+Run `database/recruitment_dashboard_migration.sql` once in Supabase to enable dashboard channel selection. The dashboard summary also reads the EventHub and StaffFlow tables, so run `database/eventhub_staffflow_migration.sql` before opening `/dashboard` if those feature tables are not installed yet. Keep each selected review channel private to the intended reviewers.
+
 Recruitment is managed by authorized staff (server administrators/moderators or configured `STAFF_ROLE_IDS`); members can only submit applications.
 
 1. Run `database/recruitment_migration.sql`, then `database/recruitment_enhancements_migration.sql` in the Supabase SQL Editor.

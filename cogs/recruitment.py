@@ -250,14 +250,15 @@ class ApplicationModal(discord.ui.Modal):
                 review_channel = await self.bot.fetch_channel(current["review_channel_id"])
             if not isinstance(review_channel, discord.TextChannel):
                 raise RuntimeError("Configured review destination is not a text channel")
-            embed = discord.Embed(title=f"Application #{record['id']} · {current['title']}", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
+            embed = discord.Embed(title=f"New staff application · #{record['id']}", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
             embed.add_field(name="Applicant", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
+            embed.add_field(name="Position applied for", value=current["title"], inline=False)
             embed.add_field(name="Experience", value=self.experience.value[:1024], inline=False)
             embed.add_field(name="Motivation", value=self.motivation.value[:1024], inline=False)
             embed.add_field(name="Availability", value=self.availability.value[:1024], inline=False)
             for field in self.custom_inputs:
                 embed.add_field(name=field.label, value=field.value[:1024], inline=False)
-            await review_channel.send(embed=embed, view=ApplicationReviewView(record["id"]))
+            await review_channel.send(embed=embed, view=ApplicationReviewView(record["id"]), allowed_mentions=discord.AllowedMentions.none())
             await interaction.followup.send("Your application was sent to the staff team for review.", ephemeral=True)
         except Exception as exc:
             logger.exception("Could not process recruitment application")
