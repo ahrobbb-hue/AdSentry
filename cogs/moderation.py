@@ -27,7 +27,7 @@ def is_admin(user: discord.Member | discord.User) -> bool:
 
 
 def is_staff(user: discord.Member | discord.User) -> bool:
-    """Checks whether the user has staff roles or moderation permissions."""
+    """Checks configured staff roles, Manager and higher roles, or mod permissions."""
     if not isinstance(user, discord.Member):
         return False
     if (
@@ -37,7 +37,18 @@ def is_staff(user: discord.Member | discord.User) -> bool:
     ):
         return True
     user_roles = {r.id for r in user.roles}
-    return bool(user_roles.intersection(set(Config.STAFF_ROLE_IDS)))
+    if user_roles.intersection(set(Config.STAFF_ROLE_IDS)):
+        return True
+
+    # Support the server's Manager role without requiring its snowflake to be
+    # duplicated in every deployment's environment variables. Roles at or
+    # above that role in the server hierarchy inherit staff access.
+    manager_names = {"manager", "مدير", "المدير", "مدير السيرفر", "مدير الطاقم"}
+    manager_role = next(
+        (role for role in user.guild.roles if role.name.strip().casefold() in manager_names),
+        None,
+    )
+    return bool(manager_role and any(role.position >= manager_role.position for role in user.roles))
 
 
 class StaffReviewView(discord.ui.View):
