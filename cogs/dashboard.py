@@ -50,6 +50,12 @@ class SystemDashboardView(discord.ui.View):
             await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await self.cog.show_staffflow(interaction, edit=True)
 
+    @discord.ui.button(label="شكوى إدارية", emoji="📨", style=discord.ButtonStyle.primary, row=0)
+    async def complaint(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _staff(interaction):
+            await interaction.response.send_message("هذا الإجراء لطاقم السيرفر فقط.", ephemeral=True); return
+        await interaction.response.send_message("اختر تصنيف الشكوى ثم اكتب تفاصيلها:", view=ComplaintCategoryView(self.cog), ephemeral=True)
+
     @discord.ui.button(label="إعداد قنوات التقديم", emoji="⚙️", style=discord.ButtonStyle.secondary, row=1)
     async def channel_setup(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _admin(interaction) or not interaction.guild:
@@ -82,6 +88,12 @@ class PersistentDashboardView(discord.ui.View):
     async def staffflow(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction): await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await self.cog.show_staffflow(interaction)
+
+    @discord.ui.button(label="شكوى إدارية", emoji="📨", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:complaint", row=0)
+    async def complaint(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _staff(interaction):
+            await interaction.response.send_message("هذا الإجراء لطاقم السيرفر فقط.", ephemeral=True); return
+        await interaction.response.send_message("اختر تصنيف الشكوى ثم اكتب تفاصيلها:", view=ComplaintCategoryView(self.cog), ephemeral=True)
 
     @discord.ui.button(label="قنوات مراجعة التقديم", emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="adsentry:ops:channels", row=1)
     async def channels(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
