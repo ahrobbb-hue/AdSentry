@@ -369,9 +369,16 @@ async def submit_staff_case(
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         config = await cog.bot.db.get_guild_config(interaction.guild.id)
-        channel = interaction.guild.get_channel(int((config or {}).get("staffflow_review_channel_id") or 0))
+        channel_key = "staffflow_review_channel_id" if kind == "إجازة" else "staffflow_complaint_channel_id"
+        channel = interaction.guild.get_channel(int((config or {}).get(channel_key) or 0))
         if not isinstance(channel, discord.TextChannel):
-            await interaction.followup.send("لم يحدد المسؤول قناة طلبات StaffFlow بعد. اطلب من المالك أو Administrator ضبطها من لوحة الطاقم.", ephemeral=True)
+            destination_label = "الإجازات" if kind == "إجازة" else "الشكاوى"
+            setup_hint = (
+                "ضبط قناة الإجازات من لوحة الطاقم"
+                if kind == "إجازة"
+                else "الأمر `/staffflow complaint-channel`"
+            )
+            await interaction.followup.send(f"لم يحدد المسؤول قناة {destination_label} بعد. اطلب من المالك أو Administrator إعدادها عبر {setup_hint}.", ephemeral=True)
             return
         client = await cog.bot.db.get_client()
         result = await client.table("staff_cases").insert({
@@ -387,7 +394,8 @@ async def submit_staff_case(
         }).execute()
         case = result.data[0]
         embed = discord.Embed(title=f"طلب {kind} · #{case['id']}", description=details[:4000], color=discord.Color.orange())
-        embed.add_field(name="الموظف", value=f"{interaction.user} (`{interaction.user.id}`)", inline=False)
+        reporter_label = "مقدم الشكوى" if kind == "شكوى" else "مقدم الطلب"
+        embed.add_field(name=reporter_label, value=interaction.user.mention, inline=False)
         embed.add_field(name="الموضوع", value=subject, inline=False)
         if start and end:
             embed.add_field(name="الفترة", value=f"{start} إلى {end}", inline=False)

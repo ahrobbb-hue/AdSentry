@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS public.server_configs (
     announcement_channel_id BIGINT NOT NULL,
     staff_review_channel_id BIGINT NOT NULL,
     staffflow_review_channel_id BIGINT,
+    staffflow_complaint_channel_id BIGINT,
     last_panel_message_id BIGINT,          -- Message ID of active submission panel
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -16,6 +17,7 @@ CREATE TABLE IF NOT EXISTS public.server_configs (
 -- Schema Migration (run if server_configs already exists):
 ALTER TABLE public.server_configs ADD COLUMN IF NOT EXISTS last_panel_message_id BIGINT;
 ALTER TABLE public.server_configs ADD COLUMN IF NOT EXISTS staffflow_review_channel_id BIGINT;
+ALTER TABLE public.server_configs ADD COLUMN IF NOT EXISTS staffflow_complaint_channel_id BIGINT;
 
 -- 2. Submissions Table: Stores ad applications from submission to review
 CREATE TABLE IF NOT EXISTS public.submissions (

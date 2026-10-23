@@ -8,7 +8,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from cogs.moderation import is_staff
+from cogs.moderation import is_admin, is_staff
 
 logger = logging.getLogger("AdSentry.StaffFlow")
 
@@ -21,22 +21,31 @@ class StaffFlow(commands.GroupCog, group_name="staffflow"):
 
     async def _private_channel(self, guild_id: int) -> discord.TextChannel | None:
         config = await self.bot.db.get_guild_config(guild_id)
-        channel_id = (config or {}).get("staff_review_channel_id")
+        channel_id = (config or {}).get("staffflow_review_channel_id")
+        channel = self.bot.get_channel(int(channel_id)) if channel_id else None
+        return channel if isinstance(channel, discord.TextChannel) else None
+
+    async def _complaint_channel(self, guild_id: int) -> discord.TextChannel | None:
+        config = await self.bot.db.get_guild_config(guild_id)
+        channel_id = (config or {}).get("staffflow_complaint_channel_id")
         channel = self.bot.get_channel(int(channel_id)) if channel_id else None
         return channel if isinstance(channel, discord.TextChannel) else None
 
     async def _submit_case(self, interaction: discord.Interaction, kind: str, subject: str, details: str, start: str | None = None, end: str | None = None) -> None:
         if not interaction.guild:
             await interaction.response.send_message("استخدم الأمر داخل السيرفر.", ephemeral=True); return
-        channel = await self._private_channel(interaction.guild.id)
+        channel = (await self._private_channel(interaction.guild.id) if kind == "إجازة"
+                   else await self._complaint_channel(interaction.guild.id))
         if not channel:
-            await interaction.response.send_message("لم يتم إعداد قناة الإدارة. استخدم `/ad-setup` أولًا.", ephemeral=True); return
+            command = "`/staffflow complaint-channel`" if kind == "شكوى" else "زر ضبط قناة الإجازات في لوحة الطاقم"
+            await interaction.response.send_message(f"لم يتم إعداد قناة {kind}. استخدم {command} أولًا.", ephemeral=True); return
         await interaction.response.defer(ephemeral=True)
         client = await self.bot.db.get_client()
         result = await client.table("staff_cases").insert({"guild_id": interaction.guild.id, "user_id": interaction.user.id, "user_name": str(interaction.user), "kind": kind, "subject": subject[:120], "details": details[:1800], "starts_at": start, "ends_at": end, "status": "PENDING"}).execute()
         case = result.data[0]
         embed = discord.Embed(title=f"طلب {kind} · #{case['id']}", description=details[:4000], color=discord.Color.orange())
-        embed.add_field(name="الموظف", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
+        reporter_label = "مقدم الشكوى" if kind == "شكوى" else "مقدم الطلب"
+        embed.add_field(name=reporter_label, value=interaction.user.mention, inline=False)
         embed.add_field(name="الموضوع", value=subject[:1024], inline=False)
         if start: embed.add_field(name="من", value=start)
         if end: embed.add_field(name="إلى", value=end)
@@ -63,6 +72,47 @@ class StaffFlow(commands.GroupCog, group_name="staffflow"):
     @app_commands.command(name="complaint", description="إرسال شكوى إدارية سرية")
     async def complaint(self, interaction: discord.Interaction, subject: str, details: str) -> None:
         await self._submit_case(interaction, "شكوى", subject, details)
+
+    @app_commands.command(name="complaint-channel", description="تحديد قناة خاصة لاستقبال الشكاوى فقط")
+    @app_commands.describe(channel="القناة النصية المخصصة للشكاوى فقط")
+    async def complaint_channel(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+        if not interaction.guild or not is_admin(interaction.user):
+            await interaction.response.send_message("هذا الإعداد للمالك وAdministrator فقط.", ephemeral=True)
+            return
+        guild = interaction.guild
+        if channel.guild.id != guild.id:
+            await interaction.response.send_message("اختر قناة نصية من هذا السيرفر.", ephemeral=True)
+            return
+        bot_member = guild.me
+        if bot_member is None or not channel.permissions_for(bot_member).manage_channels:
+            await interaction.response.send_message("يحتاج البوت صلاحية Manage Channels لتأمين قناة الشكاوى.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                bot_member: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    embed_links=True,
+                    read_message_history=True,
+                    manage_messages=True,
+                ),
+            }
+            await channel.edit(overwrites=overwrites, reason=f"Private StaffFlow complaint channel configured by {interaction.user}")
+            await self.bot.db.set_staffflow_complaint_channel(guild.id, channel.id)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Could not secure or save StaffFlow complaint channel")
+            await interaction.followup.send("تعذر تأمين القناة أو حفظها. تحقق من صلاحيات البوت وترحيل قاعدة البيانات.", ephemeral=True)
+            return
+        except Exception:
+            logger.exception("Could not persist StaffFlow complaint channel")
+            await interaction.followup.send("تم تقييد ظهور القناة، لكن تعذر حفظ إعدادها. تحقق من ترحيل قاعدة البيانات ثم أعد الأمر.", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"تم تخصيص {channel.mention} للشكاوى فقط وإخفاؤها عن @everyone. المالك وأصحاب Administrator يستطيعون رؤيتها.",
+            ephemeral=True,
+        )
 
     @app_commands.command(name="review", description="اتخاذ قرار وتسجيله على طلب طاقم")
     @app_commands.choices(decision=[app_commands.Choice(name="قبول", value="APPROVED"), app_commands.Choice(name="رفض", value="REJECTED")])
