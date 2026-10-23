@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from cogs.moderation import is_staff
+from cogs.moderation import is_admin
 
 logger = logging.getLogger("AdSentry.Recruitment")
 
@@ -25,7 +25,7 @@ DEFAULT_RECRUITMENT_ROLES = (
 
 
 def _can_manage(interaction: discord.Interaction) -> bool:
-    return bool(interaction.guild and is_staff(interaction.user))
+    return bool(interaction.guild and is_admin(interaction.user))
 
 
 def _deadline_passed(opening: dict[str, Any]) -> bool:

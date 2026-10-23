@@ -10,6 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from config import Config
+from cogs.moderation import is_admin
 
 logger = logging.getLogger("AdSentry.Setup")
 
@@ -25,7 +26,7 @@ class SetupCog(commands.Cog, name="Server Setup"):
     async def setup_server(self, interaction: discord.Interaction) -> None:
         """Create or reuse AdSentry channels and wire them to the bot."""
         guild = interaction.guild
-        if guild is None or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        if guild is None or not is_admin(interaction.user):
             await interaction.response.send_message("هذا الأمر متاح لمالك السيرفر أو المدير فقط.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -56,14 +57,15 @@ class SetupCog(commands.Cog, name="Server Setup"):
         try:
             public_cat = await category(public_category_name, False)
             staff_cat = await category(staff_category_name, True)
-            staff_overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+            admin_overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=False),
                 bot_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True, manage_messages=True),
             }
+            panel_overwrites = dict(admin_overwrites)
             for role_id in Config.STAFF_ROLE_IDS:
                 role = guild.get_role(role_id)
                 if role:
-                    staff_overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True)
+                    panel_overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True)
             public_overwrites = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
                 bot_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, manage_webhooks=True, create_public_threads=True),
@@ -72,16 +74,17 @@ class SetupCog(commands.Cog, name="Server Setup"):
             channels: dict[str, discord.TextChannel] = {}
             for key, (name, private) in definitions.items():
                 parent = staff_cat if private else public_cat
+                private_overwrites = panel_overwrites if key == "panel" else admin_overwrites
                 channel = discord.utils.get(parent.text_channels, name=name)
                 if channel is None:
                     channel = await guild.create_text_channel(
                         name, category=parent,
-                        overwrites=staff_overwrites if private else public_overwrites,
+                        overwrites=private_overwrites if private else public_overwrites,
                         reason="AdSentry channel setup",
                     )
                 else:
                     # Reassert bot-managed access controls on channels inside our named categories.
-                    await channel.edit(overwrites=staff_overwrites if private else public_overwrites, reason="AdSentry channel setup")
+                    await channel.edit(overwrites=private_overwrites if private else public_overwrites, reason="AdSentry channel setup")
                 channels[key] = channel
 
             stage = "حفظ قناة الإعلانات والمراجعة في قاعدة البيانات"
@@ -146,6 +149,9 @@ class SetupCog(commands.Cog, name="Server Setup"):
         """Configures and saves the guild's announcement and review channels in the database."""
         if not interaction.guild:
             await interaction.response.send_message("❌ This command must be executed within a server.", ephemeral=True)
+            return
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("هذا الأمر متاح لمالك السيرفر أو لمن لديه صلاحية Administrator فقط.", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
@@ -238,6 +244,9 @@ class SetupCog(commands.Cog, name="Server Setup"):
         """Displays currently active channel routing for the guild."""
         if not interaction.guild:
             await interaction.response.send_message("❌ This command must be executed within a server.", ephemeral=True)
+            return
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("هذا الأمر متاح لمالك السيرفر أو لمن لديه صلاحية Administrator فقط.", ephemeral=True)
             return
 
         config = await self.bot.db.get_guild_config(interaction.guild.id)

@@ -19,6 +19,13 @@ from utils import publish_ad_via_webhook
 logger = logging.getLogger("AdSentry.Moderation")
 
 
+def is_admin(user: discord.Member | discord.User) -> bool:
+    """Server owner or a member with Discord's Administrator permission."""
+    return isinstance(user, discord.Member) and (
+        user.id == user.guild.owner_id or user.guild_permissions.administrator
+    )
+
+
 def is_staff(user: discord.Member | discord.User) -> bool:
     """Checks whether the user has staff roles or moderation permissions."""
     if not isinstance(user, discord.Member):
@@ -265,7 +272,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
 
         try:
             # Enforce staff authorization
-            if not is_staff(interaction.user):
+            if not is_admin(interaction.user):
                 embed = discord.Embed(
                     title="⛔ Access Denied",
                     description="You do not possess the required staff roles or permissions to review ad submissions.",
@@ -683,7 +690,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
         clear_pending: bool = True,
     ) -> None:
         """Resets the submission cooldown for a target member."""
-        if not is_staff(interaction.user):
+        if not is_admin(interaction.user):
             await interaction.response.send_message(
                 "❌ **عذراً، هذا الأمر مخصص للإدارة والمشرفين فقط.**\n"
                 "You do not have staff permissions to reset cooldowns.",

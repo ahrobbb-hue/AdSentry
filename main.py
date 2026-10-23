@@ -90,8 +90,12 @@ class AdSentryBot(commands.Bot):
         # 4. Synchronize Application (Slash) Commands
         if Config.GUILD_ID:
             guild = discord.Object(id=Config.GUILD_ID)
+            # Keep commands scoped to the development guild only; mixing a global
+            # registration with guild copies makes Discord show each command twice.
             self.tree.copy_global_to(guild=guild)
             synced = await self.tree.sync(guild=guild)
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
             logger.info(f"Synced {len(synced)} slash command(s) to development guild [{Config.GUILD_ID}].")
         else:
             synced = await self.tree.sync()
@@ -114,14 +118,18 @@ class AdSentryBot(commands.Bot):
         )
         await self.change_presence(status=discord.Status.online, activity=activity)
 
-        # Synchronize slash commands directly to connected guilds for instant availability
+        # Remove stale guild-scoped copies left by older versions. Current
+        # production commands are registered globally (or only in GUILD_ID).
         for guild in self.guilds:
+            if Config.GUILD_ID and guild.id == Config.GUILD_ID:
+                continue
             try:
-                self.tree.copy_global_to(guild=guild)
+                self.tree.clear_commands(guild=guild)
                 synced_guild = await self.tree.sync(guild=guild)
-                logger.info(f"Instant synced {len(synced_guild)} slash command(s) to guild: {guild.name} ({guild.id})")
+                if synced_guild:
+                    logger.info(f"Removed {len(synced_guild)} stale guild-scoped slash command(s) from {guild.name} ({guild.id}).")
             except Exception as e:
-                logger.warning(f"Could not instant-sync commands to guild {guild.id}: {e}")
+                logger.warning(f"Could not clean stale guild-scoped commands in guild {guild.id}: {e}")
 
     async def close(self) -> None:
         """Gracefully cleanup connections upon bot shutdown."""
