@@ -105,9 +105,15 @@ class SupabaseDatabase:
         response = await client.table("recruitments").select("*").eq("status", status).execute()
         return response.data or []
 
+    async def get_due_recruitments(self) -> list[dict[str, Any]]:
+        client = await self.get_client()
+        now = datetime.now(timezone.utc).isoformat()
+        response = await client.table("recruitments").select("*").eq("status", "OPEN").not_.is_("closes_at", "null").lte("closes_at", now).execute()
+        return response.data or []
+
     async def get_pending_recruitment_applications(self) -> list[dict[str, Any]]:
         client = await self.get_client()
-        response = await client.table("recruitment_applications").select("id").eq("status", "PENDING").execute()
+        response = await client.table("recruitment_applications").select("id").in_("status", ["PENDING", "INTERVIEW"]).execute()
         return response.data or []
 
     async def set_recruitment_message(self, recruitment_id: int, message_id: int) -> None:
@@ -121,24 +127,42 @@ class SupabaseDatabase:
 
     async def create_recruitment_application(self, payload: dict[str, Any]) -> dict[str, Any]:
         client = await self.get_client()
-        response = await client.table("recruitment_applications").insert(payload).execute()
-        if not response.data:
+        response = await client.rpc("submit_recruitment_application", {
+            "p_recruitment_id": payload["recruitment_id"],
+            "p_guild_id": payload["guild_id"],
+            "p_user_id": payload["user_id"],
+            "p_user_name": payload["user_name"],
+            "p_experience": payload["experience"],
+            "p_motivation": payload["motivation"],
+            "p_availability": payload["availability"],
+            "p_custom_answers": payload.get("custom_answers", []),
+        }).execute()
+        data = response.data
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not isinstance(data, dict):
             raise RuntimeError("Application could not be saved.")
-        return response.data[0]
+        if not data.get("created"):
+            return {"id": 0, "reason": data.get("reason", "unknown")}
+        return data["application"]
 
     async def get_recruitment_application(self, application_id: int, guild_id: int) -> dict[str, Any] | None:
         client = await self.get_client()
         response = await client.table("recruitment_applications").select("*").eq("id", application_id).eq("guild_id", guild_id).limit(1).execute()
         return response.data[0] if response.data else None
 
-    async def review_recruitment_application(self, application_id: int, reviewer_id: int, status: str, guild_id: int) -> bool:
+    async def review_recruitment_application(self, application_id: int, reviewer_id: int, status: str, guild_id: int) -> dict[str, Any]:
         client = await self.get_client()
-        response = await client.table("recruitment_applications").update({
-            "status": status,
-            "reviewed_by": reviewer_id,
-            "reviewed_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", application_id).eq("guild_id", guild_id).eq("status", "PENDING").execute()
-        return bool(response.data)
+        response = await client.rpc("review_recruitment_application", {
+            "p_application_id": application_id,
+            "p_guild_id": guild_id,
+            "p_reviewer_id": reviewer_id,
+            "p_status": status,
+        }).execute()
+        data = response.data
+        if isinstance(data, list):
+            data = data[0] if data else None
+        return data if isinstance(data, dict) else {"changed": False, "reason": "invalid_response"}
 
     # -------------------------------------------------------------
     # Server Configurations Operations (Dynamic /ad-setup)

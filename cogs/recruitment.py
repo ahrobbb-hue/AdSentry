@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from cogs.moderation import is_staff
 
@@ -28,30 +28,58 @@ def _can_manage(interaction: discord.Interaction) -> bool:
     return bool(interaction.guild and is_staff(interaction.user))
 
 
+def _deadline_passed(opening: dict[str, Any]) -> bool:
+    raw = opening.get("closes_at")
+    if not raw:
+        return False
+    deadline = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    return deadline <= datetime.now(timezone.utc)
+
+
 class RecruitmentDetailsModal(discord.ui.Modal):
-    def __init__(self, title: str | None, public_channel: discord.TextChannel, review_channel: discord.TextChannel, bot: commands.Bot) -> None:
+    def __init__(self, title: str | None, public_channel: discord.TextChannel, review_channel: discord.TextChannel, bot: commands.Bot, grant_role: discord.Role | None = None) -> None:
         super().__init__(title="Create recruitment opening", timeout=600)
         self.role_title = title
         self.public_channel = public_channel
         self.review_channel = review_channel
         self.bot = bot
+        self.grant_role = grant_role
         if title is None:
             self.custom_title = discord.ui.TextInput(label="Custom role name", placeholder="e.g. Community Manager", max_length=80, required=True)
             self.add_item(self.custom_title)
-        self.summary = discord.ui.TextInput(label="Role description", style=discord.TextStyle.paragraph, placeholder="What will the selected person do?", max_length=850, required=True)
-        self.requirements = discord.ui.TextInput(label="Requirements", style=discord.TextStyle.paragraph, placeholder="Skills, experience, age requirements, etc.", max_length=850, required=True)
-        self.add_item(self.summary)
-        self.add_item(self.requirements)
+        self.description = discord.ui.TextInput(label="Description and requirements", style=discord.TextStyle.paragraph, placeholder="Describe the role, responsibilities, and requirements.", max_length=1200, required=True)
+        self.seat_limit = discord.ui.TextInput(label="Number of people to accept (1–100)", default="1", max_length=3, required=True)
+        self.close_after = discord.ui.TextInput(label="Close after hours (optional)", placeholder="Leave blank for manual close; maximum 720", max_length=3, required=False)
+        self.questions = discord.ui.TextInput(label="Extra questions (optional, one per line)", style=discord.TextStyle.paragraph, placeholder="Up to 2 extra questions", max_length=92, required=False)
+        self.add_item(self.description)
+        self.add_item(self.seat_limit)
+        self.add_item(self.close_after)
+        self.add_item(self.questions)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not _can_manage(interaction) or not interaction.guild:
             await interaction.response.send_message("Only authorized staff can create recruitment openings.", ephemeral=True)
             return
         title = self.role_title or self.custom_title.value.strip()
-        description = f"{self.summary.value.strip()}\n\n**Requirements**\n{self.requirements.value.strip()}"
+        description = self.description.value.strip()
+        try:
+            seat_limit = int(self.seat_limit.value.strip())
+            duration_value = (self.close_after.value or "").strip()
+            duration_hours = int(duration_value) if duration_value else None
+        except ValueError:
+            await interaction.response.send_message("Seats must be a number, and the close duration must be a whole number of hours.", ephemeral=True)
+            return
+        if not 1 <= seat_limit <= 100 or (duration_hours is not None and not 1 <= duration_hours <= 720):
+            await interaction.response.send_message("Choose 1–100 seats and an optional closing period of 1–720 hours.", ephemeral=True)
+            return
+        questions = [line.strip() for line in (self.questions.value or "").splitlines() if line.strip()]
+        if len(questions) > 2 or any(len(question) > 45 for question in questions):
+            await interaction.response.send_message("Add at most two extra questions, each no longer than 45 characters.", ephemeral=True)
+            return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            await publish_opening(self.bot, interaction, title, description, self.public_channel, self.review_channel)
+            await publish_opening(self.bot, interaction, title, description, self.public_channel, self.review_channel,
+                                  seat_limit=seat_limit, duration_hours=duration_hours, questions=questions, grant_role=self.grant_role)
             await interaction.followup.send("Recruitment is now open.", ephemeral=True)
         except Exception:
             logger.exception("Could not create recruitment through the role picker")
@@ -59,10 +87,11 @@ class RecruitmentDetailsModal(discord.ui.Modal):
 
 
 class RecruitmentRoleSelect(discord.ui.Select):
-    def __init__(self, options: list[discord.SelectOption], public_channel: discord.TextChannel, review_channel: discord.TextChannel) -> None:
+    def __init__(self, options: list[discord.SelectOption], public_channel: discord.TextChannel, review_channel: discord.TextChannel, grant_role: discord.Role | None) -> None:
         super().__init__(placeholder="Choose the role you are recruiting for", min_values=1, max_values=1, options=options, row=0)
         self.public_channel = public_channel
         self.review_channel = review_channel
+        self.grant_role = grant_role
 
     async def callback(self, interaction: discord.Interaction) -> None:
         if not _can_manage(interaction):
@@ -75,13 +104,14 @@ class RecruitmentRoleSelect(discord.ui.Select):
             public_channel=self.public_channel,
             review_channel=self.review_channel,
             bot=bot,
+            grant_role=self.grant_role,
         ))
 
 
 class RecruitmentRoleSelectView(discord.ui.View):
-    def __init__(self, options: list[discord.SelectOption], public_channel: discord.TextChannel, review_channel: discord.TextChannel) -> None:
+    def __init__(self, options: list[discord.SelectOption], public_channel: discord.TextChannel, review_channel: discord.TextChannel, grant_role: discord.Role | None = None) -> None:
         super().__init__(timeout=180)
-        self.add_item(RecruitmentRoleSelect(options, public_channel, review_channel))
+        self.add_item(RecruitmentRoleSelect(options, public_channel, review_channel, grant_role))
 
 
 async def publish_opening(
@@ -91,6 +121,11 @@ async def publish_opening(
     description: str,
     public_channel: discord.TextChannel,
     review_channel: discord.TextChannel,
+    *,
+    seat_limit: int | None = None,
+    duration_hours: int | None = None,
+    questions: list[str] | None = None,
+    grant_role: discord.Role | None = None,
 ) -> None:
     """Create the database record and public announcement with rollback on partial failure."""
     assert interaction.guild is not None
@@ -107,6 +142,15 @@ async def publish_opening(
     review_perms = review_channel.permissions_for(bot_member)
     if not review_perms.view_channel or not review_perms.send_messages or not review_perms.embed_links:
         raise PermissionError("Missing review channel permissions.")
+    if seat_limit is not None and not 1 <= seat_limit <= 100:
+        raise ValueError("Seat limit must be between 1 and 100.")
+    if duration_hours is not None and not 1 <= duration_hours <= 720:
+        raise ValueError("Closing period must be between 1 and 720 hours.")
+    if grant_role:
+        if grant_role.guild.id != interaction.guild.id or grant_role.is_default() or grant_role.managed:
+            raise ValueError("Choose a normal role from this server.")
+        if not bot_member.guild_permissions.manage_roles or grant_role >= bot_member.top_role:
+            raise PermissionError("The bot needs Manage Roles and a role higher than the role to grant.")
     active = await bot.db.get_open_recruitments(interaction.guild.id)
     if any(row["title"].casefold() == title.casefold() for row in active):
         raise ValueError("An opening with this role name is already active.")
@@ -121,8 +165,17 @@ async def publish_opening(
             "public_channel_id": public_channel.id,
             "review_channel_id": review_channel.id,
             "status": "OPEN",
+            "seat_limit": seat_limit,
+            "closes_at": (datetime.now(timezone.utc) + timedelta(hours=duration_hours)).isoformat() if duration_hours else None,
+            "questions": questions or [],
+            "grant_role_id": grant_role.id if grant_role else None,
         })
         embed = discord.Embed(title=f"Now accepting applications: {title.strip()}", description=description.strip(), color=discord.Color.green())
+        details = [f"Seats: {seat_limit}" if seat_limit else None,
+                   f"Closes: <t:{int((datetime.now(timezone.utc) + timedelta(hours=duration_hours)).timestamp())}:f>" if duration_hours else "Closes manually"]
+        embed.add_field(name="Details", value=" · ".join(value for value in details if value), inline=False)
+        if grant_role:
+            embed.add_field(name="Role after acceptance", value=grant_role.mention, inline=False)
         embed.set_footer(text=f"Opening #{opening['id']} · Apply using the button below")
         announcement = await public_channel.send(embed=embed, view=ApplyView(opening["id"]), allowed_mentions=discord.AllowedMentions.none())
         await bot.db.set_recruitment_message(opening["id"], announcement.id)
@@ -152,6 +205,11 @@ class ApplicationModal(discord.ui.Modal):
         self.add_item(self.experience)
         self.add_item(self.motivation)
         self.add_item(self.availability)
+        self.custom_inputs: list[discord.ui.TextInput] = []
+        for question in (recruitment.get("questions") or [])[:2]:
+            answer = discord.ui.TextInput(label=question, style=discord.TextStyle.paragraph, max_length=700, required=True)
+            self.custom_inputs.append(answer)
+            self.add_item(answer)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not interaction.guild or interaction.guild.id != self.recruitment["guild_id"]:
@@ -161,7 +219,10 @@ class ApplicationModal(discord.ui.Modal):
         try:
             # Re-check status at submission time; stale buttons cannot submit to a closed opening.
             current = await self.bot.db.get_recruitment(self.recruitment["id"])
-            if not current or current.get("status") != "OPEN":
+            if not current or current.get("status") != "OPEN" or _deadline_passed(current):
+                if current and current.get("status") == "OPEN":
+                    await self.bot.db.close_recruitment(current["id"], current["guild_id"])
+                    await close_announcement(self.bot, current)
                 await interaction.followup.send("This application is closed.", ephemeral=True)
                 return
             record = await self.bot.db.create_recruitment_application({
@@ -172,8 +233,18 @@ class ApplicationModal(discord.ui.Modal):
                 "experience": self.experience.value.strip(),
                 "motivation": self.motivation.value.strip(),
                 "availability": self.availability.value.strip(),
+                "custom_answers": [{"question": field.label, "answer": field.value.strip()} for field in self.custom_inputs],
                 "status": "PENDING",
             })
+            if record.get("reason") == "duplicate":
+                await interaction.followup.send("You have already applied to this opening.", ephemeral=True)
+                return
+            if record.get("reason") == "closed":
+                latest = await self.bot.db.get_recruitment(current["id"])
+                if latest:
+                    await close_announcement(self.bot, latest)
+                await interaction.followup.send("This application closed before your submission was received.", ephemeral=True)
+                return
             review_channel = self.bot.get_channel(current["review_channel_id"])
             if not isinstance(review_channel, discord.TextChannel):
                 review_channel = await self.bot.fetch_channel(current["review_channel_id"])
@@ -184,6 +255,8 @@ class ApplicationModal(discord.ui.Modal):
             embed.add_field(name="Experience", value=self.experience.value[:1024], inline=False)
             embed.add_field(name="Motivation", value=self.motivation.value[:1024], inline=False)
             embed.add_field(name="Availability", value=self.availability.value[:1024], inline=False)
+            for field in self.custom_inputs:
+                embed.add_field(name=field.label, value=field.value[:1024], inline=False)
             await review_channel.send(embed=embed, view=ApplicationReviewView(record["id"]))
             await interaction.followup.send("Your application was sent to the staff team for review.", ephemeral=True)
         except Exception as exc:
@@ -205,7 +278,10 @@ class ApplyView(discord.ui.View):
             return
         bot: commands.Bot = interaction.client  # type: ignore[assignment]
         recruitment = await bot.db.get_recruitment(self.recruitment_id)
-        if not recruitment or recruitment.get("status") != "OPEN" or recruitment["guild_id"] != interaction.guild.id:
+        if not recruitment or recruitment.get("status") != "OPEN" or recruitment["guild_id"] != interaction.guild.id or _deadline_passed(recruitment):
+            if recruitment and recruitment.get("status") == "OPEN" and _deadline_passed(recruitment):
+                await bot.db.close_recruitment(recruitment["id"], interaction.guild.id)
+                await close_announcement(bot, recruitment)
             await interaction.response.send_message("This application is closed.", ephemeral=True)
             return
         await interaction.response.send_modal(ApplicationModal(recruitment, bot))
@@ -214,7 +290,7 @@ class ApplyView(discord.ui.View):
 class ApplicationReviewView(discord.ui.View):
     def __init__(self, application_id: int) -> None:
         super().__init__(timeout=None)
-        for decision, label, style in (("ACCEPTED", "Accept", discord.ButtonStyle.success), ("REJECTED", "Reject", discord.ButtonStyle.danger)):
+        for decision, label, style in (("INTERVIEW", "Invite to interview", discord.ButtonStyle.primary), ("ACCEPTED", "Accept", discord.ButtonStyle.success), ("REJECTED", "Reject", discord.ButtonStyle.danger)):
             button = discord.ui.Button(label=label, style=style, custom_id=f"adsentry:recruit:review:{application_id}:{decision}")
             button.callback = self.review  # type: ignore[method-assign]
             self.add_item(button)
@@ -225,7 +301,7 @@ class ApplicationReviewView(discord.ui.View):
             return
         custom_id = str((interaction.data or {}).get("custom_id", ""))
         parts = custom_id.split(":")
-        if len(parts) != 5 or not parts[3].isdigit() or parts[4] not in {"ACCEPTED", "REJECTED"}:
+        if len(parts) != 5 or not parts[3].isdigit() or parts[4] not in {"INTERVIEW", "ACCEPTED", "REJECTED"}:
             await interaction.response.send_message("Invalid review action.", ephemeral=True)
             return
         application_id, decision = int(parts[3]), parts[4]
@@ -236,29 +312,68 @@ class ApplicationReviewView(discord.ui.View):
             if not application:
                 await interaction.followup.send("Application not found in this server.", ephemeral=True)
                 return
-            changed = await bot.db.review_recruitment_application(application_id, interaction.user.id, decision, interaction.guild.id)  # type: ignore[union-attr]
-            if not changed:
-                await interaction.followup.send("This application was already reviewed.", ephemeral=True)
+            opening = await bot.db.get_recruitment(application["recruitment_id"])
+            result = await bot.db.review_recruitment_application(application_id, interaction.user.id, decision, interaction.guild.id)  # type: ignore[union-attr]
+            if not result.get("changed"):
+                reason = result.get("reason")
+                message = "No more seats are available; this opening has reached its capacity." if reason == "capacity" else "This application was already reviewed or is no longer available."
+                await interaction.followup.send(message, ephemeral=True)
                 return
             if interaction.message:
                 embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed(title=f"Application #{application_id}")
-                embed.color = discord.Color.green() if decision == "ACCEPTED" else discord.Color.red()
-                embed.add_field(name="Decision", value=f"{decision.title()} by {interaction.user.mention}", inline=False)
+                embed.color = discord.Color.blurple() if decision == "INTERVIEW" else (discord.Color.green() if decision == "ACCEPTED" else discord.Color.red())
+                embed.add_field(name="Stage", value=f"{decision.title()} by {interaction.user.mention}", inline=False)
                 try:
-                    await interaction.message.edit(embed=embed, view=None)
+                    await interaction.message.edit(embed=embed, view=None if decision != "INTERVIEW" else ApplicationReviewView(application_id))
                 except discord.HTTPException:
                     logger.exception("Decision saved but review card could not be updated for application %s", application_id)
+            role_result = ""
+            if decision == "ACCEPTED" and opening and opening.get("grant_role_id"):
+                try:
+                    role = interaction.guild.get_role(opening["grant_role_id"])  # type: ignore[union-attr]
+                    member = interaction.guild.get_member(application["user_id"])  # type: ignore[union-attr]
+                    if not member:
+                        member = await interaction.guild.fetch_member(application["user_id"])  # type: ignore[union-attr]
+                    if not role or role.is_default() or role.managed or role >= interaction.guild.me.top_role:  # type: ignore[union-attr]
+                        raise PermissionError("Configured role is missing or above the bot's role")
+                    await member.add_roles(role, reason=f"Accepted for recruitment opening #{opening['id']}")
+                    role_result = f" Role {role.name} assigned."
+                except (discord.HTTPException, discord.NotFound, PermissionError):
+                    logger.exception("Application accepted, but its configured role could not be assigned")
+                    role_result = " The application was accepted, but Discord could not assign the configured role."
             try:
                 applicant = await bot.fetch_user(application["user_id"])
-                opening = await bot.db.get_recruitment(application["recruitment_id"])
                 role_title = opening.get("title", "the role") if opening else "the role"
-                await applicant.send(f"Your application for **{role_title}** was {decision.lower()} in **{interaction.guild.name}**.")  # type: ignore[union-attr]
+                dm_message = (f"The staff team would like to interview you for **{role_title}** in **{interaction.guild.name}**." if decision == "INTERVIEW"
+                              else f"Your application for **{role_title}** was {decision.lower()} in **{interaction.guild.name}**.")
+                await applicant.send(dm_message)  # type: ignore[union-attr]
             except (discord.HTTPException, discord.NotFound):
                 logger.info("Could not DM applicant %s about decision", application["user_id"])
-            await interaction.followup.send(f"Application marked {decision.lower()}.", ephemeral=True)
+            if result.get("capacity_reached") and opening:
+                await close_announcement(bot, opening)
+            await interaction.followup.send(f"Application moved to {decision.lower()}.{role_result}", ephemeral=True)
         except Exception:
             logger.exception("Could not review application %s", application_id)
             await interaction.followup.send("Could not save the decision. Please try again.", ephemeral=True)
+
+
+async def close_announcement(bot: commands.Bot, opening: dict[str, Any]) -> None:
+    channel = bot.get_channel(opening["public_channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        try:
+            channel = await bot.fetch_channel(opening["public_channel_id"])
+        except discord.HTTPException:
+            channel = None
+    if not isinstance(channel, discord.TextChannel) or not opening.get("announcement_message_id"):
+        return
+    try:
+        message = await channel.fetch_message(opening["announcement_message_id"])
+        embed = message.embeds[0] if message.embeds else discord.Embed(title=opening["title"])
+        embed.color = discord.Color.dark_grey()
+        embed.set_footer(text=f"Opening #{opening['id']} · Applications closed")
+        await message.edit(embed=embed, view=None)
+    except discord.HTTPException:
+        logger.warning("Could not update announcement for closed opening %s", opening["id"])
 
 
 class RecruitmentCog(commands.Cog):
@@ -277,14 +392,33 @@ class RecruitmentCog(commands.Cog):
                 self.bot.add_view(ApplicationReviewView(application["id"]))
         except Exception:
             logger.exception("Could not restore recruitment controls; check that the recruitment SQL migration was applied")
+        if not self.recruitment_expiry_sweeper.is_running():
+            self.recruitment_expiry_sweeper.start()
+
+    def cog_unload(self) -> None:
+        self.recruitment_expiry_sweeper.cancel()
+
+    @tasks.loop(seconds=60)
+    async def recruitment_expiry_sweeper(self) -> None:
+        try:
+            for opening in await self.bot.db.get_due_recruitments():
+                if await self.bot.db.close_recruitment(opening["id"], opening["guild_id"]):
+                    await close_announcement(self.bot, opening)
+        except Exception:
+            logger.exception("Recruitment expiry sweep failed")
+
+    @recruitment_expiry_sweeper.before_loop
+    async def before_recruitment_expiry_sweeper(self) -> None:
+        await self.bot.wait_until_ready()
 
     @recruitment.command(name="create", description="Create an opening using the role picker")
-    @app_commands.describe(public_channel="Where the opening will be announced", review_channel="Private staff channel for applications")
+    @app_commands.describe(public_channel="Where the opening will be announced", review_channel="Private staff channel for applications", grant_role="Optional Discord role to grant when an applicant is accepted")
     async def create_recruitment(
         self,
         interaction: discord.Interaction,
         public_channel: discord.TextChannel,
         review_channel: discord.TextChannel,
+        grant_role: discord.Role | None = None,
     ) -> None:
         if not _can_manage(interaction) or not interaction.guild:
             await interaction.response.send_message("Only authorized staff can create recruitment openings.", ephemeral=True)
@@ -301,7 +435,7 @@ class RecruitmentCog(commands.Cog):
             options.append(discord.SelectOption(label="Other", value="__other__", description="Enter a custom role name"))
             await interaction.response.send_message(
                 "Choose the role for this opening. Selecting **Other** will ask you to enter its name.",
-                view=RecruitmentRoleSelectView(options, public_channel, review_channel),
+                view=RecruitmentRoleSelectView(options, public_channel, review_channel, grant_role),
                 ephemeral=True,
             )
         except Exception:
@@ -354,8 +488,8 @@ class RecruitmentCog(commands.Cog):
             await interaction.response.send_message("Could not remove that option. Please check the database migration.", ephemeral=True)
 
     @recruitment.command(name="open", description="Open an application form for a team role")
-    @app_commands.describe(title="Role or team", description="What the role involves and eligibility", public_channel="Where to announce the opening", review_channel="Private staff channel for applications")
-    async def open_recruitment(self, interaction: discord.Interaction, title: str, description: str, public_channel: discord.TextChannel, review_channel: discord.TextChannel) -> None:
+    @app_commands.describe(title="Role or team", description="What the role involves and eligibility", public_channel="Where to announce the opening", review_channel="Private staff channel for applications", grant_role="Optional Discord role to grant when an applicant is accepted")
+    async def open_recruitment(self, interaction: discord.Interaction, title: str, description: str, public_channel: discord.TextChannel, review_channel: discord.TextChannel, grant_role: discord.Role | None = None) -> None:
         if not _can_manage(interaction):
             await interaction.response.send_message("Only authorized staff can open recruitment.", ephemeral=True)
             return
@@ -374,6 +508,10 @@ class RecruitmentCog(commands.Cog):
             if not review_perms.view_channel or not review_perms.send_messages or not review_perms.embed_links:
                 await interaction.followup.send("I need View Channel, Send Messages, and Embed Links in the staff review channel.", ephemeral=True)
                 return
+            if grant_role and (grant_role.guild.id != interaction.guild.id or grant_role.is_default() or grant_role.managed
+                               or not interaction.guild.me.guild_permissions.manage_roles or grant_role >= interaction.guild.me.top_role):
+                await interaction.followup.send("The optional role must be a regular role below the bot's highest role, and the bot needs Manage Roles.", ephemeral=True)
+                return
             # Avoid simultaneous openings for the same role (case-insensitive check).
             active = await self.bot.db.get_open_recruitments(interaction.guild.id)
             if any(row["title"].casefold() == title.casefold() for row in active):
@@ -387,8 +525,14 @@ class RecruitmentCog(commands.Cog):
                 "public_channel_id": public_channel.id,
                 "review_channel_id": review_channel.id,
                 "status": "OPEN",
+                "seat_limit": None,
+                "closes_at": None,
+                "questions": [],
+                "grant_role_id": grant_role.id if grant_role else None,
             })
             embed = discord.Embed(title=f"Now accepting applications: {title.strip()}", description=description.strip(), color=discord.Color.green())
+            if grant_role:
+                embed.add_field(name="Role after acceptance", value=grant_role.mention, inline=False)
             embed.set_footer(text=f"Opening #{opening['id']} · Apply using the button below")
             announcement = await public_channel.send(embed=embed, view=ApplyView(opening["id"]), allowed_mentions=discord.AllowedMentions.none())
             await self.bot.db.set_recruitment_message(opening["id"], announcement.id)
@@ -426,16 +570,7 @@ class RecruitmentCog(commands.Cog):
             if not await self.bot.db.close_recruitment(opening_id, interaction.guild.id):
                 await interaction.followup.send("This opening is already closed.", ephemeral=True)
                 return
-            channel = self.bot.get_channel(opening["public_channel_id"])
-            if isinstance(channel, discord.TextChannel) and opening.get("announcement_message_id"):
-                try:
-                    message = await channel.fetch_message(opening["announcement_message_id"])
-                    embed = message.embeds[0] if message.embeds else discord.Embed(title=opening["title"])
-                    embed.color = discord.Color.dark_grey()
-                    embed.set_footer(text=f"Opening #{opening_id} · Applications closed")
-                    await message.edit(embed=embed, view=None)
-                except discord.HTTPException:
-                    logger.warning("Could not update announcement for closed opening %s", opening_id)
+            await close_announcement(self.bot, opening)
             await interaction.followup.send(f"Opening #{opening_id} is now closed.", ephemeral=True)
         except Exception:
             logger.exception("Could not close recruitment %s", opening_id)
