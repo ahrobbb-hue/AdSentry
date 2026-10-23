@@ -57,6 +57,39 @@ class SystemDashboardView(discord.ui.View):
         await self.cog.show_home(interaction, edit=True)
 
 
+class PersistentDashboardView(discord.ui.View):
+    """Controls for the permanent operations-center message."""
+
+    def __init__(self, cog: "DashboardCog") -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(label="التوظيف والإدارة", emoji="👥", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:recruitment", row=0)
+    async def recruitment(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _staff(interaction): await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
+        await self.cog.show_recruitment(interaction)
+
+    @discord.ui.button(label="الفعاليات", emoji="📅", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:events", row=0)
+    async def events(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _staff(interaction): await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
+        await self.cog.show_events(interaction)
+
+    @discord.ui.button(label="إدارة الطاقم", emoji="🛡️", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:staff", row=0)
+    async def staffflow(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _staff(interaction): await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
+        await self.cog.show_staffflow(interaction)
+
+    @discord.ui.button(label="قنوات مراجعة التقديم", emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="adsentry:ops:channels", row=1)
+    async def channels(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _staff(interaction): await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
+        await interaction.response.send_message("اختر حتى ثلاث قنوات خاصة لبطاقات المتقدمين:", view=ReviewChannelSetupView(self.cog), ephemeral=True)
+
+    @discord.ui.button(label="تحديث الملخص", emoji="🔄", style=discord.ButtonStyle.secondary, custom_id="adsentry:ops:refresh", row=1)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _staff(interaction): await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
+        await self.cog.refresh_persistent_panel(interaction)
+
+
 class ReviewChannelSetupView(discord.ui.View):
     def __init__(self, cog: "DashboardCog") -> None:
         super().__init__(timeout=180)
@@ -521,28 +554,82 @@ class DashboardCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
+    async def cog_load(self) -> None:
+        # Stable custom IDs make the operations-center buttons survive restarts.
+        self.bot.add_view(PersistentDashboardView(self))
+
+    async def dashboard_embed(self, guild: discord.Guild) -> discord.Embed:
+        try:
+            client = await self.bot.db.get_client()
+            openings = (await client.table("recruitments").select("id").eq("guild_id", guild.id).eq("status", "OPEN").execute()).data or []
+            events = (await client.table("events").select("id").eq("guild_id", guild.id).eq("status", "OPEN").execute()).data or []
+            cases = (await client.table("staff_cases").select("id").eq("guild_id", guild.id).eq("status", "PENDING").execute()).data or []
+            channels = (await client.table("recruitment_review_channels").select("channel_id").eq("guild_id", guild.id).order("slot").execute()).data or []
+            ads = await self.bot.db.get_ad_stats(guild.id, days=7)
+            channel_text = "، ".join(f"<#{row['channel_id']}>" for row in channels) or "لم يتم ضبطها"
+            description = (f"مركز العمليات في **{guild.name}**\n\n"
+                           f"**التوظيف:** {len(openings)} تقديم مفتوح\n**الفعاليات:** {len(events)} فعالية مفتوحة\n**طلبات الطاقم المعلقة:** {len(cases)}\n"
+                           f"**الإعلانات خلال 7 أيام:** {ads['total_count']} (مقبول: {ads['approved_count']} · مرفوض: {ads['rejected_count']})\n"
+                           f"**قنوات مراجعة المتقدمين:** {channel_text}\n\n"
+                           "اختر نظامًا من الأزرار. ستُفتح أدوات الإدارة لك برسائل خاصة، وستبقى لوحة المركز هذه ثابتة هنا.")
+        except Exception:
+            logger.exception("Could not load dashboard summary for guild %s", guild.id)
+            description = "مركز العمليات جاهز، لكن تعذر تحميل الإحصاءات. تحقق من تشغيل ترحيلات قاعدة البيانات."
+        return discord.Embed(title="AdSentry · مركز العمليات", description=description, color=discord.Color.blurple())
+
+    async def refresh_persistent_panel(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("استخدم اللوحة داخل السيرفر.", ephemeral=True); return
+        await interaction.response.defer()
+        embed = await self.dashboard_embed(interaction.guild)
+        await interaction.edit_original_response(embed=embed, view=PersistentDashboardView(self))
+
+    async def publish_panel(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+        if not interaction.guild or not _staff(interaction):
+            await interaction.response.send_message("إعداد مركز العمليات متاح للإدارة فقط.", ephemeral=True); return
+        if channel.guild.id != interaction.guild.id:
+            await interaction.response.send_message("اختر قناة من هذا السيرفر.", ephemeral=True); return
+        bot_member = interaction.guild.me
+        perms = channel.permissions_for(bot_member)
+        if not (perms.view_channel and perms.send_messages and perms.embed_links):
+            await interaction.response.send_message("أحتاج View Channel وSend Messages وEmbed Links في قناة مركز العمليات.", ephemeral=True); return
+        if channel.permissions_for(interaction.guild.default_role).view_channel:
+            await interaction.response.send_message("قناة مركز العمليات ظاهرة للجميع. اجعلها خاصة بفريق الإدارة أولًا.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            client = await self.bot.db.get_client()
+            saved = (await client.table("staff_dashboard_panels").select("channel_id,message_id").eq("guild_id", interaction.guild.id).limit(1).execute()).data or []
+            if saved and saved[0].get("message_id"):
+                current_channel = interaction.guild.get_channel(int(saved[0]["channel_id"]))
+                if current_channel is None:
+                    try: current_channel = await interaction.guild.fetch_channel(int(saved[0]["channel_id"]))
+                    except discord.NotFound: current_channel = None
+                if isinstance(current_channel, discord.TextChannel):
+                    try:
+                        message = await current_channel.fetch_message(int(saved[0]["message_id"]))
+                        if current_channel.id != channel.id:
+                            await interaction.followup.send(f"مركز العمليات موجود مسبقًا في {current_channel.mention}. لم أحذف اللوحة أو أنشئ نسخة ثانية.", ephemeral=True); return
+                        await message.edit(embed=await self.dashboard_embed(interaction.guild), view=PersistentDashboardView(self))
+                        await interaction.followup.send(f"تم تحديث مركز العمليات الثابت في {channel.mention}.", ephemeral=True); return
+                    except discord.NotFound:
+                        logger.warning("Saved operations panel was deleted outside the bot; recreating it")
+            # Save the destination before sending; retries can recover if Discord delivery succeeds but persistence fails.
+            await client.table("staff_dashboard_panels").upsert({"guild_id": interaction.guild.id, "channel_id": channel.id, "message_id": None, "updated_by": interaction.user.id}).execute()
+            message = await channel.send(embed=await self.dashboard_embed(interaction.guild), view=PersistentDashboardView(self), allowed_mentions=discord.AllowedMentions.none())
+            await client.table("staff_dashboard_panels").update({"message_id": message.id, "updated_by": interaction.user.id, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("guild_id", interaction.guild.id).execute()
+            try: await message.pin(reason="AdSentry permanent operations center")
+            except discord.HTTPException: logger.info("Could not pin the dashboard panel in channel %s", channel.id)
+            await interaction.followup.send(f"تم تثبيت مركز العمليات في {channel.mention}. أزراره ستبقى تعمل بعد إعادة تشغيل البوت.", ephemeral=True)
+        except Exception:
+            logger.exception("Could not publish persistent dashboard panel")
+            await interaction.followup.send("تعذر إنشاء مركز العمليات. تأكد من تشغيل ترحيل لوحة التحكم وصلاحيات القناة.", ephemeral=True)
+
     async def show_home(self, interaction: discord.Interaction, edit: bool = False) -> None:
         if not _staff(interaction) or not interaction.guild:
             await interaction.response.send_message("لوحة التحكم متاحة للإدارة فقط.", ephemeral=True); return
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True, thinking=not edit)
-        try:
-            client = await self.bot.db.get_client()
-            openings = (await client.table("recruitments").select("id").eq("guild_id", interaction.guild.id).eq("status", "OPEN").execute()).data or []
-            events = (await client.table("events").select("id").eq("guild_id", interaction.guild.id).eq("status", "OPEN").execute()).data or []
-            cases = (await client.table("staff_cases").select("id").eq("guild_id", interaction.guild.id).eq("status", "PENDING").execute()).data or []
-            channels = (await client.table("recruitment_review_channels").select("channel_id").eq("guild_id", interaction.guild.id).order("slot").execute()).data or []
-            ads = await self.bot.db.get_ad_stats(interaction.guild.id, days=7)
-            channel_text = "، ".join(f"<#{row['channel_id']}>" for row in channels) or "لم يتم ضبطها"
-            description = (f"مرحبًا **{interaction.guild.name}**. اختر النظام الذي تريد إدارته من الأزرار.\n\n"
-                           f"**التوظيف:** {len(openings)} تقديم مفتوح\n**الفعاليات:** {len(events)} فعالية مفتوحة\n**طلبات الطاقم المعلقة:** {len(cases)}\n"
-                           f"**الإعلانات خلال 7 أيام:** {ads['total_count']} (مقبول: {ads['approved_count']} · مرفوض: {ads['rejected_count']})\n"
-                           f"**قنوات مراجعة المتقدمين:** {channel_text}\n\n"
-                           "اللوحة خاصة بك ولن تظهر للأعضاء الآخرين.")
-        except Exception:
-            logger.exception("Could not load dashboard summary")
-            description = "تعذر تحميل بعض الإحصاءات. تأكد من تشغيل ترحيلات قاعدة البيانات الخاصة بالأنظمة الجديدة."
-        embed = discord.Embed(title="AdSentry · لوحة التحكم", description=description, color=discord.Color.blurple())
+        embed = await self.dashboard_embed(interaction.guild)
         view = SystemDashboardView(self)
         await interaction.edit_original_response(embed=embed, view=view)
 
@@ -602,9 +689,27 @@ class DashboardCog(commands.Cog):
         embed = discord.Embed(title="StaffFlow · إدارة الطاقم", description=description, color=discord.Color.blurple())
         await interaction.edit_original_response(embed=embed, view=StaffDashboardView(self))
 
-    @app_commands.command(name="dashboard", description="فتح لوحة تحكم أنظمة AdSentry")
-    async def dashboard(self, interaction: discord.Interaction) -> None:
-        await self.show_home(interaction)
+    @app_commands.command(name="dashboard", description="فتح أو تثبيت لوحة مركز عمليات AdSentry")
+    @app_commands.describe(channel="قناة الإدارة الخاصة لتثبيت لوحة العمليات فيها")
+    async def dashboard(self, interaction: discord.Interaction, channel: discord.TextChannel | None = None) -> None:
+        if channel:
+            await self.publish_panel(interaction, channel)
+            return
+        if not interaction.guild or not _staff(interaction):
+            await interaction.response.send_message("مركز العمليات متاح للإدارة فقط.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            client = await self.bot.db.get_client()
+            rows = (await client.table("staff_dashboard_panels").select("channel_id,message_id").eq("guild_id", interaction.guild.id).limit(1).execute()).data or []
+        except Exception:
+            logger.exception("Could not locate persistent dashboard")
+            await interaction.followup.send("تأكد من تشغيل ترحيل لوحة التحكم، ثم استخدم `/dashboard channel:#قناة-الإدارة` لإنشاء المركز.", ephemeral=True); return
+        if rows:
+            channel_obj = interaction.guild.get_channel(int(rows[0]["channel_id"]))
+            if isinstance(channel_obj, discord.TextChannel) and rows[0].get("message_id"):
+                await interaction.followup.send(f"لوحة مركز العمليات الثابتة موجودة في {channel_obj.mention}.", ephemeral=True)
+                return
+        await interaction.followup.send("لم يتم تثبيت مركز العمليات بعد. استخدم `/dashboard channel:#قناة-الإدارة` مرة واحدة.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

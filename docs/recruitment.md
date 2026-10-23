@@ -2,9 +2,11 @@
 
 ## Interactive dashboard
 
-Staff can open `/dashboard` to see current system counts and enter the recruitment, EventHub, or StaffFlow page. In the dashboard, use **إعداد قنوات التقديم** to select up to three private review channels. The recruitment page's **إنشاء تقديم جديد** flow then asks which configured channel should receive that opening's applicant cards, followed by the existing role and opening form. The public announcement uses the announcement channel configured through `/ad-setup`.
+Staff can run `/dashboard channel:#operations-room` once to post the permanent operations-center panel in a private administration channel. Its buttons keep working after bot restarts, and the bot edits or refreshes this same message instead of deleting it or creating a new one. Clicking a system opens a private graphical page for the staff member while leaving the permanent panel untouched. Running `/dashboard` later returns the configured channel.
 
-Run `database/recruitment_dashboard_migration.sql` once in Supabase to enable dashboard channel selection. The dashboard summary also reads the EventHub and StaffFlow tables, so run `database/eventhub_staffflow_migration.sql` before opening `/dashboard` if those feature tables are not installed yet. Keep each selected review channel private to the intended reviewers.
+From the recruitment page, staff can create or close openings. Use the permanent panel's **قنوات مراجعة التقديم** button to select up to three private review channels. The create flow asks which configured channel receives the opening's applicant cards, then opens the role and application form. The public announcement uses the channel configured through `/ad-setup`.
+
+Run `database/dashboard_panel_migration.sql` once in Supabase to store the permanent panel. Also run `database/recruitment_dashboard_migration.sql` for channel selection and `database/eventhub_staffflow_migration.sql` if the EventHub and StaffFlow tables are not installed yet. Keep the operations and review channels private to their intended teams.
 
 Recruitment is managed by authorized staff (server administrators/moderators or configured `STAFF_ROLE_IDS`); members can only submit applications.
 
