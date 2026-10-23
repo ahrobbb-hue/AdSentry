@@ -44,8 +44,13 @@ def is_staff(user: discord.Member | discord.User) -> bool:
     # duplicated in every deployment's environment variables. Roles at or
     # above that role in the server hierarchy inherit staff access.
     manager_names = {"manager", "مدير", "المدير", "مدير السيرفر", "مدير الطاقم"}
+
+    def normalized_role_name(name: str) -> str:
+        # Discord role names often include emoji and separators, e.g. "🏹 | Manager".
+        return " ".join("".join(ch if ch.isalnum() else " " for ch in name.casefold()).split())
+
     manager_role = next(
-        (role for role in user.guild.roles if role.name.strip().casefold() in manager_names),
+        (role for role in user.guild.roles if normalized_role_name(role.name) in manager_names),
         None,
     )
     return bool(manager_role and any(role.position >= manager_role.position for role in user.roles))
