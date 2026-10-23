@@ -404,6 +404,38 @@ class LeaveDetailsModal(discord.ui.Modal, title="تفاصيل طلب الإجا�
                                 details=self.details.value.strip(), start=self.start, end=self.end)
 
 
+class OtherLeaveReasonModal(discord.ui.Modal, title="سبب الإجازة الآخر"):
+    reason_input = discord.ui.TextInput(
+        label="اكتب سبب الإجازة",
+        placeholder="اكتب السبب الذي تريد إرساله للإدارة",
+        max_length=100,
+    )
+
+    def __init__(self, view: "LeaveRequestView", source_interaction: discord.Interaction) -> None:
+        super().__init__()
+        self.view_state = view
+        self.source_interaction = source_interaction
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not _staff(interaction):
+            await interaction.response.send_message("هذا الإجراء لطاقم السيرفر فقط.", ephemeral=True)
+            return
+        reason = self.reason_input.value.strip()
+        if not reason:
+            await interaction.response.send_message("اكتب سبب الإجازة قبل الإرسال.", ephemeral=True)
+            return
+        self.view_state.reason = reason
+        self.view_state.reason_is_other = True
+        self.view_state.refresh_selected_options()
+        await interaction.response.send_message("تم حفظ السبب الآخر. أكمل اختيار التاريخين ثم اضغط متابعة.", ephemeral=True)
+        try:
+            await self.source_interaction.edit_original_response(
+                content=self.view_state.summary_text(), view=self.view_state
+            )
+        except discord.HTTPException:
+            logger.debug("Could not refresh the leave form after custom reason entry", exc_info=True)
+
+
 class LeaveRequestView(discord.ui.View):
     """Guided leave request: dates and reason are selected from menus."""
 
@@ -412,6 +444,8 @@ class LeaveRequestView(discord.ui.View):
         self.cog = cog
         self.start_date: str | None = None
         self.end_date: str | None = None
+        self.reason: str | None = None
+        self.reason_is_other = False
         today = datetime.now(timezone.utc).date()
         self.start_select = discord.ui.Select(
             placeholder="اختر تاريخ بداية الإجازة",
@@ -452,24 +486,71 @@ class LeaveRequestView(discord.ui.View):
         self.end_select.placeholder = "اختر تاريخ نهاية الإجازة"
         self.end_select.disabled = False
         self.end_date = None
-        await interaction.response.edit_message(content="اختر البداية والنهاية وسبب الإجازة، ثم اضغط **متابعة** لإضافة التفاصيل.", view=self)
+        self.refresh_selected_options()
+        await interaction.response.edit_message(content=self.summary_text(), view=self)
 
     async def choose_end(self, interaction: discord.Interaction) -> None:
         self.end_date = self.end_select.values[0]
-        await interaction.response.edit_message(content=f"البداية: **{self.start_date}** · النهاية: **{self.end_date}**. اختر السبب ثم اضغط **متابعة**.", view=self)
+        self.refresh_selected_options()
+        await interaction.response.edit_message(content=self.summary_text(), view=self)
 
     async def choose_reason(self, interaction: discord.Interaction) -> None:
-        await interaction.response.edit_message(content=f"تم اختيار السبب: **{self.reason_select.values[0]}**. أكمل اختيار التاريخين ثم اضغط **متابعة**.", view=self)
+        selected_reason = self.reason_select.values[0]
+        if selected_reason == "سبب آخر":
+            await interaction.response.send_modal(OtherLeaveReasonModal(self, interaction))
+            return
+        self.reason = selected_reason
+        self.reason_is_other = False
+        self.refresh_selected_options()
+        await interaction.response.edit_message(content=self.summary_text(), view=self)
+
+    def refresh_selected_options(self) -> None:
+        today = datetime.now(timezone.utc).date()
+        self.start_select.options = [
+            discord.SelectOption(
+                label=(today + timedelta(days=i)).isoformat(),
+                value=(today + timedelta(days=i)).isoformat(),
+                default=(today + timedelta(days=i)).isoformat() == self.start_date,
+            )
+            for i in range(25)
+        ]
+        if self.start_date:
+            start = datetime.fromisoformat(self.start_date).date()
+            self.end_select.options = [
+                discord.SelectOption(
+                    label=(start + timedelta(days=i)).isoformat(),
+                    value=(start + timedelta(days=i)).isoformat(),
+                    default=(start + timedelta(days=i)).isoformat() == self.end_date,
+                )
+                for i in range(25)
+            ]
+        reason_values = ("إجازة سنوية", "إجازة مرضية", "ظرف طارئ", "إجازة شخصية", "سبب آخر")
+        reason_emojis = ("🌴", "🩺", "🚨", "👤", "📝")
+        self.reason_select.options = [
+            discord.SelectOption(
+                label=value,
+                value=value,
+                emoji=reason_emojis[index],
+                default=(value == "سبب آخر" and self.reason_is_other) or (value == self.reason and not self.reason_is_other),
+            )
+            for index, value in enumerate(reason_values)
+        ]
+
+    def summary_text(self) -> str:
+        start = f"**{self.start_date}**" if self.start_date else "لم يُحدد"
+        end = f"**{self.end_date}**" if self.end_date else "لم يُحدد"
+        reason = f"**{self.reason}**" if self.reason else "لم يُحدد"
+        return f"البداية: {start} · النهاية: {end} · السبب: {reason}. أكمل الاختيارات ثم اضغط **متابعة** لإضافة التفاصيل."
 
     @discord.ui.button(label="متابعة وإضافة التفاصيل", emoji="➡️", style=discord.ButtonStyle.success, row=3)
     async def continue_request(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self.start_date or not self.end_date or not self.reason_select.values:
+        if not self.start_date or not self.end_date or not self.reason:
             await interaction.response.send_message("اختر تاريخ البداية والنهاية وسبب الإجازة أولًا.", ephemeral=True)
             return
         if self.end_date < self.start_date:
             await interaction.response.send_message("تاريخ النهاية يجب أن يكون في يوم البداية أو بعده.", ephemeral=True)
             return
-        await interaction.response.send_modal(LeaveDetailsModal(self.cog, self.start_date, self.end_date, self.reason_select.values[0]))
+        await interaction.response.send_modal(LeaveDetailsModal(self.cog, self.start_date, self.end_date, self.reason))
 
 
 class ComplaintDetailsModal(discord.ui.Modal, title="تفاصيل الشكوى الإدارية"):

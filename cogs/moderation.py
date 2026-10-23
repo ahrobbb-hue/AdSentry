@@ -27,22 +27,37 @@ def is_admin(user: discord.Member | discord.User) -> bool:
 
 
 def is_staff(user: discord.Member | discord.User) -> bool:
-    """Checks configured staff roles, Manager and higher roles, or mod permissions."""
+    """Detect staff from Discord permission grants, with optional role-ID overrides."""
     if not isinstance(user, discord.Member):
         return False
-    if (
-        user.guild_permissions.administrator
-        or user.guild_permissions.manage_messages
-        or user.guild_permissions.manage_guild
-    ):
+
+    # Use the effective member permissions and individual role permissions so
+    # staff recognition works across guilds with different role names.
+    staff_permission_flags = (
+        "manage_messages",
+        "manage_guild",
+        "manage_channels",
+        "manage_events",
+        "manage_roles",
+        "view_audit_log",
+        "moderate_members",
+    )
+    if any(getattr(user.guild_permissions, flag, False) for flag in staff_permission_flags):
         return True
     user_roles = {r.id for r in user.roles}
     if user_roles.intersection(set(Config.STAFF_ROLE_IDS)):
         return True
 
-    # Support the server's Manager role without requiring its snowflake to be
-    # duplicated in every deployment's environment variables. Roles at or
-    # above that role in the server hierarchy inherit staff access.
+    if any(
+        getattr(role.permissions, flag, False)
+        for role in user.roles
+        for flag in staff_permission_flags
+    ):
+        return True
+
+    # Backward-compatible fallback for custom Manager roles that have no
+    # Discord moderation permissions assigned. Permission-based detection
+    # above handles differently named roles in other guilds.
     manager_names = {"manager", "مدير", "المدير", "مدير السيرفر", "مدير الطاقم"}
 
     def normalized_role_name(name: str) -> str:
