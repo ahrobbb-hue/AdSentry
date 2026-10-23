@@ -52,6 +52,7 @@ class SetupCog(commands.Cog, name="Server Setup"):
             overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)} if private else None
             return await guild.create_category(name, overwrites=overwrites, reason="AdSentry channel setup")
 
+        stage = "إنشاء الفئات والقنوات"
         try:
             public_cat = await category(public_category_name, False)
             staff_cat = await category(staff_category_name, True)
@@ -83,14 +84,17 @@ class SetupCog(commands.Cog, name="Server Setup"):
                     await channel.edit(overwrites=staff_overwrites if private else public_overwrites, reason="AdSentry channel setup")
                 channels[key] = channel
 
+            stage = "حفظ قناة الإعلانات والمراجعة في قاعدة البيانات"
             await self.bot.db.set_guild_config(guild_id=guild.id, announcement_channel_id=channels["announcements"].id, staff_review_channel_id=channels["review"].id)
             client = await self.bot.db.get_client()
+            stage = "حفظ قنوات مراجعة طلبات الانضمام"
             await client.rpc("set_recruitment_review_channels", {
                 "p_guild_id": guild.id,
                 "p_channel_ids": [channels[k].id for k in ("app1", "app2", "app3")],
                 "p_configured_by": interaction.user.id,
             }).execute()
 
+            stage = "إنشاء لوحة العمليات وربطها"
             dashboard = self.bot.get_cog("DashboardCog")
             if dashboard is None:
                 raise RuntimeError("DashboardCog is not loaded")
@@ -117,7 +121,12 @@ class SetupCog(commands.Cog, name="Server Setup"):
             await interaction.followup.send(f"✅ اكتمل إعداد AdSentry. تم تجهيز **6 قنوات** وربطها، وإنشاء/تحديث لوحة العمليات الثابتة.\n\n{summary}{note}", ephemeral=True)
         except Exception as exc:
             logger.exception("AdSentry setup failed for guild %s", guild.id)
-            await interaction.followup.send(f"تعذر إكمال الربط: `{type(exc).__name__}`. القنوات التي أُنشئت ستبقى كما هي؛ أصلح إعداد قاعدة البيانات ثم أعد `/setup` بأمان.", ephemeral=True)
+            detail = str(exc).replace("`", "'")[:700] or "لا توجد تفاصيل إضافية"
+            await interaction.followup.send(
+                f"تعذر الإعداد أثناء: **{stage}**\n`{type(exc).__name__}: {detail}`\n\n"
+                "القنوات التي أُنشئت ستبقى كما هي. أرسل هذا الخطأ للمطور أو راجع سجل Render، ثم أعد `/setup` بعد إصلاح السبب.",
+                ephemeral=True,
+            )
 
     @app_commands.command(
         name="ad-setup",
