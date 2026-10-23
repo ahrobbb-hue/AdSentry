@@ -59,6 +59,67 @@ class SupabaseDatabase:
         logger.info("Supabase client connection closed.")
 
     # -------------------------------------------------------------
+    # Recruitment operations
+    # -------------------------------------------------------------
+
+    async def create_recruitment(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client = await self.get_client()
+        response = await client.table("recruitments").insert(payload).execute()
+        if not response.data:
+            raise RuntimeError("Recruitment could not be created.")
+        return response.data[0]
+
+    async def get_recruitment(self, recruitment_id: int) -> dict[str, Any] | None:
+        client = await self.get_client()
+        response = await client.table("recruitments").select("*").eq("id", recruitment_id).limit(1).execute()
+        return response.data[0] if response.data else None
+
+    async def get_open_recruitments(self, guild_id: int) -> list[dict[str, Any]]:
+        client = await self.get_client()
+        response = await client.table("recruitments").select("*").eq("guild_id", guild_id).eq("status", "OPEN").execute()
+        return response.data or []
+
+    async def get_recruitments_with_status(self, status: str) -> list[dict[str, Any]]:
+        client = await self.get_client()
+        response = await client.table("recruitments").select("*").eq("status", status).execute()
+        return response.data or []
+
+    async def get_pending_recruitment_applications(self) -> list[dict[str, Any]]:
+        client = await self.get_client()
+        response = await client.table("recruitment_applications").select("id").eq("status", "PENDING").execute()
+        return response.data or []
+
+    async def set_recruitment_message(self, recruitment_id: int, message_id: int) -> None:
+        client = await self.get_client()
+        await client.table("recruitments").update({"announcement_message_id": message_id}).eq("id", recruitment_id).execute()
+
+    async def close_recruitment(self, recruitment_id: int, guild_id: int) -> bool:
+        client = await self.get_client()
+        response = await client.table("recruitments").update({"status": "CLOSED", "closed_at": datetime.now(timezone.utc).isoformat()}).eq("id", recruitment_id).eq("guild_id", guild_id).eq("status", "OPEN").execute()
+        return bool(response.data)
+
+    async def create_recruitment_application(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client = await self.get_client()
+        response = await client.table("recruitment_applications").insert(payload).execute()
+        if not response.data:
+            raise RuntimeError("Application could not be saved.")
+        return response.data[0]
+
+    async def get_recruitment_application(self, application_id: int, guild_id: int) -> dict[str, Any] | None:
+        client = await self.get_client()
+        response = await client.table("recruitment_applications").select("*").eq("id", application_id).eq("guild_id", guild_id).limit(1).execute()
+        return response.data[0] if response.data else None
+
+    async def review_recruitment_application(self, application_id: int, reviewer_id: int, status: str, guild_id: int) -> bool:
+        client = await self.get_client()
+        response = await client.table("recruitment_applications").update({
+            "status": status,
+            "reviewed_by": reviewer_id,
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", application_id).eq("guild_id", guild_id).eq("status", "PENDING").execute()
+        return bool(response.data)
+
+    # -------------------------------------------------------------
     # Server Configurations Operations (Dynamic /ad-setup)
     # -------------------------------------------------------------
 
