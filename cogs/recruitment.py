@@ -14,9 +14,131 @@ from cogs.moderation import is_staff
 
 logger = logging.getLogger("AdSentry.Recruitment")
 
+DEFAULT_RECRUITMENT_ROLES = (
+    "Administrator",
+    "Moderator",
+    "Ticket Support",
+    "Management",
+    "Events Team",
+    "Design Team",
+)
+
 
 def _can_manage(interaction: discord.Interaction) -> bool:
     return bool(interaction.guild and is_staff(interaction.user))
+
+
+class RecruitmentDetailsModal(discord.ui.Modal):
+    def __init__(self, title: str | None, public_channel: discord.TextChannel, review_channel: discord.TextChannel, bot: commands.Bot) -> None:
+        super().__init__(title="Create recruitment opening", timeout=600)
+        self.role_title = title
+        self.public_channel = public_channel
+        self.review_channel = review_channel
+        self.bot = bot
+        if title is None:
+            self.custom_title = discord.ui.TextInput(label="Custom role name", placeholder="e.g. Community Manager", max_length=80, required=True)
+            self.add_item(self.custom_title)
+        self.summary = discord.ui.TextInput(label="Role description", style=discord.TextStyle.paragraph, placeholder="What will the selected person do?", max_length=850, required=True)
+        self.requirements = discord.ui.TextInput(label="Requirements", style=discord.TextStyle.paragraph, placeholder="Skills, experience, age requirements, etc.", max_length=850, required=True)
+        self.add_item(self.summary)
+        self.add_item(self.requirements)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _can_manage(interaction) or not interaction.guild:
+            await interaction.response.send_message("Only authorized staff can create recruitment openings.", ephemeral=True)
+            return
+        title = self.role_title or self.custom_title.value.strip()
+        description = f"{self.summary.value.strip()}\n\n**Requirements**\n{self.requirements.value.strip()}"
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await publish_opening(self.bot, interaction, title, description, self.public_channel, self.review_channel)
+            await interaction.followup.send("Recruitment is now open.", ephemeral=True)
+        except Exception:
+            logger.exception("Could not create recruitment through the role picker")
+            await interaction.followup.send("Could not open recruitment. Check channel permissions and the Supabase migration.", ephemeral=True)
+
+
+class RecruitmentRoleSelect(discord.ui.Select):
+    def __init__(self, options: list[discord.SelectOption], public_channel: discord.TextChannel, review_channel: discord.TextChannel) -> None:
+        super().__init__(placeholder="Choose the role you are recruiting for", min_values=1, max_values=1, options=options, row=0)
+        self.public_channel = public_channel
+        self.review_channel = review_channel
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not _can_manage(interaction):
+            await interaction.response.send_message("Only authorized staff can create recruitment openings.", ephemeral=True)
+            return
+        bot: commands.Bot = interaction.client  # type: ignore[assignment]
+        value = self.values[0]
+        await interaction.response.send_modal(RecruitmentDetailsModal(
+            title=None if value == "__other__" else value,
+            public_channel=self.public_channel,
+            review_channel=self.review_channel,
+            bot=bot,
+        ))
+
+
+class RecruitmentRoleSelectView(discord.ui.View):
+    def __init__(self, options: list[discord.SelectOption], public_channel: discord.TextChannel, review_channel: discord.TextChannel) -> None:
+        super().__init__(timeout=180)
+        self.add_item(RecruitmentRoleSelect(options, public_channel, review_channel))
+
+
+async def publish_opening(
+    bot: commands.Bot,
+    interaction: discord.Interaction,
+    title: str,
+    description: str,
+    public_channel: discord.TextChannel,
+    review_channel: discord.TextChannel,
+) -> None:
+    """Create the database record and public announcement with rollback on partial failure."""
+    assert interaction.guild is not None
+    if not title.strip() or len(title) > 80 or not description.strip() or len(description) > 1800:
+        raise ValueError("Title or description exceeds the supported length.")
+    if public_channel.guild.id != interaction.guild.id or review_channel.guild.id != interaction.guild.id:
+        raise ValueError("Both channels must belong to this server.")
+    bot_member = interaction.guild.me
+    if not bot_member:
+        raise RuntimeError("Bot member is unavailable in this server.")
+    public_perms = public_channel.permissions_for(bot_member)
+    if not public_perms.send_messages or not public_perms.embed_links:
+        raise PermissionError("Missing announcement channel permissions.")
+    review_perms = review_channel.permissions_for(bot_member)
+    if not review_perms.view_channel or not review_perms.send_messages or not review_perms.embed_links:
+        raise PermissionError("Missing review channel permissions.")
+    active = await bot.db.get_open_recruitments(interaction.guild.id)
+    if any(row["title"].casefold() == title.casefold() for row in active):
+        raise ValueError("An opening with this role name is already active.")
+    opening: dict[str, Any] | None = None
+    announcement: discord.Message | None = None
+    try:
+        opening = await bot.db.create_recruitment({
+            "guild_id": interaction.guild.id,
+            "title": title.strip(),
+            "description": description.strip(),
+            "created_by": interaction.user.id,
+            "public_channel_id": public_channel.id,
+            "review_channel_id": review_channel.id,
+            "status": "OPEN",
+        })
+        embed = discord.Embed(title=f"Now accepting applications: {title.strip()}", description=description.strip(), color=discord.Color.green())
+        embed.set_footer(text=f"Opening #{opening['id']} · Apply using the button below")
+        announcement = await public_channel.send(embed=embed, view=ApplyView(opening["id"]), allowed_mentions=discord.AllowedMentions.none())
+        await bot.db.set_recruitment_message(opening["id"], announcement.id)
+        bot.add_view(ApplyView(opening["id"]))
+    except Exception:
+        if opening:
+            try:
+                await bot.db.close_recruitment(opening["id"], interaction.guild.id)
+            except Exception:
+                logger.exception("Could not roll back incomplete opening %s", opening["id"])
+        if announcement:
+            try:
+                await announcement.edit(view=None)
+            except discord.HTTPException:
+                logger.warning("Could not disable announcement for incomplete opening")
+        raise
 
 
 class ApplicationModal(discord.ui.Modal):
@@ -155,6 +277,81 @@ class RecruitmentCog(commands.Cog):
                 self.bot.add_view(ApplicationReviewView(application["id"]))
         except Exception:
             logger.exception("Could not restore recruitment controls; check that the recruitment SQL migration was applied")
+
+    @recruitment.command(name="create", description="Create an opening using the role picker")
+    @app_commands.describe(public_channel="Where the opening will be announced", review_channel="Private staff channel for applications")
+    async def create_recruitment(
+        self,
+        interaction: discord.Interaction,
+        public_channel: discord.TextChannel,
+        review_channel: discord.TextChannel,
+    ) -> None:
+        if not _can_manage(interaction) or not interaction.guild:
+            await interaction.response.send_message("Only authorized staff can create recruitment openings.", ephemeral=True)
+            return
+        try:
+            options = [discord.SelectOption(label=role, value=role) for role in DEFAULT_RECRUITMENT_ROLES]
+            configured = await self.bot.db.get_custom_recruitment_roles(interaction.guild.id)
+            existing = {role.casefold() for role in DEFAULT_RECRUITMENT_ROLES}
+            for row in configured:
+                label = row["label"].strip()
+                if label and label.casefold() not in existing and len(options) < 24:
+                    options.append(discord.SelectOption(label=label, value=label))
+                    existing.add(label.casefold())
+            options.append(discord.SelectOption(label="Other", value="__other__", description="Enter a custom role name"))
+            await interaction.response.send_message(
+                "Choose the role for this opening. Selecting **Other** will ask you to enter its name.",
+                view=RecruitmentRoleSelectView(options, public_channel, review_channel),
+                ephemeral=True,
+            )
+        except Exception:
+            logger.exception("Could not load recruitment role options")
+            await interaction.response.send_message("Could not load role options. Check the recruitment database migration.", ephemeral=True)
+
+    @recruitment.command(name="role-add", description="Add a custom role to the recruitment role picker")
+    @app_commands.describe(name="Name shown in the role picker")
+    async def add_recruitment_role(self, interaction: discord.Interaction, name: str) -> None:
+        if not _can_manage(interaction) or not interaction.guild:
+            await interaction.response.send_message("Only authorized staff can manage role options.", ephemeral=True)
+            return
+        name = name.strip()
+        if not 2 <= len(name) <= 80 or name.casefold() == "other":
+            await interaction.response.send_message("Enter a role name of 2–80 characters. 'Other' is reserved.", ephemeral=True)
+            return
+        try:
+            if name.casefold() in {role.casefold() for role in DEFAULT_RECRUITMENT_ROLES}:
+                await interaction.response.send_message("That role is already included by default.", ephemeral=True)
+                return
+            configured = await self.bot.db.get_custom_recruitment_roles(interaction.guild.id)
+            if any(row["label"].casefold() == name.casefold() for row in configured):
+                await interaction.response.send_message("That custom role is already in the picker.", ephemeral=True)
+                return
+            if len(configured) >= 18:
+                await interaction.response.send_message("The picker already has its maximum of 18 custom role options.", ephemeral=True)
+                return
+            await self.bot.db.add_custom_recruitment_role(interaction.guild.id, name, interaction.user.id)
+            await interaction.response.send_message(f"Added **{name}** to `/recruit create`.", ephemeral=True)
+        except Exception:
+            logger.exception("Could not add recruitment role option")
+            await interaction.response.send_message("Could not save that role option. Please check the database migration.", ephemeral=True)
+
+    @recruitment.command(name="role-remove", description="Remove a custom role from the recruitment role picker")
+    @app_commands.describe(name="Exact name of the custom option")
+    async def remove_recruitment_role(self, interaction: discord.Interaction, name: str) -> None:
+        if not _can_manage(interaction) or not interaction.guild:
+            await interaction.response.send_message("Only authorized staff can manage role options.", ephemeral=True)
+            return
+        try:
+            configured = await self.bot.db.get_custom_recruitment_roles(interaction.guild.id)
+            match = next((row for row in configured if row["label"].casefold() == name.strip().casefold()), None)
+            if not match:
+                await interaction.response.send_message("Custom role option not found. Default roles cannot be removed.", ephemeral=True)
+                return
+            await self.bot.db.delete_custom_recruitment_role(interaction.guild.id, match["id"])
+            await interaction.response.send_message(f"Removed **{match['label']}** from the picker.", ephemeral=True)
+        except Exception:
+            logger.exception("Could not remove recruitment role option")
+            await interaction.response.send_message("Could not remove that option. Please check the database migration.", ephemeral=True)
 
     @recruitment.command(name="open", description="Open an application form for a team role")
     @app_commands.describe(title="Role or team", description="What the role involves and eligibility", public_channel="Where to announce the opening", review_channel="Private staff channel for applications")

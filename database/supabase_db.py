@@ -79,6 +79,27 @@ class SupabaseDatabase:
         response = await client.table("recruitments").select("*").eq("guild_id", guild_id).eq("status", "OPEN").execute()
         return response.data or []
 
+    async def get_custom_recruitment_roles(self, guild_id: int) -> list[dict[str, Any]]:
+        client = await self.get_client()
+        response = await client.table("recruitment_role_options").select("id, label").eq("guild_id", guild_id).order("label").execute()
+        return response.data or []
+
+    async def add_custom_recruitment_role(self, guild_id: int, label: str, added_by: int) -> dict[str, Any]:
+        client = await self.get_client()
+        response = await client.table("recruitment_role_options").insert({
+            "guild_id": guild_id,
+            "label": label,
+            "added_by": added_by,
+        }).execute()
+        if not response.data:
+            raise RuntimeError("Role option could not be saved.")
+        return response.data[0]
+
+    async def delete_custom_recruitment_role(self, guild_id: int, role_id: int) -> bool:
+        client = await self.get_client()
+        response = await client.table("recruitment_role_options").delete().eq("guild_id", guild_id).eq("id", role_id).execute()
+        return bool(response.data)
+
     async def get_recruitments_with_status(self, status: str) -> list[dict[str, Any]]:
         client = await self.get_client()
         response = await client.table("recruitments").select("*").eq("status", status).execute()

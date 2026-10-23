@@ -21,6 +21,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_recruitments_one_open_role
 CREATE INDEX IF NOT EXISTS idx_recruitments_guild_status
     ON public.recruitments (guild_id, status);
 
+CREATE TABLE IF NOT EXISTS public.recruitment_role_options (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    label TEXT NOT NULL CHECK (char_length(label) BETWEEN 2 AND 80),
+    added_by BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_recruitment_role_options_unique_label
+    ON public.recruitment_role_options (guild_id, lower(label));
+CREATE INDEX IF NOT EXISTS idx_recruitment_role_options_guild
+    ON public.recruitment_role_options (guild_id, label);
+
 CREATE TABLE IF NOT EXISTS public.recruitment_applications (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     recruitment_id BIGINT NOT NULL REFERENCES public.recruitments(id) ON DELETE CASCADE,
@@ -46,3 +58,4 @@ CREATE INDEX IF NOT EXISTS idx_recruitment_applications_user
 -- the Supabase service-role key; expose no direct anon/authenticated policies.
 ALTER TABLE public.recruitments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.recruitment_applications ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.recruitment_role_options ENABLE ROW LEVEL SECURITY;
