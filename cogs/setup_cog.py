@@ -49,8 +49,8 @@ class SetupCog(commands.Cog, name="Server Setup"):
             found = discord.utils.get(guild.categories, name=name)
             if found:
                 return found
-            overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)} if private else None
-            return await guild.create_category(name, overwrites=overwrites, reason="AdSentry channel setup")
+            options = {"overwrites": {guild.default_role: discord.PermissionOverwrite(view_channel=False)}} if private else {}
+            return await guild.create_category(name, reason="AdSentry channel setup", **options)
 
         stage = "إنشاء الفئات والقنوات"
         try:
