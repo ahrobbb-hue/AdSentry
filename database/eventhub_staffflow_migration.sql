@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS public.event_participants (
     guild_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
     user_name TEXT NOT NULL,
+    target_user_id BIGINT,
     attended BOOLEAN,
     attendance_by BIGINT,
     attendance_at TIMESTAMPTZ,
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS public.staff_cases (
     reviewed_at TIMESTAMPTZ,
     CHECK ((starts_at IS NULL AND ends_at IS NULL) OR (starts_at IS NOT NULL AND ends_at >= starts_at))
 );
+ALTER TABLE public.staff_cases ADD COLUMN IF NOT EXISTS target_user_id BIGINT;
 CREATE INDEX IF NOT EXISTS idx_staff_cases_pending ON public.staff_cases(guild_id, status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS public.staff_shifts (

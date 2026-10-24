@@ -362,6 +362,7 @@ async def submit_staff_case(
     details: str,
     start: str | None = None,
     end: str | None = None,
+    target_user: discord.Member | None = None,
 ) -> None:
     if not interaction.guild:
         await interaction.response.send_message("استخدم النموذج داخل السيرفر.", ephemeral=True)
@@ -385,6 +386,7 @@ async def submit_staff_case(
             "guild_id": interaction.guild.id,
             "user_id": interaction.user.id,
             "user_name": str(interaction.user),
+            "target_user_id": target_user.id if target_user else None,
             "kind": kind,
             "subject": subject,
             "details": details,
@@ -396,6 +398,8 @@ async def submit_staff_case(
         embed = discord.Embed(title=f"طلب {kind} · #{case['id']}", description=details[:4000], color=discord.Color.orange())
         reporter_label = "مقدم الشكوى" if kind == "شكوى" else "مقدم الطلب"
         embed.add_field(name=reporter_label, value=interaction.user.mention, inline=False)
+        if kind == "شكوى" and target_user:
+            embed.add_field(name="المشكو عليه", value=target_user.mention, inline=False)
         embed.add_field(name="الموضوع", value=subject, inline=False)
         if start and end:
             embed.add_field(name="الفترة", value=f"{start} إلى {end}", inline=False)
@@ -403,7 +407,14 @@ async def submit_staff_case(
         message = await channel.send(embed=embed, view=decision_view, allowed_mentions=discord.AllowedMentions.none())
         cog.bot.add_view(decision_view, message_id=message.id)
         await client.table("staff_cases").update({"review_channel_id": channel.id, "review_message_id": message.id}).eq("id", case["id"]).execute()
-        await interaction.followup.send(f"وصل طلبك إلى الإدارة برقم #{case['id']}.", ephemeral=True)
+        submitted_message = f"وصل طلبك إلى الإدارة برقم #{case['id']}."
+        if kind == "شكوى" and target_user:
+            submitted_message += f" الشخص المشكو عليه: {target_user.mention}."
+        await interaction.followup.send(
+            submitted_message,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
     except Exception:
         logger.exception("Could not submit dashboard staff case")
         await interaction.followup.send("تعذر إرسال الطلب. تحقق من إعدادات قاعدة البيانات والقناة.", ephemeral=True)
@@ -576,15 +587,59 @@ class LeaveRequestView(discord.ui.View):
 class ComplaintDetailsModal(discord.ui.Modal, title="تفاصيل الشكوى الإدارية"):
     details = discord.ui.TextInput(label="اشرح الشكوى", style=discord.TextStyle.paragraph, max_length=1500)
 
-    def __init__(self, cog: "DashboardCog", subject: str) -> None:
+    def __init__(self, cog: "DashboardCog", subject: str, target_user: discord.Member) -> None:
         super().__init__()
-        self.cog, self.subject = cog, subject
+        self.cog, self.subject, self.target_user = cog, subject, target_user
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not interaction.guild or not _staff(interaction):
             await interaction.response.send_message("هذا الإجراء لطاقم السيرفر فقط.", ephemeral=True)
             return
-        await submit_staff_case(self.cog, interaction, kind="شكوى", subject=self.subject, details=self.details.value.strip())
+        await submit_staff_case(
+            self.cog,
+            interaction,
+            kind="شكوى",
+            subject=self.subject,
+            details=self.details.value.strip(),
+            target_user=self.target_user,
+        )
+
+
+class ComplaintTargetView(discord.ui.View):
+    def __init__(self, cog: "DashboardCog", subject: str) -> None:
+        super().__init__(timeout=180)
+        self.cog, self.subject = cog, subject
+        self.picker = discord.ui.UserSelect(
+            placeholder="اختر الشخص المشكو عليه",
+            min_values=1,
+            max_values=1,
+        )
+        self.picker.callback = self.choose_target  # type: ignore[method-assign]
+        self.add_item(self.picker)
+
+    async def choose_target(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not _staff(interaction):
+            await interaction.response.send_message("هذا الإجراء لطاقم السيرفر فقط.", ephemeral=True)
+            return
+        selected_users = self.picker.values
+        if not selected_users:
+            await interaction.response.send_message("تعذر العثور على العضو المختار في هذا السيرفر.", ephemeral=True)
+            return
+        selected = selected_users[0]
+        if isinstance(selected, discord.Member):
+            target = selected
+        else:
+            try:
+                target = interaction.guild.get_member(selected.id)
+                if target is None:
+                    target = await interaction.guild.fetch_member(selected.id)
+            except discord.NotFound:
+                await interaction.response.send_message("تعذر العثور على العضو المختار في هذا السيرفر.", ephemeral=True)
+                return
+        if target.id == interaction.user.id:
+            await interaction.response.send_message("اختر عضوًا آخر؛ لا يمكنك تقديم شكوى على نفسك.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ComplaintDetailsModal(self.cog, self.subject, target))
 
 
 class ComplaintCategoryView(discord.ui.View):
@@ -608,7 +663,11 @@ class ComplaintCategoryView(discord.ui.View):
         if not _staff(interaction):
             await interaction.response.send_message("هذا الإجراء لطاقم السيرفر فقط.", ephemeral=True)
             return
-        await interaction.response.send_modal(ComplaintDetailsModal(self.cog, interaction.data["values"][0]))
+        subject = interaction.data["values"][0]
+        await interaction.response.edit_message(
+            content="اختر الشخص الذي تريد تقديم الشكوى عليه:",
+            view=ComplaintTargetView(self.cog, subject),
+        )
 
 
 class ShiftCreateModal(discord.ui.Modal, title="جدولة مناوبة"):

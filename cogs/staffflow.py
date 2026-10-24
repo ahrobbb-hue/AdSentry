@@ -31,7 +31,16 @@ class StaffFlow(commands.GroupCog, group_name="staffflow"):
         channel = self.bot.get_channel(int(channel_id)) if channel_id else None
         return channel if isinstance(channel, discord.TextChannel) else None
 
-    async def _submit_case(self, interaction: discord.Interaction, kind: str, subject: str, details: str, start: str | None = None, end: str | None = None) -> None:
+    async def _submit_case(
+        self,
+        interaction: discord.Interaction,
+        kind: str,
+        subject: str,
+        details: str,
+        start: str | None = None,
+        end: str | None = None,
+        target_user: discord.Member | None = None,
+    ) -> None:
         if not interaction.guild:
             await interaction.response.send_message("استخدم الأمر داخل السيرفر.", ephemeral=True); return
         channel = (await self._private_channel(interaction.guild.id) if kind == "إجازة"
@@ -41,11 +50,13 @@ class StaffFlow(commands.GroupCog, group_name="staffflow"):
             await interaction.response.send_message(f"لم يتم إعداد قناة {kind}. استخدم {command} أولًا.", ephemeral=True); return
         await interaction.response.defer(ephemeral=True)
         client = await self.bot.db.get_client()
-        result = await client.table("staff_cases").insert({"guild_id": interaction.guild.id, "user_id": interaction.user.id, "user_name": str(interaction.user), "kind": kind, "subject": subject[:120], "details": details[:1800], "starts_at": start, "ends_at": end, "status": "PENDING"}).execute()
+        result = await client.table("staff_cases").insert({"guild_id": interaction.guild.id, "user_id": interaction.user.id, "user_name": str(interaction.user), "target_user_id": target_user.id if target_user else None, "kind": kind, "subject": subject[:120], "details": details[:1800], "starts_at": start, "ends_at": end, "status": "PENDING"}).execute()
         case = result.data[0]
         embed = discord.Embed(title=f"طلب {kind} · #{case['id']}", description=details[:4000], color=discord.Color.orange())
         reporter_label = "مقدم الشكوى" if kind == "شكوى" else "مقدم الطلب"
         embed.add_field(name=reporter_label, value=interaction.user.mention, inline=False)
+        if kind == "شكوى" and target_user:
+            embed.add_field(name="المشكو عليه", value=target_user.mention, inline=False)
         embed.add_field(name="الموضوع", value=subject[:1024], inline=False)
         if start: embed.add_field(name="من", value=start)
         if end: embed.add_field(name="إلى", value=end)
@@ -70,8 +81,12 @@ class StaffFlow(commands.GroupCog, group_name="staffflow"):
         await self._submit_case(interaction, "إجازة", "طلب إجازة", reason, start.isoformat(), end.isoformat())
 
     @app_commands.command(name="complaint", description="إرسال شكوى إدارية سرية")
-    async def complaint(self, interaction: discord.Interaction, subject: str, details: str) -> None:
-        await self._submit_case(interaction, "شكوى", subject, details)
+    @app_commands.describe(target_user="الشخص المشكو عليه", subject="تصنيف أو عنوان الشكوى", details="تفاصيل الشكوى")
+    async def complaint(self, interaction: discord.Interaction, target_user: discord.Member, subject: str, details: str) -> None:
+        if interaction.guild and target_user.id == interaction.user.id:
+            await interaction.response.send_message("لا يمكنك تقديم شكوى على نفسك؛ اختر الشخص المشكو عليه.", ephemeral=True)
+            return
+        await self._submit_case(interaction, "شكوى", subject, details, target_user=target_user)
 
     @app_commands.command(name="complaint-channel", description="تحديد قناة خاصة لاستقبال الشكاوى فقط")
     @app_commands.describe(channel="القناة النصية المخصصة للشكاوى فقط")

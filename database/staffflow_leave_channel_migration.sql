@@ -5,5 +5,8 @@ ALTER TABLE public.server_configs
 ALTER TABLE public.server_configs
     ADD COLUMN IF NOT EXISTS staffflow_complaint_channel_id BIGINT;
 
+ALTER TABLE public.staff_cases
+    ADD COLUMN IF NOT EXISTS target_user_id BIGINT;
+
 -- Refresh PostgREST's schema cache so the bot can see the new columns immediately.
 NOTIFY pgrst, 'reload schema';
