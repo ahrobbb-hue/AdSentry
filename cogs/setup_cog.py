@@ -93,7 +93,7 @@ class SetupCog(commands.Cog, name="Server Setup"):
                 "key": "complaints",
                 "name": "╠〖🚫┇〢staff-complaints",
                 "slug": "staff-complaints",
-                "aliases": ["staff-complaints", "شكاوى-الطاقم", "شكاوى", "complaints"],
+                "aliases": ["staff-complaints", "شكاوى-الطاقم", "شكاوى-إدارية"],
                 "access": "complaints",
                 "label": "شكاوى الطاقم الإدارية",
                 "private": True,
@@ -102,7 +102,7 @@ class SetupCog(commands.Cog, name="Server Setup"):
                 "key": "review",
                 "name": "╚〖📢┇〢ads-and-staff",
                 "slug": "ads-and-staff",
-                "aliases": ["ads-and-staff", "مراجعة-الإعلانات-والطاقم", "مراجعة-الإعلانات", "review"],
+                "aliases": ["ads-and-staff", "مراجعة-الإعلانات-والطاقم", "مراجعة-الإعلانات", "ads-staff"],
                 "access": "staff_review",
                 "label": "مراجعة الإعلانات والطاقم",
                 "private": True,
@@ -114,7 +114,7 @@ class SetupCog(commands.Cog, name="Server Setup"):
                 "key": "announcements",
                 "name": "╚〖📢┇〢announcements",
                 "slug": "announcements",
-                "aliases": ["announcements", "إعلانات-البوت", "إعلانات"],
+                "aliases": ["announcements", "إعلانات-البوت", "إعلانات-adsentry"],
                 "access": "public",
                 "label": "إعلانات البوت العامة",
                 "private": False,
@@ -150,46 +150,41 @@ class SetupCog(commands.Cog, name="Server Setup"):
             spec: dict,
             parent_category: discord.CategoryChannel | None,
         ) -> discord.TextChannel | None:
-            # 1. Search inside parent_category FIRST (ensures staff channels stay in staff category)
-            if parent_category:
-                # Exact stylized name
-                for ch in parent_category.text_channels:
-                    if ch.id not in claimed_ids and ch.name == spec["name"]:
-                        return ch
-                # Exact slug in channel name
-                for ch in parent_category.text_channels:
-                    if ch.id not in claimed_ids and spec["slug"] in ch.name.lower():
-                        return ch
-                # Specific aliases match
-                for ch in parent_category.text_channels:
-                    if ch.id not in claimed_ids:
-                        for alias in spec.get("aliases", []):
-                            if alias.lower() in ch.name.lower():
-                                return ch
+            if not parent_category:
+                return None
 
-            # 2. Look up by saved ID from database
+            def matches_spec(ch: discord.TextChannel) -> bool:
+                if ch.name == spec["name"]:
+                    return True
+                ch_lower = ch.name.lower()
+                if spec["slug"] in ch_lower:
+                    return True
+                for alias in spec.get("aliases", []):
+                    if alias.lower() in ch_lower:
+                        return True
+                return False
+
+            # 1. Search inside parent_category FIRST (ensures channels stay strictly in AdSentry categories)
+            for ch in parent_category.text_channels:
+                if ch.id not in claimed_ids and matches_spec(ch):
+                    return ch
+
+            # 2. Check saved_id ONLY IF the channel is ALREADY in parent_category
+            # AND does not look like an unrelated channel (e.g. ticket, appeal)
             if saved_id and saved_id not in claimed_ids:
                 ch = guild.get_channel(int(saved_id))
-                if isinstance(ch, discord.TextChannel):
-                    # Safety check: for staff private channels, only reuse saved_id
-                    # if it's already in parent_category OR its name/slug matches this specific spec!
-                    # This prevents reusing announcement_channel or foreign channels as staff review!
-                    is_private_spec = spec.get("private", True)
-                    is_in_category = (ch.category_id == parent_category.id) if parent_category else True
-                    name_matches = (
-                        ch.name == spec["name"]
-                        or spec["slug"] in ch.name.lower()
-                        or any(alias.lower() in ch.name.lower() for alias in spec.get("aliases", []))
-                    )
-                    if is_in_category or name_matches or not is_private_spec:
-                        return ch
+                if isinstance(ch, discord.TextChannel) and ch.category_id == parent_category.id:
+                    foreign_keywords = ["appeal", "ticket", "log", "welcome", "general", "rules"]
+                    if not any(kw in ch.name.lower() for kw in foreign_keywords):
+                        all_other_slugs = [
+                            s["slug"]
+                            for s in (PUBLIC_CHANNEL_SPECS + STAFF_CHANNEL_SPECS)
+                            if s["key"] != spec["key"]
+                        ]
+                        if not any(s in ch.name.lower() for s in all_other_slugs):
+                            return ch
 
-            # 3. Look up across entire guild ONLY if exact slug or name matches
-            for ch in guild.text_channels:
-                if ch.id not in claimed_ids:
-                    if ch.name == spec["name"] or spec["slug"] in ch.name.lower():
-                        return ch
-
+            # NEVER hijack or move channels from other categories across the guild!
             return None
 
         stage = "قراءة الإعدادات الحالية من قاعدة البيانات"
@@ -306,12 +301,6 @@ class SetupCog(commands.Cog, name="Server Setup"):
                     reused_flags[key] = False
                 else:
                     reused_flags[key] = True
-                    # Reassert category if channel was placed elsewhere
-                    if parent and channel.category_id != parent.id:
-                        try:
-                            await channel.edit(category=parent, reason="AdSentry category alignment")
-                        except Exception:
-                            pass
                     # Reassert permissions
                     await channel.edit(overwrites=overwrites, reason="AdSentry channel setup")
                     # If channel still has an old legacy default Arabic name, upgrade to the new stylized name
