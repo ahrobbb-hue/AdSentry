@@ -219,16 +219,22 @@ class SupabaseDatabase:
         announcement_channel_id: int,
         staff_review_channel_id: int,
         last_panel_message_id: int | None = None,
+        staffflow_review_channel_id: int | None = None,
+        staffflow_complaint_channel_id: int | None = None,
     ) -> dict[str, Any]:
         """Saves or updates dynamic server channel settings in Supabase and updates local cache."""
         client = await self.get_client()
         existing = self._guild_configs_cache.get(guild_id) or {}
         panel_id = last_panel_message_id if last_panel_message_id is not None else existing.get("last_panel_message_id")
+        vac_id = staffflow_review_channel_id if staffflow_review_channel_id is not None else existing.get("staffflow_review_channel_id")
+        comp_id = staffflow_complaint_channel_id if staffflow_complaint_channel_id is not None else existing.get("staffflow_complaint_channel_id")
         payload = {
             "guild_id": guild_id,
             "announcement_channel_id": announcement_channel_id,
             "staff_review_channel_id": staff_review_channel_id,
             "last_panel_message_id": panel_id,
+            "staffflow_review_channel_id": vac_id,
+            "staffflow_complaint_channel_id": comp_id,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 

@@ -40,93 +40,278 @@ class SetupCog(commands.Cog, name="Server Setup"):
             await interaction.followup.send("يحتاج البوت إلى صلاحية **Manage Channels** لإنشاء القنوات.", ephemeral=True)
             return
 
-        public_category_name = "AdSentry · عام"
-        staff_category_name = "AdSentry · الإدارة"
-        definitions = {
-            "announcements": ("إعلانات-البوت", False),
-            "review": ("مراجعة-الإعلانات-والطاقم", True),
-            "app1": ("طلبات-الانضمام-1", True),
-            "app2": ("طلبات-الانضمام-2", True),
-            "app3": ("طلبات-الانضمام-3", True),
-            "panel": ("مركز-العمليات", True),
-        }
+        STAFF_CATEGORY_NAME = "↳AdSentry - الإداره↲"
+        PUBLIC_CATEGORY_NAME = "↳AdSentry - عام↲"
 
-        async def category(name: str, private: bool) -> discord.CategoryChannel:
-            found = discord.utils.get(guild.categories, name=name)
+        STAFF_CHANNEL_SPECS = [
+            {
+                "key": "panel",
+                "name": "╔〖⚙️┇〢operations-center",
+                "slug": "operations-center",
+                "aliases": ["operations-center", "مركز-العمليات", "لوحة-العمليات", "panel"],
+                "access": "panel",
+                "label": "مركز العمليات",
+                "private": True,
+            },
+            {
+                "key": "app1",
+                "name": "╠〖📥┇〢join-requests-1",
+                "slug": "join-requests-1",
+                "aliases": ["join-requests-1", "طلبات-الانضمام-1", "app1"],
+                "access": "admin",
+                "label": "طلبات الانضمام 1",
+                "private": True,
+            },
+            {
+                "key": "app2",
+                "name": "╠〖📥┇〢join-requests-2",
+                "slug": "join-requests-2",
+                "aliases": ["join-requests-2", "طلبات-الانضمام-2", "app2"],
+                "access": "admin",
+                "label": "طلبات الانضمام 2",
+                "private": True,
+            },
+            {
+                "key": "app3",
+                "name": "╠〖📥┇〢join-requests-3",
+                "slug": "join-requests-3",
+                "aliases": ["join-requests-3", "طلبات-الانضمام-3", "app3"],
+                "access": "admin",
+                "label": "طلبات الانضمام 3",
+                "private": True,
+            },
+            {
+                "key": "vacation",
+                "name": "╠〖🏖️┇〢vacation-requests",
+                "slug": "vacation-requests",
+                "aliases": ["vacation-requests", "طلبات-الإجازات", "طلبات-الاجازات", "إجازات", "vacation"],
+                "access": "staff",
+                "label": "طلبات الإجازات",
+                "private": True,
+            },
+            {
+                "key": "complaints",
+                "name": "╠〖🚫┇〢staff-complaints",
+                "slug": "staff-complaints",
+                "aliases": ["staff-complaints", "شكاوى-الطاقم", "شكاوى", "complaints"],
+                "access": "complaints",
+                "label": "شكاوى الطاقم الإدارية",
+                "private": True,
+            },
+            {
+                "key": "review",
+                "name": "╚〖📢┇〢ads-and-staff",
+                "slug": "ads-and-staff",
+                "aliases": ["ads-and-staff", "مراجعة-الإعلانات-والطاقم", "مراجعة-الإعلانات", "review"],
+                "access": "staff_review",
+                "label": "مراجعة الإعلانات والطاقم",
+                "private": True,
+            },
+        ]
+
+        PUBLIC_CHANNEL_SPECS = [
+            {
+                "key": "announcements",
+                "name": "╚〖📢┇〢announcements",
+                "slug": "announcements",
+                "aliases": ["announcements", "إعلانات-البوت", "إعلانات", "ads"],
+                "access": "public",
+                "label": "إعلانات البوت العامة",
+                "private": False,
+            }
+        ]
+
+        def find_category(target_name: str, keywords: list[str]) -> discord.CategoryChannel | None:
+            cat = discord.utils.get(guild.categories, name=target_name)
+            if cat:
+                return cat
+            for c in guild.categories:
+                c_lower = c.name.lower()
+                if all(kw.lower() in c_lower for kw in keywords):
+                    return c
+            return None
+
+        async def get_or_create_category(target_name: str, private: bool, keywords: list[str]) -> discord.CategoryChannel:
+            found = find_category(target_name, keywords)
             if found:
+                if found.name != target_name and any(kw in found.name.lower() for kw in keywords):
+                    try:
+                        await found.edit(name=target_name, reason="AdSentry category name styling")
+                    except Exception:
+                        pass
                 return found
             options = {"overwrites": {guild.default_role: discord.PermissionOverwrite(view_channel=False)}} if private else {}
-            return await guild.create_category(name, reason="AdSentry channel setup", **options)
+            return await guild.create_category(target_name, reason="AdSentry channel setup", **options)
 
-        stage = "إنشاء الفئات والقنوات"
+        def find_existing_channel(
+            saved_id: int | None,
+            spec: dict,
+            parent_category: discord.CategoryChannel | None,
+        ) -> discord.TextChannel | None:
+            # 1. Look up by ID from database (preserves manual renames 100%)
+            if saved_id:
+                ch = guild.get_channel(int(saved_id))
+                if isinstance(ch, discord.TextChannel):
+                    return ch
+
+            # 2. Look up inside category by exact name, slug or alias
+            if parent_category:
+                for ch in parent_category.text_channels:
+                    if ch.name == spec["name"] or spec["slug"] in ch.name.lower():
+                        return ch
+                    for alias in spec.get("aliases", []):
+                        if alias.lower() in ch.name.lower():
+                            return ch
+
+            # 3. Look up across entire guild by exact name, slug or alias
+            for ch in guild.text_channels:
+                if ch.name == spec["name"] or spec["slug"] in ch.name.lower():
+                    return ch
+                for alias in spec.get("aliases", []):
+                    if alias.lower() in ch.name.lower():
+                        return ch
+
+            return None
+
+        stage = "قراءة الإعدادات الحالية من قاعدة البيانات"
         try:
-            # Preserve the server's existing announcement destination by default.
-            previous_config = await self.bot.db.get_guild_config(guild.id)
-            selected_announcement = announcement_channel
-            if selected_announcement is None and previous_config:
-                previous_channel_id = previous_config.get("announcement_channel_id")
-                if previous_channel_id:
-                    previous_channel = guild.get_channel(int(previous_channel_id))
-                    if previous_channel is None:
-                        try:
-                            previous_channel = await guild.fetch_channel(int(previous_channel_id))
-                        except (discord.NotFound, discord.Forbidden):
-                            previous_channel = None
-                    if isinstance(previous_channel, discord.TextChannel):
-                        selected_announcement = previous_channel
-            announcement_reused = selected_announcement is not None
+            previous_config = await self.bot.db.get_guild_config(guild.id) or {}
+            client = await self.bot.db.get_client()
 
-            public_cat = await category(public_category_name, False)
-            staff_cat = await category(staff_category_name, True)
+            # Retrieve recruitment review channels map
+            saved_recruitment = (
+                await client.table("recruitment_review_channels")
+                .select("slot,channel_id")
+                .eq("guild_id", guild.id)
+                .execute()
+            ).data or []
+            rec_map = {int(r["slot"]): int(r["channel_id"]) for r in saved_recruitment}
+
+            # Retrieve operations dashboard panel channel
+            saved_panel = (
+                await client.table("staff_dashboard_panels")
+                .select("channel_id,message_id")
+                .eq("guild_id", guild.id)
+                .limit(1)
+                .execute()
+            ).data or []
+            saved_panel_id = int(saved_panel[0]["channel_id"]) if saved_panel and saved_panel[0].get("channel_id") else None
+
+            # Map known IDs for deduplication
+            known_ids: dict[str, int | None] = {
+                "announcements": int(previous_config["announcement_channel_id"]) if previous_config.get("announcement_channel_id") else None,
+                "review": int(previous_config["staff_review_channel_id"]) if previous_config.get("staff_review_channel_id") else None,
+                "vacation": int(previous_config["staffflow_review_channel_id"]) if previous_config.get("staffflow_review_channel_id") else None,
+                "complaints": int(previous_config["staffflow_complaint_channel_id"]) if previous_config.get("staffflow_complaint_channel_id") else None,
+                "app1": rec_map.get(1),
+                "app2": rec_map.get(2),
+                "app3": rec_map.get(3),
+                "panel": saved_panel_id,
+            }
+
+            stage = "إنشاء وتنسيق الفئات"
+            public_cat = await get_or_create_category(PUBLIC_CATEGORY_NAME, False, ["adsentry", "عام"])
+            staff_cat = await get_or_create_category(STAFF_CATEGORY_NAME, True, ["adsentry", "إدار"])
+
+            # Permission setups
             admin_overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                bot_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True, manage_messages=True),
+                bot_member: discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, embed_links=True, read_message_history=True, manage_messages=True
+                ),
             }
             panel_overwrites = dict(admin_overwrites)
             staff_review_overwrites = dict(admin_overwrites)
+            staff_vacation_overwrites = dict(admin_overwrites)
             for role_id in Config.STAFF_ROLE_IDS:
                 role = guild.get_role(role_id)
                 if role:
-                    staff_permissions = discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True)
-                    panel_overwrites[role] = staff_permissions
-                    staff_review_overwrites[role] = staff_permissions
+                    staff_perms = discord.PermissionOverwrite(
+                        view_channel=True, send_messages=True, embed_links=True, read_message_history=True
+                    )
+                    panel_overwrites[role] = staff_perms
+                    staff_review_overwrites[role] = staff_perms
+                    staff_vacation_overwrites[role] = staff_perms
+
+            complaints_overwrites = dict(admin_overwrites)  # Confidential for admins + bot only
             public_overwrites = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
-                bot_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, manage_webhooks=True, create_public_threads=True),
+                bot_member: discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, embed_links=True, manage_webhooks=True, create_public_threads=True
+                ),
             }
 
             channels: dict[str, discord.TextChannel] = {}
-            for key, (name, private) in definitions.items():
-                if key == "announcements" and selected_announcement is not None:
-                    # Reuse the existing channel as-is: do not move it, edit its permissions,
-                    # or touch its messages and chat history.
-                    channels[key] = selected_announcement
+            reused_flags: dict[str, bool] = {}
+            all_specs = PUBLIC_CHANNEL_SPECS + STAFF_CHANNEL_SPECS
+
+            stage = "فحص وإنشاء وتنسيق القنوات"
+            for spec in all_specs:
+                key = spec["key"]
+                is_private = spec.get("private", True)
+                parent = staff_cat if is_private else public_cat
+
+                # Handle custom announcement channel if explicitly provided by user
+                if key == "announcements" and announcement_channel is not None:
+                    channels[key] = announcement_channel
+                    reused_flags[key] = True
                     continue
-                parent = staff_cat if private else public_cat
-                private_overwrites = (
-                    panel_overwrites if key == "panel"
-                    else staff_review_overwrites if key == "review"
-                    else admin_overwrites
+
+                known_id = known_ids.get(key)
+                channel = find_existing_channel(known_id, spec, parent)
+
+                overwrites = (
+                    panel_overwrites if spec["access"] == "panel"
+                    else staff_review_overwrites if spec["access"] == "staff_review"
+                    else staff_vacation_overwrites if spec["access"] == "staff"
+                    else complaints_overwrites if spec["access"] == "complaints"
+                    else admin_overwrites if is_private
+                    else public_overwrites
                 )
-                channel = discord.utils.get(parent.text_channels, name=name)
+
                 if channel is None:
                     channel = await guild.create_text_channel(
-                        name, category=parent,
-                        overwrites=private_overwrites if private else public_overwrites,
+                        spec["name"],
+                        category=parent,
+                        overwrites=overwrites,
                         reason="AdSentry channel setup",
                     )
+                    reused_flags[key] = False
                 else:
-                    # Reassert bot-managed access controls on channels inside our named categories.
-                    await channel.edit(overwrites=private_overwrites if private else public_overwrites, reason="AdSentry channel setup")
+                    reused_flags[key] = True
+                    # Reassert category if channel was placed elsewhere
+                    if channel.category_id != parent.id:
+                        try:
+                            await channel.edit(category=parent, reason="AdSentry category alignment")
+                        except Exception:
+                            pass
+                    # Reassert permissions
+                    await channel.edit(overwrites=overwrites, reason="AdSentry channel setup")
+                    # If channel still has an old legacy default Arabic name, upgrade to the new stylized name
+                    legacy_names = set(spec.get("aliases", [])) | {spec["slug"]}
+                    if channel.name in legacy_names:
+                        try:
+                            await channel.edit(name=spec["name"], reason="AdSentry channel style upgrade")
+                        except Exception:
+                            pass
+
                 channels[key] = channel
 
             stage = "حفظ قناة الإعلانات والمراجعة في قاعدة البيانات"
-            await self.bot.db.set_guild_config(guild_id=guild.id, announcement_channel_id=channels["announcements"].id, staff_review_channel_id=channels["review"].id)
-            client = await self.bot.db.get_client()
+            await self.bot.db.set_guild_config(
+                guild_id=guild.id,
+                announcement_channel_id=channels["announcements"].id,
+                staff_review_channel_id=channels["review"].id,
+            )
+
+            stage = "حفظ قنوات الإجازات والشكاوى الإدارية"
+            await self.bot.db.set_staffflow_review_channel(guild.id, channels["vacation"].id)
+            await self.bot.db.set_staffflow_complaint_channel(guild.id, channels["complaints"].id)
+
             stage = "حفظ قنوات مراجعة طلبات الانضمام"
             await client.rpc("set_recruitment_review_channels", {
                 "p_guild_id": guild.id,
-                "p_channel_ids": [channels[k].id for k in ("app1", "app2", "app3")],
+                "p_channel_ids": [channels["app1"].id, channels["app2"].id, channels["app3"].id],
                 "p_configured_by": interaction.user.id,
             }).execute()
 
@@ -134,28 +319,70 @@ class SetupCog(commands.Cog, name="Server Setup"):
             dashboard = self.bot.get_cog("DashboardCog")
             if dashboard is None:
                 raise RuntimeError("DashboardCog is not loaded")
-            # Reuse the existing persistent panel if it already lives in the configured channel.
-            saved = (await client.table("staff_dashboard_panels").select("channel_id,message_id").eq("guild_id", guild.id).limit(1).execute()).data or []
+
+            saved_panel_record = (
+                await client.table("staff_dashboard_panels")
+                .select("channel_id,message_id")
+                .eq("guild_id", guild.id)
+                .limit(1)
+                .execute()
+            ).data or []
             from cogs.dashboard import PersistentDashboardView
-            if saved and saved[0].get("message_id") and int(saved[0]["channel_id"]) == channels["panel"].id:
+
+            panel_ch = channels["panel"]
+            if (
+                saved_panel_record
+                and saved_panel_record[0].get("message_id")
+                and int(saved_panel_record[0]["channel_id"]) == panel_ch.id
+            ):
                 try:
-                    message = await channels["panel"].fetch_message(int(saved[0]["message_id"]))
-                    await message.edit(embed=await dashboard.dashboard_embed(guild), view=PersistentDashboardView(dashboard))
+                    message = await panel_ch.fetch_message(int(saved_panel_record[0]["message_id"]))
+                    await message.edit(
+                        embed=await dashboard.dashboard_embed(guild),
+                        view=PersistentDashboardView(dashboard),
+                    )
                 except discord.NotFound:
-                    saved = []
-            if not saved or int(saved[0]["channel_id"]) != channels["panel"].id or not saved[0].get("message_id"):
-                panel_message = await channels["panel"].send(embed=await dashboard.dashboard_embed(guild), view=PersistentDashboardView(dashboard), allowed_mentions=discord.AllowedMentions.none())
-                await client.table("staff_dashboard_panels").upsert({"guild_id": guild.id, "channel_id": channels["panel"].id, "message_id": panel_message.id, "updated_by": interaction.user.id}).execute()
+                    saved_panel_record = []
+
+            if not saved_panel_record or int(saved_panel_record[0]["channel_id"]) != panel_ch.id or not saved_panel_record[0].get("message_id"):
+                panel_message = await panel_ch.send(
+                    embed=await dashboard.dashboard_embed(guild),
+                    view=PersistentDashboardView(dashboard),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                await client.table("staff_dashboard_panels").upsert({
+                    "guild_id": guild.id,
+                    "channel_id": panel_ch.id,
+                    "message_id": panel_message.id,
+                    "updated_by": interaction.user.id,
+                }).execute()
                 try:
                     await panel_message.pin(reason="AdSentry permanent operations center")
                 except discord.HTTPException:
                     pass
 
-            summary = "\n".join(f"• {channels[k].mention} — {definitions[k][0]}" for k in definitions)
+            summary_parts = []
+            summary_parts.append(f"📁 **فئة الإدارة:** `{staff_cat.name}`")
+            for spec in STAFF_CHANNEL_SPECS:
+                ch = channels[spec["key"]]
+                tag = "♻️ تم التعرف عليها" if reused_flags.get(spec["key"]) else "✨ جديدة"
+                summary_parts.append(f"• {ch.mention} — `{spec['label']}` ({tag})")
+
+            summary_parts.append(f"\n📁 **فئة عام:** `{public_cat.name}`")
+            ann_tag = "♻️ تم التعرف عليها" if reused_flags.get("announcements") else "✨ جديدة"
+            summary_parts.append(f"• {channels['announcements'].mention} — `إعلانات البوت العامة` ({ann_tag})")
+
+            summary = "\n".join(summary_parts)
             missing_roles = not any(guild.get_role(role_id) for role_id in Config.STAFF_ROLE_IDS)
             note = "\n\n⚠️ لم يتم العثور على رتب الطاقم في `STAFF_ROLE_IDS`؛ القنوات الخاصة ستكون للمدراء والبوت فقط." if missing_roles else ""
-            reuse_note = "تم الإبقاء على القناة وسجلها كما هما." if announcement_reused else "أُنشئت قناة إعلانات جديدة."
-            await interaction.followup.send(f"✅ اكتمل إعداد AdSentry. قناة الإعلانات العامة: {channels['announcements'].mention} — {reuse_note}\n\n{summary}{note}", ephemeral=True)
+
+            await interaction.followup.send(
+                f"✅ **اكتمل إعداد وتنسيق قنوات AdSentry بنجاح!**\n\n"
+                f"{summary}{note}\n\n"
+                f"🔒 **تعديل الأسماء:** جميع وظائف البوت مرتبطة تلقائياً بـ `Channel ID` في قاعدة البيانات، "
+                f"لذلك يمكنك تعديل أسماء القنوات أو ترتيبها في Discord في أي وقت دون أن تتأثر أي ميزة!",
+                ephemeral=True,
+            )
         except Exception as exc:
             logger.exception("AdSentry setup failed for guild %s", guild.id)
             detail = str(exc).replace("`", "'")[:700] or "لا توجد تفاصيل إضافية"
@@ -298,32 +525,48 @@ class SetupCog(commands.Cog, name="Server Setup"):
 
         ann_id = config.get("announcement_channel_id")
         rev_id = config.get("staff_review_channel_id")
+        vac_id = config.get("staffflow_review_channel_id")
+        comp_id = config.get("staffflow_complaint_channel_id")
 
-        ann_channel = interaction.guild.get_channel(ann_id)
-        rev_channel = interaction.guild.get_channel(rev_id)
+        ann_channel = interaction.guild.get_channel(ann_id) if ann_id else None
+        rev_channel = interaction.guild.get_channel(rev_id) if rev_id else None
+        vac_channel = interaction.guild.get_channel(vac_id) if vac_id else None
+        comp_channel = interaction.guild.get_channel(comp_id) if comp_id else None
 
         embed = discord.Embed(
             title="⚙️ Current AdSentry Configuration",
-            description=f"Active advertising settings for **{interaction.guild.name}**:",
+            description=f"Active channel settings for **{interaction.guild.name}**:",
             color=discord.Color.blurple(),
         )
         embed.add_field(
             name="📢 Announcement Channel",
-            value=f"{ann_channel.mention if ann_channel else '⚠️ Channel Not Found'} (`{ann_id}`)",
+            value=f"{ann_channel.mention if ann_channel else '⚠️ Not Set'} (`{ann_id}`)",
             inline=True,
         )
         embed.add_field(
             name="🛡️ Staff Review Channel",
-            value=f"{rev_channel.mention if rev_channel else '⚠️ Channel Not Found'} (`{rev_id}`)",
+            value=f"{rev_channel.mention if rev_channel else '⚠️ Not Set'} (`{rev_id}`)",
             inline=True,
         )
+        if vac_id:
+            embed.add_field(
+                name="🏖️ Vacation Channel",
+                value=f"{vac_channel.mention if vac_channel else '⚠️ Not Set'} (`{vac_id}`)",
+                inline=True,
+            )
+        if comp_id:
+            embed.add_field(
+                name="🚫 Complaints Channel",
+                value=f"{comp_channel.mention if comp_channel else '⚠️ Not Set'} (`{comp_id}`)",
+                inline=True,
+            )
         panel_id = config.get("last_panel_message_id")
         embed.add_field(
             name="📋 Active Submission Panel",
             value=f"`Message ID: {panel_id}` (Auto-relocates on approval)" if panel_id else "Not deployed yet (Use `/ad-panel` to deploy)",
             inline=False,
         )
-        embed.set_footer(text="To change channels, run /ad-setup • To deploy panel, run /ad-panel")
+        embed.set_footer(text="To configure or refresh channels, run /setup or /ad-setup")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
