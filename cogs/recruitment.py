@@ -167,10 +167,17 @@ class RecruitmentDetailsModal(discord.ui.Modal):
         try:
             await publish_opening(self.bot, interaction, title, description, self.public_channel, target_review,
                                   seat_limit=seat_limit, duration_hours=duration_hours, questions=questions, grant_role=self.grant_role)
-            await interaction.followup.send("Recruitment is now open.", ephemeral=True)
-        except Exception:
+            await interaction.followup.send("✅ تم فتح التقديم بنجاح!", ephemeral=True)
+        except ValueError as e:
+            await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        except PermissionError as e:
+            await interaction.followup.send(f"⛔ مشكلة صلاحيات: {e}", ephemeral=True)
+        except Exception as e:
             logger.exception("Could not create recruitment through the role picker")
-            await interaction.followup.send("Could not open recruitment. Check channel permissions and the Supabase migration.", ephemeral=True)
+            await interaction.followup.send(
+                f"❌ تعذّر فتح التقديم.\nالخطأ: `{type(e).__name__}: {e}`",
+                ephemeral=True,
+            )
 
 
 class RecruitmentRoleSelect(discord.ui.Select):
@@ -286,8 +293,9 @@ async def publish_opening(
     if not public_perms.send_messages or not public_perms.embed_links:
         raise PermissionError("Missing announcement channel permissions.")
     review_perms = review_channel.permissions_for(bot_member)
-    if not review_perms.view_channel or not review_perms.send_messages or not review_perms.embed_links:
-        raise PermissionError("Missing review channel permissions.")
+    # البوت يحتاج فقط أن يرى القناة ويضبط الصلاحيات للمتقدم (ليس إرسال رسائل — بطاقة المراجعة تذهب لـ ads-and-staff)
+    if not review_perms.view_channel or not review_perms.manage_channels:
+        raise PermissionError(f"البوت يحتاج View Channel و Manage Channel في {review_channel.mention} حتى يفتحها للمتقدمين.")
     if seat_limit is not None and not 1 <= seat_limit <= 100:
         raise ValueError("Seat limit must be between 1 and 100.")
     if duration_hours is not None and not 1 <= duration_hours <= 720:
