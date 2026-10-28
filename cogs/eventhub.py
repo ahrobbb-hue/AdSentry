@@ -153,7 +153,13 @@ def build_event_embed(
 
 
 def _admin_embed(event: dict, registered: int = 0, waitlist: int = 0, creator: str = "—") -> discord.Embed:
-    start = datetime.fromisoformat(event["starts_at"].replace("Z", "+00:00"))
+    raw_start = event.get("starts_at")
+    if isinstance(raw_start, str):
+        start = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+    elif isinstance(raw_start, datetime):
+        start = raw_start
+    else:
+        start = datetime.now(timezone.utc)
     ts = int(start.timestamp())
     embed = discord.Embed(
         title=f"🛡️  إدارة الفعالية #{event['id']}  ·  {event['title']}",
@@ -182,7 +188,13 @@ def _admin_embed(event: dict, registered: int = 0, waitlist: int = 0, creator: s
 
 
 def _confirm_embed(ev: dict) -> discord.Embed:
-    start = datetime.fromisoformat(ev["starts_at"].replace("Z", "+00:00"))
+    raw_start = ev.get("starts_at")
+    if isinstance(raw_start, str):
+        start = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+    elif isinstance(raw_start, datetime):
+        start = raw_start
+    else:
+        start = datetime.now(timezone.utc)
     ts = int(start.timestamp())
     e = discord.Embed(title=f"تأكيد التسجيل في: {ev['title']}", color=discord.Color.blurple())
     e.add_field(name="📅  الموعد", value=f"<t:{ts}:F>", inline=True)
@@ -1120,6 +1132,11 @@ async def _refresh_event_announcement(
 ) -> None:
     """Update the public event embed to reflect the current seat count."""
     try:
+        await _refresh_embed(bot, event_id)
+        return
+    except Exception:
+        pass
+    try:
         event_row = (await client.table("events").select(  # type: ignore[attr-defined]
             "title,description,starts_at,capacity,channel_id,announcement_message_id,status,created_by"
         ).eq("id", event_id).limit(1).execute()).data
@@ -1132,7 +1149,8 @@ async def _refresh_event_announcement(
         registered = (await client.table("event_participants").select(  # type: ignore[attr-defined]
             "id", count="exact"
         ).eq("event_id", event_id).execute()).count or 0
-        start = datetime.fromisoformat(ev["starts_at"].replace("Z", "+00:00"))
+        raw_start = ev.get("starts_at")
+        start = datetime.fromisoformat(raw_start.replace("Z", "+00:00")) if isinstance(raw_start, str) else raw_start
         organizer = bot.get_user(int(ev["created_by"])) if ev.get("created_by") else None
         embed = build_event_embed(
             ev["title"], ev["description"], start,
