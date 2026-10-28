@@ -395,42 +395,124 @@ class UserEditSubmissionModal(discord.ui.Modal):
                 await interaction.followup.send("⚠️ تعذر تحديث الإعلان أو أن الإعلان لم يعد معلقاً.", ephemeral=True)
                 return
 
-            # Refresh review card in staff channel if review_message_id is known
+            # Post a fresh review card so the revised ad is visible and notifies staff.
             sub = await self.bot.db.get_submission(self.submission_id)
-            if sub and sub.get("review_message_id"):
-                cfg = await self.bot.db.get_guild_config(sub.get("guild_id"))
-                if cfg and cfg.get("staff_review_channel_id"):
-                    ch = self.bot.get_channel(cfg["staff_review_channel_id"])
-                    if ch and isinstance(ch, discord.TextChannel):
+            review_notice_sent = False
+            if sub:
+                guild_id = sub.get("guild_id")
+                cfg = await self.bot.db.get_guild_config(guild_id) if guild_id else None
+                channel_id = cfg.get("staff_review_channel_id") if cfg else None
+                review_channel = None
+                if channel_id:
+                    review_channel = self.bot.get_channel(int(channel_id))
+                    if not isinstance(review_channel, discord.TextChannel):
                         try:
-                            rev_msg = await ch.fetch_message(sub["review_message_id"])
-                            embed = rev_msg.embeds[0] if rev_msg.embeds else discord.Embed()
-                            new_embed = embed.copy()
-                            new_embed.title = f"📥 New Ad Submission #{self.submission_id} (✏️ محدث)"
-                            new_embed.description = f"**Headline:** {new_title}\n\n**Category:** {sub.get('category')}\n**Language:** {sub.get('language')}\n\n```{new_content}```"
-                            
-                            # Add revision notice field
-                            curr_reqs = sub.get("change_requests", 0)
-                            max_reqs = sub.get("max_change_requests", 3)
-                            new_embed.add_field(
-                                name="🔄 تحديث المعلن | Advertiser Revision",
-                                value=f"قام المعلن بإجراء التعديل رقم (`{curr_reqs}/{max_reqs}`) وهو جاهز للمراجعة مجدداً.",
+                            review_channel = await self.bot.fetch_channel(int(channel_id))
+                        except discord.NotFound:
+                            logger.warning("Staff review channel %s no longer exists", channel_id)
+                        except discord.HTTPException:
+                            logger.exception("Could not fetch staff review channel %s", channel_id)
+
+                if isinstance(review_channel, discord.TextChannel) and review_channel.guild.id == int(guild_id):
+                    curr_reqs = sub.get("change_requests", 0)
+                    max_reqs = sub.get("max_change_requests", 3)
+                    language = "🇸🇦 العربية" if sub.get("language") == "ar" else "🇬🇧 English"
+                    review_embed = discord.Embed(
+                        title=f"📥 Ad Submission #{self.submission_id} (✏️ Revision)",
+                        description=(
+                            f"**Headline:** {new_title}\n\n"
+                            f"**Category:** {sub.get('category')}\n"
+                            f"**Language:** {language}\n\n"
+                            f"```{new_content}```"
+                        ),
+                        color=discord.Color.gold(),
+                    )
+                    author_name = f"{sub.get('user_name', 'Advertiser')} ({sub.get('user_id')})"
+                    if sub.get("user_avatar_url"):
+                        review_embed.set_author(name=author_name, icon_url=sub["user_avatar_url"])
+                        review_embed.set_thumbnail(url=sub["user_avatar_url"])
+                    else:
+                        review_embed.set_author(name=author_name)
+                    if sub.get("image_url"):
+                        review_embed.set_image(url=sub["image_url"])
+                    if tags_list:
+                        review_embed.add_field(
+                            name="Tags",
+                            value=" ".join(f"`#{tag}`" for tag in tags_list[:5]),
+                            inline=True,
+                        )
+                    review_embed.add_field(name="Status", value="🟡 Pending Staff Review", inline=True)
+                    review_embed.add_field(
+                        name="🔄 Advertiser Revision",
+                        value=f"Revision {curr_reqs} of {max_reqs} requested changes; ready for review.",
+                        inline=False,
+                    )
+                    review_embed.set_footer(text=f"Submission ID: {self.submission_id} • AdSentry Review Queue")
+
+                    old_review_message = None
+                    old_message_id = sub.get("review_message_id")
+                    if old_message_id:
+                        try:
+                            old_review_message = await review_channel.fetch_message(int(old_message_id))
+                        except discord.NotFound:
+                            logger.info("Previous review card %s was deleted", old_message_id)
+                        except discord.HTTPException:
+                            logger.exception("Could not fetch previous review card %s", old_message_id)
+
+                    try:
+                        revision_message = await review_channel.send(
+                            content=f"🔄 Revised advertisement #{self.submission_id} is ready for staff review.",
+                            embed=review_embed,
+                            view=StaffReviewView(
+                                self.submission_id,
+                                can_request_changes=(curr_reqs < max_reqs),
+                            ),
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                        review_notice_sent = True
+                        if not await self.bot.db.update_review_message_id(self.submission_id, revision_message.id):
+                            logger.error(
+                                "Revision card %s sent, but review_message_id could not be saved for submission %s",
+                                revision_message.id,
+                                self.submission_id,
+                            )
+                        if old_review_message:
+                            old_embed = old_review_message.embeds[0] if old_review_message.embeds else discord.Embed()
+                            old_embed = old_embed.copy()
+                            old_embed.add_field(
+                                name="Superseded",
+                                value=f"Updated revision is available in message {revision_message.id}.",
                                 inline=False,
                             )
-                            # If attempts exhausted, hide change request button
-                            view = StaffReviewView(self.submission_id, can_request_changes=(curr_reqs < max_reqs))
-                            await rev_msg.edit(embed=new_embed, view=view)
-                        except Exception as ex:
-                            logger.warning(f"Could not update review message upon user edit: {ex}")
+                            try:
+                                await old_review_message.edit(embed=old_embed, view=None)
+                            except discord.HTTPException:
+                                logger.exception("Could not disable superseded review card for submission %s", self.submission_id)
+                    except discord.HTTPException:
+                        logger.exception("Could not send revised review card for submission %s", self.submission_id)
+                else:
+                    logger.error(
+                        "Could not notify staff about revised submission %s: review channel is not configured or unavailable",
+                        self.submission_id,
+                    )
+            else:
+                logger.error("Could not reload revised submission %s for staff review", self.submission_id)
 
-            embed = discord.Embed(
-                title="✅ تم تحديث إعلانك وإرساله للمراجعة!",
-                description=(
-                    "تم حفظ التعديلات وإشعار المشرفين تلقائياً في السيرفر.\n"
-                    "سيتم مراجعة طلبك وإخبارك بالنتيجة عبر الخاص فوراً."
-                ),
-                color=discord.Color.green(),
-            )
+            if review_notice_sent:
+                embed = discord.Embed(
+                    title="✅ تم تحديث إعلانك وإرساله للمراجعة!",
+                    description="تم حفظ التعديلات وإرسال نسخة جديدة إلى قناة مراجعة الإدارة.",
+                    color=discord.Color.green(),
+                )
+            else:
+                embed = discord.Embed(
+                    title="⚠️ تم حفظ التعديل لكن تعذر إرساله للإدارة",
+                    description=(
+                        "تم حفظ التعديلات، لكن لم أتمكن من إرسال نسخة المراجعة إلى الإدارة. "
+                        "يرجى التواصل مع الإدارة أو إعادة المحاولة لاحقاً."
+                    ),
+                    color=discord.Color.orange(),
+                )
             await interaction.followup.send(embed=embed, ephemeral=True)
         except Exception as e:
             logger.error(f"Error saving user edit for #{self.submission_id}: {e}", exc_info=True)
@@ -1394,4 +1476,3 @@ class ModerationCog(commands.Cog, name="Moderation"):
 async def setup(bot: commands.Bot) -> None:
     """Extension entry point for loading the Moderation cog."""
     await bot.add_cog(ModerationCog(bot))
-
