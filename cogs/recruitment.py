@@ -429,14 +429,14 @@ class ApplicationModal(discord.ui.Modal):
                 except discord.HTTPException:
                     logger.exception("Could not assign applicant role %s", applicant_role_name)
 
-            # 2. فتح قناة join-requests للمتقدم فقط (قراءة فقط لمتابعة طلبه)
+            # 2. فتح قناة join-requests للمتقدم (للنقاش والتكلم مع الإدارة)
             if isinstance(applicant_channel, discord.TextChannel) and isinstance(interaction.user, discord.Member):
                 try:
                     await applicant_channel.set_permissions(
                         interaction.user,
                         view_channel=True,
                         read_message_history=True,
-                        send_messages=False,
+                        send_messages=True,
                         reason=f"AdSentry applicant access to #{applicant_channel.name} for #{record['id']}",
                     )
                 except discord.HTTPException:
