@@ -50,6 +50,12 @@ class SystemDashboardView(discord.ui.View):
             await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await self.cog.show_staffflow(interaction, edit=True)
 
+    @discord.ui.button(label="المناوبات", emoji="🕒", style=discord.ButtonStyle.primary, row=0)
+    async def shifts(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _staff(interaction):
+            await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
+        await self.cog.show_shifts(interaction, edit=True)
+
     @discord.ui.button(label="شكوى إدارية", emoji="⚠️", style=discord.ButtonStyle.primary, row=0)
     async def complaint(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction):
@@ -88,6 +94,11 @@ class PersistentDashboardView(discord.ui.View):
     async def staffflow(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction): await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await self.cog.show_staffflow(interaction)
+
+    @discord.ui.button(label="المناوبات", emoji="🕒", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:shifts", row=0)
+    async def shifts(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _staff(interaction): await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
+        await self.cog.show_shifts(interaction)
 
     @discord.ui.button(label="شكوى إدارية", emoji="⚠️", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:complaint", row=0)
     async def complaint(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1397,15 +1408,7 @@ class StaffDashboardView(discord.ui.View):
     @discord.ui.button(label="عرض المناوبات", emoji="📋", style=discord.ButtonStyle.secondary, row=1)
     async def shifts(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild or not _staff(interaction): await interaction.response.send_message("للإدارة فقط.", ephemeral=True); return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        client = await self.cog.bot.db.get_client()
-        shifts = (await client.table("staff_shifts").select("id,user_id,starts_at,ends_at,duties").eq("guild_id", interaction.guild.id).eq("status", "SCHEDULED").order("starts_at").limit(10).execute()).data or []
-        embed = discord.Embed(title="المناوبات القادمة", color=discord.Color.blurple())
-        for row in shifts:
-            start = datetime.fromisoformat(row["starts_at"].replace("Z", "+00:00"))
-            embed.add_field(name=f"#{row['id']} · <@{row['user_id']}> · <t:{int(start.timestamp())}:f>", value=row["duties"], inline=False)
-        if not shifts: embed.description = "لا توجد مناوبات مجدولة."
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await self.cog.show_shifts(interaction)
 
     @discord.ui.button(label="ضبط قناة الإجازات", emoji="🔒", style=discord.ButtonStyle.secondary, row=1)
     async def configure_leave_channel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1419,6 +1422,33 @@ class StaffDashboardView(discord.ui.View):
         await interaction.response.send_modal(PositionChangeModal(self.cog))
 
     @discord.ui.button(label="الرئيسية", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.show_home(interaction, edit=True)
+
+
+class ShiftDashboardView(discord.ui.View):
+    def __init__(self, cog: "DashboardCog", can_manage: bool = False) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        if not can_manage:
+            self.remove_item(self.schedule)
+
+    @discord.ui.button(label="جدولة مناوبة", emoji="🕒", style=discord.ButtonStyle.primary, row=0)
+    async def schedule(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not interaction.guild or not _admin(interaction):
+            await interaction.response.send_message("جدولة المناوبات متاحة للمالك وAdministrator فقط.", ephemeral=True)
+            return
+        view = ShiftScheduleView(self.cog)
+        await interaction.response.send_message(content=view.render_content(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="تحديث الجدول", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _staff(interaction):
+            await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True)
+            return
+        await self.cog.show_shifts(interaction, edit=True)
+
+    @discord.ui.button(label="الرئيسية", emoji="🏠", style=discord.ButtonStyle.secondary, row=0)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog.show_home(interaction, edit=True)
 
@@ -1594,6 +1624,53 @@ class DashboardCog(commands.Cog):
             description = "تعذر تحميل الفعاليات. تأكد من تشغيل ترحيل EventHub."
         embed = discord.Embed(title="EventHub · إدارة الفعاليات", description=description, color=discord.Color.blurple())
         await interaction.edit_original_response(embed=embed, view=EventDashboardView(self))
+
+    async def show_shifts(self, interaction: discord.Interaction, edit: bool = False) -> None:
+        if not _staff(interaction) or not interaction.guild:
+            await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=not edit)
+        try:
+            client = await self.bot.db.get_client()
+            shifts = (
+                await client.table("staff_shifts")
+                .select("id,user_id,starts_at,ends_at,duties")
+                .eq("guild_id", interaction.guild.id)
+                .eq("status", "SCHEDULED")
+                .order("starts_at")
+                .limit(10)
+                .execute()
+            ).data or []
+            embed = discord.Embed(
+                title="🕒 جدول المناوبات القادمة",
+                description=f"المناوبات المعروضة: **{len(shifts)}** (يعرض الجدول أقرب 10 مناوبات).",
+                color=discord.Color.blurple(),
+            )
+            for shift in shifts:
+                start = datetime.fromisoformat(shift["starts_at"].replace("Z", "+00:00"))
+                end = datetime.fromisoformat(shift["ends_at"].replace("Z", "+00:00"))
+                embed.add_field(
+                    name=f"#{shift['id']} · <@{shift['user_id']}>",
+                    value=(
+                        f"**البداية:** <t:{int(start.timestamp())}:F>\n"
+                        f"**النهاية:** <t:{int(end.timestamp())}:t>\n"
+                        f"**المهام:** {shift['duties'][:900]}"
+                    ),
+                    inline=False,
+                )
+            if not shifts:
+                embed.description += "\nلا توجد مناوبات مجدولة حالياً."
+        except Exception:
+            logger.exception("Could not load upcoming shifts for guild %s", interaction.guild.id)
+            embed = discord.Embed(
+                title="🕒 جدول المناوبات",
+                description="تعذر تحميل جدول المناوبات. تحقق من قاعدة البيانات وترحيل StaffFlow.",
+                color=discord.Color.red(),
+            )
+        await interaction.edit_original_response(
+            embed=embed,
+            view=ShiftDashboardView(self, can_manage=_admin(interaction)),
+        )
 
     async def show_staffflow(self, interaction: discord.Interaction, edit: bool = False) -> None:
         if not _staff(interaction) or not interaction.guild:
