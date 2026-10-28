@@ -114,7 +114,7 @@ class SetupCog(commands.Cog, name="Server Setup"):
                 "key": "announcements",
                 "name": "╚〖📢┇〢announcements",
                 "slug": "announcements",
-                "aliases": ["announcements", "إعلانات-البوت", "إعلانات", "ads"],
+                "aliases": ["announcements", "إعلانات-البوت", "إعلانات"],
                 "access": "public",
                 "label": "إعلانات البوت العامة",
                 "private": False,
@@ -143,32 +143,51 @@ class SetupCog(commands.Cog, name="Server Setup"):
             options = {"overwrites": {guild.default_role: discord.PermissionOverwrite(view_channel=False)}} if private else {}
             return await guild.create_category(target_name, reason="AdSentry channel setup", **options)
 
+        claimed_ids: set[int] = set()
+
         def find_existing_channel(
             saved_id: int | None,
             spec: dict,
             parent_category: discord.CategoryChannel | None,
         ) -> discord.TextChannel | None:
-            # 1. Look up by ID from database (preserves manual renames 100%)
-            if saved_id:
+            # 1. Search inside parent_category FIRST (ensures staff channels stay in staff category)
+            if parent_category:
+                # Exact stylized name
+                for ch in parent_category.text_channels:
+                    if ch.id not in claimed_ids and ch.name == spec["name"]:
+                        return ch
+                # Exact slug in channel name
+                for ch in parent_category.text_channels:
+                    if ch.id not in claimed_ids and spec["slug"] in ch.name.lower():
+                        return ch
+                # Specific aliases match
+                for ch in parent_category.text_channels:
+                    if ch.id not in claimed_ids:
+                        for alias in spec.get("aliases", []):
+                            if alias.lower() in ch.name.lower():
+                                return ch
+
+            # 2. Look up by saved ID from database
+            if saved_id and saved_id not in claimed_ids:
                 ch = guild.get_channel(int(saved_id))
                 if isinstance(ch, discord.TextChannel):
-                    return ch
-
-            # 2. Look up inside category by exact name, slug or alias
-            if parent_category:
-                for ch in parent_category.text_channels:
-                    if ch.name == spec["name"] or spec["slug"] in ch.name.lower():
+                    # Safety check: for staff private channels, only reuse saved_id
+                    # if it's already in parent_category OR its name/slug matches this specific spec!
+                    # This prevents reusing announcement_channel or foreign channels as staff review!
+                    is_private_spec = spec.get("private", True)
+                    is_in_category = (ch.category_id == parent_category.id) if parent_category else True
+                    name_matches = (
+                        ch.name == spec["name"]
+                        or spec["slug"] in ch.name.lower()
+                        or any(alias.lower() in ch.name.lower() for alias in spec.get("aliases", []))
+                    )
+                    if is_in_category or name_matches or not is_private_spec:
                         return ch
-                    for alias in spec.get("aliases", []):
-                        if alias.lower() in ch.name.lower():
-                            return ch
 
-            # 3. Look up across entire guild by exact name, slug or alias
+            # 3. Look up across entire guild ONLY if exact slug or name matches
             for ch in guild.text_channels:
-                if ch.name == spec["name"] or spec["slug"] in ch.name.lower():
-                    return ch
-                for alias in spec.get("aliases", []):
-                    if alias.lower() in ch.name.lower():
+                if ch.id not in claimed_ids:
+                    if ch.name == spec["name"] or spec["slug"] in ch.name.lower():
                         return ch
 
             return None
@@ -198,9 +217,16 @@ class SetupCog(commands.Cog, name="Server Setup"):
             saved_panel_id = int(saved_panel[0]["channel_id"]) if saved_panel and saved_panel[0].get("channel_id") else None
 
             # Map known IDs for deduplication
+            ann_saved_id = int(previous_config["announcement_channel_id"]) if previous_config.get("announcement_channel_id") else None
+            rev_saved_id = int(previous_config["staff_review_channel_id"]) if previous_config.get("staff_review_channel_id") else None
+
+            # Disentangle if review and announcements were previously set to the same channel
+            if rev_saved_id and rev_saved_id == ann_saved_id:
+                rev_saved_id = None
+
             known_ids: dict[str, int | None] = {
-                "announcements": int(previous_config["announcement_channel_id"]) if previous_config.get("announcement_channel_id") else None,
-                "review": int(previous_config["staff_review_channel_id"]) if previous_config.get("staff_review_channel_id") else None,
+                "announcements": ann_saved_id,
+                "review": rev_saved_id,
                 "vacation": int(previous_config["staffflow_review_channel_id"]) if previous_config.get("staffflow_review_channel_id") else None,
                 "complaints": int(previous_config["staffflow_complaint_channel_id"]) if previous_config.get("staffflow_complaint_channel_id") else None,
                 "app1": rec_map.get(1),
@@ -254,6 +280,7 @@ class SetupCog(commands.Cog, name="Server Setup"):
                 # Handle custom announcement channel if explicitly provided by user
                 if key == "announcements" and announcement_channel is not None:
                     channels[key] = announcement_channel
+                    claimed_ids.add(announcement_channel.id)
                     reused_flags[key] = True
                     continue
 
@@ -280,7 +307,7 @@ class SetupCog(commands.Cog, name="Server Setup"):
                 else:
                     reused_flags[key] = True
                     # Reassert category if channel was placed elsewhere
-                    if channel.category_id != parent.id:
+                    if parent and channel.category_id != parent.id:
                         try:
                             await channel.edit(category=parent, reason="AdSentry category alignment")
                         except Exception:
@@ -296,6 +323,7 @@ class SetupCog(commands.Cog, name="Server Setup"):
                             pass
 
                 channels[key] = channel
+                claimed_ids.add(channel.id)
 
             stage = "حفظ قناة الإعلانات والمراجعة في قاعدة البيانات"
             await self.bot.db.set_guild_config(
