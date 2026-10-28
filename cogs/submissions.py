@@ -14,7 +14,7 @@ from discord.ext import commands
 
 from config import Config
 from cogs.moderation import StaffReviewView, is_staff
-from utils import screen_content
+from utils import screen_content, resolve_category_theme
 
 logger = logging.getLogger("AdSentry.Submissions")
 
@@ -30,10 +30,97 @@ def is_server_admin_or_owner(user: discord.Member | discord.User, guild: discord
     return is_staff(user)
 
 
-class AdSubmissionModal(discord.ui.Modal):
-    """Modal for collecting advertisement title and content from the user in their chosen language."""
+class AdTemplateSaveModal(discord.ui.Modal):
+    """Modal allowing users to save an ad template for recurring use."""
 
-    def __init__(self, category: str, bot: commands.Bot, lang: str = "en", is_admin: bool = False) -> None:
+    def __init__(self, template_name: str, category: str, bot: commands.Bot) -> None:
+        super().__init__(title=f"حفظ قالب: {template_name}"[:45])
+        self.template_name = template_name
+        self.category = category
+        self.bot = bot
+
+        self.ad_title = discord.ui.TextInput(
+            label="عنوان الإعلان الافتراضي",
+            placeholder="عنوان جذاب للإعلان...",
+            min_length=3,
+            max_length=100,
+            required=True,
+        )
+        self.add_item(self.ad_title)
+
+        self.ad_content = discord.ui.TextInput(
+            label="محتوى الإعلان الافتراضي",
+            style=discord.TextStyle.paragraph,
+            placeholder="اكتب نص الإعلان، المميزات، وروابط التواصل...",
+            min_length=10,
+            max_length=1800,
+            required=True,
+        )
+        self.add_item(self.ad_content)
+
+        self.ad_tags = discord.ui.TextInput(
+            label="الوسوم الافتراضية / Tags (اختياري)",
+            placeholder="مثال: #متجر #خدمات #خصم",
+            required=False,
+            max_length=150,
+        )
+        self.add_item(self.ad_tags)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        # Parse tags
+        tags_raw = self.ad_tags.value.strip()
+        tags = [t.strip() for t in re.split(r"[\s,]+", tags_raw) if t.strip()] if tags_raw else []
+
+        try:
+            await self.bot.db.save_template(
+                user_id=interaction.user.id,
+                guild_id=interaction.guild.id,
+                name=self.template_name,
+                category=self.category,
+                title=self.ad_title.value.strip(),
+                content=self.ad_content.value.strip(),
+                tags=tags,
+            )
+
+            embed = discord.Embed(
+                title="✅ تم حفظ قالب الإعلان بنجاح",
+                description=(
+                    f"**اسم القالب:** `{self.template_name}`\n"
+                    f"**القسم:** `{self.category}`\n"
+                    f"**العنوان:** {self.ad_title.value.strip()}\n\n"
+                    f"🚀 **لتقديم إعلان سريع بهذا القالب مستقبلاً:**\n"
+                    f"`/ad-template use name:{self.template_name}`"
+                ),
+                color=discord.Color.green(),
+            )
+            embed.set_footer(text="AdSentry Templates • قوالب الإعلانات المتكررة")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            logger.error(f"Error saving template '{self.template_name}': {e}", exc_info=True)
+            await interaction.followup.send(f"❌ حدث خطأ أثناء حفظ القالب: `{e}`", ephemeral=True)
+
+
+class AdSubmissionModal(discord.ui.Modal):
+    """Modal for collecting advertisement title, content, tags, and banner image in user's language."""
+
+    def __init__(
+        self,
+        category: str,
+        bot: commands.Bot,
+        lang: str = "en",
+        is_admin: bool = False,
+        default_title: str = "",
+        default_content: str = "",
+        default_image: str = "",
+        default_tags: str = "",
+    ) -> None:
         self.lang = lang
         self.category = category
         self.bot = bot
@@ -45,18 +132,27 @@ class AdSubmissionModal(discord.ui.Modal):
             title_placeholder = "مثال: منصة المطورين - أفضل مجتمع لتعلم البرمجة"
             content_label = "محتوى الإعلان والروابط"
             content_placeholder = "اكتب تفاصيل إعلانك ومميزاته وروابط التواصل والسيرفر هنا..."
+            tags_label = "الوسوم / Tags (اختياري)"
+            tags_placeholder = "مثال: #خدمات #برمجة #عرض_خاص"
+            image_label = "رابط بنر أو صورة الإعلان (اختياري)"
+            image_placeholder = "https://i.imgur.com/... أو رابط ينتهي بـ png/jpg/gif"
         else:
             modal_title = f"Submit Ad: {category}"[:45]
             title_label = "Ad Headline / Title"
             title_placeholder = "e.g. Apex Coding Hub - Join top developers"
             content_label = "Advertisement Content & Links"
             content_placeholder = "Describe your server, bot, or service in detail, including features and links..."
+            tags_label = "Tags (Optional)"
+            tags_placeholder = "e.g. #services #bot #dev"
+            image_label = "Banner / Image URL (Optional)"
+            image_placeholder = "https://i.imgur.com/... or direct image link"
 
         super().__init__(title=modal_title)
 
         self.ad_title = discord.ui.TextInput(
             label=title_label,
             placeholder=title_placeholder,
+            default=default_title,
             min_length=2,
             max_length=100,
             required=True,
@@ -67,22 +163,26 @@ class AdSubmissionModal(discord.ui.Modal):
             label=content_label,
             style=discord.TextStyle.paragraph,
             placeholder=content_placeholder,
+            default=default_content,
             min_length=10,
             max_length=1800,
             required=True,
         )
         self.add_item(self.ad_content)
 
-        if lang == "ar":
-            image_label = "رابط بنر أو صورة الإعلان (اختياري)"
-            image_placeholder = "https://i.imgur.com/... أو رابط ينتهي بـ png/jpg/gif"
-        else:
-            image_label = "Banner / Image URL (Optional)"
-            image_placeholder = "https://i.imgur.com/... or direct image link"
+        self.ad_tags = discord.ui.TextInput(
+            label=tags_label,
+            placeholder=tags_placeholder,
+            default=default_tags,
+            required=False,
+            max_length=150,
+        )
+        self.add_item(self.ad_tags)
 
         self.ad_image = discord.ui.TextInput(
             label=image_label,
             placeholder=image_placeholder,
+            default=default_image,
             required=False,
             max_length=400,
         )
@@ -291,116 +391,57 @@ class AdSubmissionModal(discord.ui.Modal):
                 return
 
             # -------------------------------------------------------------
-            # 3. Save to Supabase Submissions Table
+            # 2. Extract Tags and Build Preview
             # -------------------------------------------------------------
-            submission = None
-            try:
-                submission = await self.bot.db.create_submission(
-                    user_id=interaction.user.id,
-                    user_name=str(interaction.user),
-                    user_avatar_url=interaction.user.display_avatar.url,
-                    category=self.category,
-                    title=title,
-                    content=content,
-                    guild_id=guild_id,
-                    language=self.lang,
-                    image_url=image_url,
+            raw_tags = self.ad_tags.value.strip() if hasattr(self, "ad_tags") and self.ad_tags.value else ""
+            tags_list = [t.lstrip("#").strip() for t in raw_tags.split() if t.strip()] if raw_tags else []
+
+            theme = resolve_category_theme(self.category)
+            emoji = theme["emoji"]
+            color = theme["color"]
+            badge_label = theme["badge"]
+
+            # Build preview embed
+            preview_embed = discord.Embed(
+                title=f"{emoji} {title}",
+                description=f"{content}\n\n──────────────────────────────",
+                color=color,
+            )
+            preview_embed.set_author(
+                name=f"{interaction.user.display_name} • معاينة قبل النشر | Preview",
+                icon_url=interaction.user.display_avatar.url,
+            )
+            preview_embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            if image_url:
+                preview_embed.set_image(url=image_url)
+
+            preview_embed.add_field(name="🏷️ القسم | Category", value=f"`{badge_label}`", inline=True)
+            if tags_list:
+                preview_embed.add_field(name="🔖 الوسوم | Tags", value=" ".join(f"`#{t}`" for t in tags_list[:5]), inline=True)
+            preview_embed.add_field(name="👤 المعلن | Advertiser", value=f"{interaction.user.mention}", inline=True)
+            preview_embed.set_footer(text="🔍 هذه معاينة لإعلانك كما سيظهر للأعضاء. اضغط تأكيد للإرسال للمراجعة.")
+
+            view = AdPreviewView(
+                bot=self.bot,
+                category=self.category,
+                title=title,
+                content=content,
+                image_url=image_url,
+                tags=tags_list,
+                lang=self.lang,
+                is_admin=is_admin,
+            )
+
+            msg_text = (
+                "🔍 **معاينة الإعلان قبل الإرسال:**\n"
+                "راجع إعلانك بعناية، إذا كان كل شيء جاهزاً اضغط **تأكيد وإرسال للمراجعة**، أو اضغط **تعديل** لتغيير المحتوى."
+                if self.lang == "ar"
+                else (
+                    "🔍 **Advertisement Preview Before Submission:**\n"
+                    "Review your ad carefully. If everything looks good, click **Confirm & Submit**, or click **Edit** to modify."
                 )
-            except Exception as e:
-                logger.error(f"Failed to record submission in Supabase: {e}", exc_info=True)
-                err_desc = (
-                    "حدث خطأ أثناء حفظ إعلانك في قاعدة البيانات. يرجى المحاولة لاحقاً."
-                    if self.lang == "ar"
-                    else "An error occurred while saving your submission. Please try again later or contact an administrator."
-                )
-                embed = discord.Embed(
-                    title="❌ Database Error",
-                    description=err_desc,
-                    color=discord.Color.red(),
-                )
-                await interaction.followup.send(embed=embed, ephemeral=True)
-                return
-
-            # -------------------------------------------------------------
-            # 4. Activate User Cooldown in Database
-            # -------------------------------------------------------------
-            try:
-                await self.bot.db.set_user_cooldown(interaction.user.id)
-            except Exception as e:
-                logger.error(f"Failed to set user cooldown: {e}", exc_info=True)
-
-            submission_id = submission.get("id", "N/A") if submission else "N/A"
-
-            # -------------------------------------------------------------
-            # 5. Forward to Staff Review Channel (Dynamically Configured)
-            # -------------------------------------------------------------
-            review_channel_id = guild_config.get("staff_review_channel_id")
-            review_channel = self.bot.get_channel(review_channel_id)
-            if not review_channel and review_channel_id:
-                try:
-                    review_channel = await self.bot.fetch_channel(review_channel_id)
-                except Exception:
-                    review_channel = None
-
-            if review_channel and isinstance(review_channel, discord.TextChannel):
-                lang_tag = "🇸🇦 العربية" if self.lang == "ar" else "🇬🇧 English"
-                review_embed = discord.Embed(
-                    title=f"📥 New Ad Submission #{submission_id}",
-                    description=f"**Headline:** {title}\n\n**Category:** {self.category}\n**Language:** {lang_tag}\n\n```{content}```",
-                    color=discord.Color.blue(),
-                )
-                review_embed.set_author(
-                    name=f"{interaction.user} ({interaction.user.id})",
-                    icon_url=interaction.user.display_avatar.url,
-                )
-                review_embed.set_thumbnail(url=interaction.user.display_avatar.url)
-                if image_url:
-                    review_embed.set_image(url=image_url)
-
-                review_embed.add_field(name="Category", value=self.category, inline=True)
-                review_embed.add_field(name="Language", value=lang_tag, inline=True)
-                review_embed.add_field(name="Status", value="🟡 Pending Staff Review", inline=True)
-                review_embed.set_footer(text=f"Submission ID: {submission_id} • AdSentry Review Queue")
-
-                try:
-                    review_view = StaffReviewView(submission_id) if isinstance(submission_id, int) else None
-                    review_msg = await review_channel.send(embed=review_embed, view=review_view)
-                    if submission and isinstance(submission_id, int):
-                        await self.bot.db.update_review_message_id(submission_id, review_msg.id)
-                except Exception as e:
-                    logger.error(f"Failed to send submission to review channel: {e}", exc_info=True)
-            else:
-                logger.warning(f"Configured review channel ID {review_channel_id} could not be resolved.")
-
-            # -------------------------------------------------------------
-            # 6. Notify User of Successful Submission
-            # -------------------------------------------------------------
-            if self.lang == "ar":
-                success_embed = discord.Embed(
-                    title="✅ تم إرسال إعلانك بنجاح!",
-                    description=(
-                        f"تم استلام إعلانك في قسم **{self.category}** بنجاح!\n\n"
-                        f"**العنوان:** {title}\n"
-                        f"**رقم التتبع:** `#{submission_id}`\n\n"
-                        "سيقوم طاقم الإدارة بمراجعة طلبك في أقرب وقت. سيصلك إشعار بالنتيجة عبر الخاص."
-                    ),
-                    color=discord.Color.green(),
-                )
-                success_embed.set_footer(text="خدمة إعلانات AdSentry")
-            else:
-                success_embed = discord.Embed(
-                    title="✅ Advertisement Submitted!",
-                    description=(
-                        f"Your advertisement for **{self.category}** has been successfully received!\n\n"
-                        f"**Headline:** {title}\n"
-                        f"**Tracking ID:** `#{submission_id}`\n\n"
-                        "Our moderation team will review your ad shortly. You will be notified via DM when a decision is made."
-                    ),
-                    color=discord.Color.green(),
-                )
-                success_embed.set_footer(text="AdSentry Announcement Service")
-
-            await interaction.followup.send(embed=success_embed, ephemeral=True)
+            )
+            await interaction.followup.send(content=msg_text, embed=preview_embed, view=view, ephemeral=True)
 
         except Exception as e:
             logger.error(f"Unexpected error in AdSubmissionModal.on_submit: {e}", exc_info=True)
@@ -410,6 +451,192 @@ class AdSubmissionModal(discord.ui.Modal):
                 color=discord.Color.red(),
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class AdPreviewView(discord.ui.View):
+    """View allowing the user to confirm, edit, or cancel their ad submission after preview."""
+
+    def __init__(
+        self,
+        bot: commands.Bot,
+        category: str,
+        title: str,
+        content: str,
+        image_url: str | None,
+        tags: list[str],
+        lang: str,
+        is_admin: bool,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.category = category
+        self.title = title
+        self.content = content
+        self.image_url = image_url
+        self.tags = tags
+        self.lang = lang
+        self.is_admin = is_admin
+
+        confirm_label = "تأكيد وإرسال للمراجعة ✅" if lang == "ar" else "Confirm & Submit ✅"
+        edit_label = "تعديل ✏️" if lang == "ar" else "Edit ✏️"
+        cancel_label = "إلغاء ❌" if lang == "ar" else "Cancel ❌"
+
+        confirm_btn = discord.ui.Button(label=confirm_label, style=discord.ButtonStyle.success)
+        confirm_btn.callback = self.confirm_submission
+        self.add_item(confirm_btn)
+
+        edit_btn = discord.ui.Button(label=edit_label, style=discord.ButtonStyle.secondary)
+        edit_btn.callback = self.edit_submission
+        self.add_item(edit_btn)
+
+        cancel_btn = discord.ui.Button(label=cancel_label, style=discord.ButtonStyle.danger)
+        cancel_btn.callback = self.cancel_submission
+        self.add_item(cancel_btn)
+
+    async def edit_submission(self, interaction: discord.Interaction) -> None:
+        """Re-opens the submission modal populated with current inputs."""
+        raw_tags = " ".join(f"#{t}" for t in self.tags)
+        modal = AdSubmissionModal(
+            category=self.category,
+            bot=self.bot,
+            lang=self.lang,
+            is_admin=self.is_admin,
+            default_title=self.title,
+            default_content=self.content,
+            default_image=self.image_url or "",
+            default_tags=raw_tags,
+        )
+        await interaction.response.send_modal(modal)
+
+    async def cancel_submission(self, interaction: discord.Interaction) -> None:
+        """Cancels submission."""
+        msg = "❌ تم إلغاء تقديم الإعلان." if self.lang == "ar" else "❌ Ad submission cancelled."
+        await interaction.response.edit_message(content=msg, embed=None, view=None)
+
+    async def confirm_submission(self, interaction: discord.Interaction) -> None:
+        """Finalizes the submission into Supabase and sends it to staff review channel."""
+        await interaction.response.defer(ephemeral=True)
+
+        guild_id = interaction.guild_id
+        guild_config = await self.bot.db.get_guild_config(guild_id) if guild_id else None
+
+        if not guild_config or not guild_config.get("staff_review_channel_id"):
+            msg = (
+                "لم يتم تكوين قناة مراجعة الإعلانات في هذا السيرفر بعد. يجب على المشرف تشغيل `/ad-setup`."
+                if self.lang == "ar"
+                else "Staff review channel is not configured. An admin must run `/ad-setup`."
+            )
+            await interaction.followup.send(f"⚙️ {msg}", ephemeral=True)
+            return
+
+        # Double check pending and cooldown
+        has_pending = await self.bot.db.has_pending_submission(interaction.user.id)
+        if has_pending:
+            msg = "⚠️ لديك طلب إعلان معلق بالفعل قيد المراجعة." if self.lang == "ar" else "⚠️ You already have a pending submission."
+            await interaction.followup.send(msg, ephemeral=True)
+            return
+
+        cooldown_until = await self.bot.db.get_user_cooldown(interaction.user.id)
+        if cooldown_until:
+            unix_ts = int(cooldown_until.timestamp())
+            msg = f"⏳ أنت في فترة الانتظار حتى <t:{unix_ts}:R>."
+            await interaction.followup.send(msg, ephemeral=True)
+            return
+
+        # Save to Supabase
+        submission = None
+        try:
+            submission = await self.bot.db.create_submission(
+                user_id=interaction.user.id,
+                user_name=str(interaction.user),
+                user_avatar_url=interaction.user.display_avatar.url,
+                category=self.category,
+                title=self.title,
+                content=self.content,
+                guild_id=guild_id,
+                language=self.lang,
+                image_url=self.image_url,
+                tags=self.tags,
+            )
+        except Exception as e:
+            logger.error(f"Failed to record submission in Supabase: {e}", exc_info=True)
+            await interaction.followup.send("❌ حدث خطأ أثناء حفظ الإعلان في قاعدة البيانات.", ephemeral=True)
+            return
+
+        # Set user cooldown
+        try:
+            await self.bot.db.set_user_cooldown(interaction.user.id)
+        except Exception as e:
+            logger.error(f"Failed to set user cooldown: {e}", exc_info=True)
+
+        submission_id = submission.get("id", "N/A") if submission else "N/A"
+
+        # Forward to staff review channel
+        review_channel_id = guild_config.get("staff_review_channel_id")
+        review_channel = self.bot.get_channel(review_channel_id)
+        if not review_channel and review_channel_id:
+            try:
+                review_channel = await self.bot.fetch_channel(review_channel_id)
+            except Exception:
+                review_channel = None
+
+        if review_channel and isinstance(review_channel, discord.TextChannel):
+            lang_tag = "🇸🇦 العربية" if self.lang == "ar" else "🇬🇧 English"
+            review_embed = discord.Embed(
+                title=f"📥 New Ad Submission #{submission_id}",
+                description=f"**Headline:** {self.title}\n\n**Category:** {self.category}\n**Language:** {lang_tag}\n\n```{self.content}```",
+                color=discord.Color.blue(),
+            )
+            review_embed.set_author(
+                name=f"{interaction.user} ({interaction.user.id})",
+                icon_url=interaction.user.display_avatar.url,
+            )
+            review_embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            if self.image_url:
+                review_embed.set_image(url=self.image_url)
+
+            review_embed.add_field(name="Category", value=self.category, inline=True)
+            review_embed.add_field(name="Language", value=lang_tag, inline=True)
+            if self.tags:
+                review_embed.add_field(name="Tags", value=" ".join(f"`#{t}`" for t in self.tags[:5]), inline=True)
+            review_embed.add_field(name="Status", value="🟡 Pending Staff Review", inline=True)
+            review_embed.set_footer(text=f"Submission ID: {submission_id} • AdSentry Review Queue")
+
+            try:
+                review_view = StaffReviewView(submission_id) if isinstance(submission_id, int) else None
+                review_msg = await review_channel.send(embed=review_embed, view=review_view)
+                if submission and isinstance(submission_id, int):
+                    await self.bot.db.update_review_message_id(submission_id, review_msg.id)
+            except Exception as e:
+                logger.error(f"Failed to send submission to review channel: {e}", exc_info=True)
+
+        # Notify user
+        if self.lang == "ar":
+            success_embed = discord.Embed(
+                title="✅ تم إرسال إعلانك بنجاح للمراجعة!",
+                description=(
+                    f"تم استلام إعلانك في قسم **{self.category}** بنجاح!\n\n"
+                    f"**العنوان:** {self.title}\n"
+                    f"**رقم التتبع:** `#{submission_id}`\n\n"
+                    "سيقوم طاقم الإدارة بمراجعة طلبك في أقرب وقت. سيصلك إشعار بالنتيجة عبر الخاص."
+                ),
+                color=discord.Color.green(),
+            )
+            success_embed.set_footer(text="خدمة إعلانات AdSentry")
+        else:
+            success_embed = discord.Embed(
+                title="✅ Advertisement Submitted!",
+                description=(
+                    f"Your advertisement for **{self.category}** has been successfully received!\n\n"
+                    f"**Headline:** {self.title}\n"
+                    f"**Tracking ID:** `#{submission_id}`\n\n"
+                    "Our moderation team will review your ad shortly. You will be notified via DM when a decision is made."
+                ),
+                color=discord.Color.green(),
+            )
+            success_embed.set_footer(text="AdSentry Announcement Service")
+
+        await interaction.edit_original_response(content=None, embed=success_embed, view=None)
 
 
 class CategorySelect(discord.ui.Select):
@@ -1270,6 +1497,212 @@ class SubmissionsCog(commands.Cog, name="Submissions"):
             )
         else:
             await interaction.followup.send("❌ Failed to deploy submission panel. Please check permissions.", ephemeral=True)
+
+    # -----------------------------------------------------------------------
+    # 📝 Ad Templates System (/ad-template save, list, use, delete)
+    # -----------------------------------------------------------------------
+
+    template_group = app_commands.Group(
+        name="ad-template",
+        description="إدارة نماذج الإعلانات المتكررة | Manage your ad templates",
+    )
+
+    @template_group.command(name="save", description="حفظ قالب إعلان جديد | Save a new ad template")
+    @app_commands.describe(
+        name="اسم القالب للرجوع إليه (مثل: متجري، سيرفري) | Name of this template",
+        category="تصنيف الإعلان | Ad category",
+    )
+    async def template_save(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        category: str,
+    ) -> None:
+        """Opens a modal to save a new recurring ad template."""
+        if not interaction.guild:
+            await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+            return
+
+        modal = AdTemplateSaveModal(template_name=name, category=category, bot=self.bot)
+        await interaction.response.send_modal(modal)
+
+    @template_group.command(name="list", description="عرض قوالبك المحفوظة | List your saved ad templates")
+    async def template_list(self, interaction: discord.Interaction) -> None:
+        """Lists all templates saved by the user in this server."""
+        if not interaction.guild:
+            await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        templates = await self.bot.db.get_user_templates(interaction.user.id, interaction.guild.id)
+        if not templates:
+            embed = discord.Embed(
+                title="📝 قوالب الإعلانات | Ad Templates",
+                description=(
+                    "**لا توجد لديك أي قوالب محفوظة حالياً في هذا السيرفر.**\n"
+                    "You don't have any saved templates in this server.\n\n"
+                    "💡 **لحفظ قالب جديد:** استخدم `/ad-template save`"
+                ),
+                color=discord.Color.gold(),
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="📝 قوالبك المحفوظة | Your Saved Templates",
+            description=f"لديك **{len(templates)}** قالب/قوالب محفوظة يمكنك استخدامها للإعلان بسرعة:",
+            color=discord.Color.blue(),
+        )
+
+        for t in templates[:10]:
+            t_id = t.get("id")
+            t_name = t.get("name") or "Template"
+            t_cat = t.get("category") or "General"
+            t_title = t.get("title") or "بدون عنوان"
+            t_tags = " ".join(t.get("tags") or [])
+            tags_display = f"\n🏷️ `{t_tags}`" if t_tags else ""
+            embed.add_field(
+                name=f"📌 {t_name} (`ID: {t_id}`)",
+                value=f"📁 **القسم:** `{t_cat}`\n📝 **العنوان:** {t_title}{tags_display}\n🚀 للاستخدام: `/ad-template use name:{t_name}`",
+                inline=False,
+            )
+
+        embed.set_footer(text="AdSentry Templates • استخدم /ad-template use لتعبئة الإعلان تلقائياً")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @template_group.command(name="use", description="استخدام قالب محفوظ لتقديم إعلان | Use a template to submit an ad")
+    @app_commands.describe(name="اسم القالب المحفوظ | Template name")
+    async def template_use(self, interaction: discord.Interaction, name: str) -> None:
+        """Loads a saved template and opens the submission modal pre-filled."""
+        if not interaction.guild:
+            await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+            return
+
+        templates = await self.bot.db.get_user_templates(interaction.user.id, interaction.guild.id)
+        matched = next((t for t in templates if t.get("name", "").lower() == name.lower()), None)
+
+        if not matched:
+            available = ", ".join([f"`{t.get('name')}`" for t in templates]) or "لا توجد قوالب"
+            await interaction.response.send_message(
+                f"❌ لم يتم العثور على قالب بالاسم `{name}`.\n"
+                f"القوالب المتوفرة لديك: {available}",
+                ephemeral=True,
+            )
+            return
+
+        # Check cooldown
+        cooldown_until = await self.bot.db.get_user_cooldown(interaction.user.id)
+        if cooldown_until:
+            unix_ts = int(cooldown_until.timestamp())
+            embed = discord.Embed(
+                title="⏳ Cooldown Active | أنت في فترة الانتظار",
+                description=(
+                    f"**Next submission available:** <t:{unix_ts}:F> (<t:{unix_ts}:R>)\n"
+                    f"**موعد تقديم الإعلان القادم:** <t:{unix_ts}:F> (<t:{unix_ts}:R>)"
+                ),
+                color=discord.Color.orange(),
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # Check pending submission
+        has_pending = await self.bot.db.has_pending_submission(interaction.user.id)
+        if has_pending:
+            embed = discord.Embed(
+                title="⚠️ Submission Already Pending | لديك إعلان معلق",
+                description=(
+                    "You already have a pending advertisement request awaiting review.\n"
+                    "لديك بالفعل طلب إعلان قيد المراجعة، يرجى الانتظار قبل إرسال إعلان جديد."
+                ),
+                color=discord.Color.gold(),
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        category = matched.get("category", "General")
+        default_title = matched.get("title") or ""
+        default_content = matched.get("content") or ""
+        tags_list = matched.get("tags") or []
+        default_tags = " ".join(tags_list)
+
+        # Open submission modal with pre-filled fields
+        modal = AdSubmissionModal(
+            category=category,
+            bot=self.bot,
+            lang="ar",
+            is_admin=is_server_admin_or_owner(interaction.user, interaction.guild),
+            default_title=default_title,
+            default_content=default_content,
+            default_tags=default_tags,
+        )
+        await interaction.response.send_modal(modal)
+
+    @template_use.autocomplete("name")
+    async def template_use_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete template names for the user."""
+        if not interaction.guild:
+            return []
+        try:
+            templates = await self.bot.db.get_user_templates(interaction.user.id, interaction.guild.id)
+            choices = []
+            for t in templates:
+                t_name = t.get("name", "")
+                if current.lower() in t_name.lower():
+                    choices.append(app_commands.Choice(name=t_name[:100], value=t_name))
+            return choices[:25]
+        except Exception:
+            return []
+
+    @template_group.command(name="delete", description="حذف قالب محفوظ | Delete a saved ad template")
+    @app_commands.describe(name="اسم القالب المراد حذفه | Template name to delete")
+    async def template_delete(self, interaction: discord.Interaction, name: str) -> None:
+        """Deletes a saved template."""
+        if not interaction.guild:
+            await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        templates = await self.bot.db.get_user_templates(interaction.user.id, interaction.guild.id)
+        matched = next((t for t in templates if t.get("name", "").lower() == name.lower()), None)
+
+        if not matched:
+            await interaction.followup.send(f"❌ لم يتم العثور على قالب بالاسم `{name}`.", ephemeral=True)
+            return
+
+        success = await self.bot.db.delete_template(matched["id"], interaction.user.id)
+        if success:
+            embed = discord.Embed(
+                title="✅ تم حذف القالب بنجاح",
+                description=f"تم حذف القالب `{name}` نهائياً من حسابك.",
+                color=discord.Color.green(),
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.followup.send("❌ تعذر حذف القالب، يرجى المحاولة لاحقاً.", ephemeral=True)
+
+    @template_delete.autocomplete("name")
+    async def template_delete_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete template names for deletion."""
+        if not interaction.guild:
+            return []
+        try:
+            templates = await self.bot.db.get_user_templates(interaction.user.id, interaction.guild.id)
+            choices = []
+            for t in templates:
+                t_name = t.get("name", "")
+                if current.lower() in t_name.lower():
+                    choices.append(app_commands.Choice(name=t_name[:100], value=t_name))
+            return choices[:25]
+        except Exception:
+            return []
 
 
 async def setup(bot: commands.Bot) -> None:

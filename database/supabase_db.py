@@ -318,6 +318,7 @@ class SupabaseDatabase:
         guild_id: int | None = None,
         language: str = "en",
         image_url: str | None = None,
+        tags: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """Creates a new PENDING ad submission in Supabase."""
         client = await self.get_client()
@@ -335,6 +336,8 @@ class SupabaseDatabase:
         }
         if image_url:
             payload["image_url"] = image_url
+        if tags:
+            payload["tags"] = tags
 
         try:
             try:
@@ -342,6 +345,10 @@ class SupabaseDatabase:
             except Exception as insert_err:
                 err_str = str(insert_err).lower()
                 modified = False
+                if "tags" in err_str:
+                    logger.warning("Supabase submissions table missing 'tags' column. Falling back without it.")
+                    payload.pop("tags", None)
+                    modified = True
                 if "image_url" in err_str:
                     logger.warning("Supabase submissions table missing 'image_url' column. Falling back without it.")
                     payload.pop("image_url", None)

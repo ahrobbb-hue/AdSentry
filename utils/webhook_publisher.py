@@ -129,6 +129,7 @@ async def publish_ad_via_webhook(
     image_url: str | None = None,
     reviewer_id: int | None = None,
     submission_id: int | None = None,
+    tags: list[str] | None = None,
 ) -> tuple[discord.WebhookMessage, discord.Thread | None, str]:
     """
     Publishes a premium, modern advertisement card via webhook disguised as the submitter.
@@ -175,6 +176,14 @@ async def publish_ad_via_webhook(
         value=f"`{badge_label}`",
         inline=True,
     )
+
+    if tags:
+        tag_str = " ".join(f"`#{t.lstrip('#')}`" for t in tags[:5])
+        embed.add_field(
+            name="🔖 الوسوم | Tags",
+            value=tag_str,
+            inline=True,
+        )
 
     if user_id:
         embed.add_field(

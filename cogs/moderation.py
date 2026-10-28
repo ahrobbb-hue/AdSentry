@@ -74,7 +74,7 @@ def is_staff(user: discord.Member | discord.User) -> bool:
 class StaffReviewView(discord.ui.View):
     """Interactive review buttons attached to new submission review cards."""
 
-    def __init__(self, submission_id: int) -> None:
+    def __init__(self, submission_id: int, can_request_changes: bool = True) -> None:
         super().__init__(timeout=None)
         self.submission_id = submission_id
 
@@ -86,14 +86,15 @@ class StaffReviewView(discord.ui.View):
                 custom_id=f"adsentry:approve:{submission_id}",
             )
         )
-        self.add_item(
-            discord.ui.Button(
-                label="Request Changes",
-                style=discord.ButtonStyle.secondary,
-                emoji="✏️",
-                custom_id=f"adsentry:request_changes:{submission_id}",
+        if can_request_changes:
+            self.add_item(
+                discord.ui.Button(
+                    label="Request Changes",
+                    style=discord.ButtonStyle.secondary,
+                    emoji="✏️",
+                    custom_id=f"adsentry:request_changes:{submission_id}",
+                )
             )
-        )
         self.add_item(
             discord.ui.Button(
                 label="Reject",
@@ -274,6 +275,168 @@ class RejectionModal(discord.ui.Modal):
         )
 
 
+class ReviewRatingView(discord.ui.View):
+    """Interactive rating stars attached to approval DMs for advertisers to rate staff review."""
+
+    def __init__(self, submission_id: int, reviewer_id: int, guild_id: int) -> None:
+        super().__init__(timeout=None)
+        self.submission_id = submission_id
+        self.reviewer_id = reviewer_id
+        self.guild_id = guild_id
+
+        for stars in range(1, 6):
+            btn = discord.ui.Button(
+                label=f"{stars} ⭐",
+                style=discord.ButtonStyle.secondary if stars < 4 else discord.ButtonStyle.primary,
+                custom_id=f"adsentry:rate:{submission_id}:{stars}",
+            )
+            self.add_item(btn)
+
+
+class ChangeRequestModal(discord.ui.Modal):
+    """Modal prompting the staff member for specific revision requests on a submission."""
+
+    def __init__(self, cog: ModerationCog, submission_id: int, review_message: discord.Message) -> None:
+        super().__init__(title=f"Request Changes #{submission_id}"[:45])
+        self.cog = cog
+        self.submission_id = submission_id
+        self.review_message = review_message
+
+        self.notes_input = discord.ui.TextInput(
+            label="ملاحظات التعديل المطلوب | Revision Notes",
+            style=discord.TextStyle.paragraph,
+            placeholder="اكتب النقاط التي يجب على المعلن تعديلها (مثل: تصحيح الرابط، إزالة ألفاظ، تقليل الأسطر)...",
+            min_length=5,
+            max_length=800,
+            required=True,
+        )
+        self.add_item(self.notes_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        notes = self.notes_input.value.strip()
+        await self.cog.complete_change_request(
+            interaction=interaction,
+            submission_id=self.submission_id,
+            notes=notes,
+            review_message=self.review_message,
+        )
+
+
+class UserEditSubmissionView(discord.ui.View):
+    """DM view sent to advertiser with an 'Edit Ad' button."""
+
+    def __init__(self, submission_id: int) -> None:
+        super().__init__(timeout=None)
+        self.add_item(
+            discord.ui.Button(
+                label="تعديل الإعلان | Edit Ad",
+                style=discord.ButtonStyle.primary,
+                emoji="✏️",
+                custom_id=f"adsentry:user_edit:{submission_id}",
+            )
+        )
+
+
+class UserEditSubmissionModal(discord.ui.Modal):
+    """Modal presented to advertiser in DM to revise their pending submission."""
+
+    def __init__(self, bot: commands.Bot, submission_id: int, current_title: str, current_content: str, current_tags: list[str] | None = None) -> None:
+        super().__init__(title=f"تعديل الإعلان #{submission_id}"[:45])
+        self.bot = bot
+        self.submission_id = submission_id
+
+        self.title_input = discord.ui.TextInput(
+            label="عنوان الإعلان | Headline",
+            default=current_title,
+            min_length=2,
+            max_length=100,
+            required=True,
+        )
+        self.add_item(self.title_input)
+
+        self.content_input = discord.ui.TextInput(
+            label="المحتوى | Content",
+            style=discord.TextStyle.paragraph,
+            default=current_content,
+            min_length=10,
+            max_length=1800,
+            required=True,
+        )
+        self.add_item(self.content_input)
+
+        tags_str = " ".join(f"#{t.lstrip('#')}" for t in (current_tags or []))
+        self.tags_input = discord.ui.TextInput(
+            label="الوسوم | Tags (اختياري)",
+            placeholder="مثال: #خدمات #برمجة #عرض",
+            default=tags_str,
+            required=False,
+            max_length=120,
+        )
+        self.add_item(self.tags_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        new_title = self.title_input.value.strip()
+        new_content = self.content_input.value.strip()
+        raw_tags = self.tags_input.value.strip()
+        tags_list = [t.lstrip("#").strip() for t in raw_tags.split() if t.strip()] if raw_tags else []
+
+        try:
+            # Update database
+            res = await self.bot.db.update_submission_content(
+                submission_id=self.submission_id,
+                title=new_title,
+                content=new_content,
+                tags=tags_list,
+            )
+            if not res:
+                await interaction.followup.send("⚠️ تعذر تحديث الإعلان أو أن الإعلان لم يعد معلقاً.", ephemeral=True)
+                return
+
+            # Refresh review card in staff channel if review_message_id is known
+            sub = await self.bot.db.get_submission(self.submission_id)
+            if sub and sub.get("review_message_id"):
+                cfg = await self.bot.db.get_guild_config(sub.get("guild_id"))
+                if cfg and cfg.get("staff_review_channel_id"):
+                    ch = self.bot.get_channel(cfg["staff_review_channel_id"])
+                    if ch and isinstance(ch, discord.TextChannel):
+                        try:
+                            rev_msg = await ch.fetch_message(sub["review_message_id"])
+                            embed = rev_msg.embeds[0] if rev_msg.embeds else discord.Embed()
+                            new_embed = embed.copy()
+                            new_embed.title = f"📥 New Ad Submission #{self.submission_id} (✏️ محدث)"
+                            new_embed.description = f"**Headline:** {new_title}\n\n**Category:** {sub.get('category')}\n**Language:** {sub.get('language')}\n\n```{new_content}```"
+                            
+                            # Add revision notice field
+                            curr_reqs = sub.get("change_requests", 0)
+                            max_reqs = sub.get("max_change_requests", 3)
+                            new_embed.add_field(
+                                name="🔄 تحديث المعلن | Advertiser Revision",
+                                value=f"قام المعلن بإجراء التعديل رقم (`{curr_reqs}/{max_reqs}`) وهو جاهز للمراجعة مجدداً.",
+                                inline=False,
+                            )
+                            # If attempts exhausted, hide change request button
+                            view = StaffReviewView(self.submission_id, can_request_changes=(curr_reqs < max_reqs))
+                            await rev_msg.edit(embed=new_embed, view=view)
+                        except Exception as ex:
+                            logger.warning(f"Could not update review message upon user edit: {ex}")
+
+            embed = discord.Embed(
+                title="✅ تم تحديث إعلانك وإرساله للمراجعة!",
+                description=(
+                    "تم حفظ التعديلات وإشعار المشرفين تلقائياً في السيرفر.\n"
+                    "سيتم مراجعة طلبك وإخبارك بالنتيجة عبر الخاص فوراً."
+                ),
+                color=discord.Color.green(),
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error saving user edit for #{self.submission_id}: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ حدث خطأ أثناء حفظ التعديل: `{e}`", ephemeral=True)
+
+
 class ModerationCog(commands.Cog, name="Moderation"):
     """Cog handling review interactions, webhook posting, and auto-expiry sweeper."""
 
@@ -300,17 +463,91 @@ class ModerationCog(commands.Cog, name="Moderation"):
             return
 
         parts = custom_id.split(":")
-        if len(parts) != 3:
+        if len(parts) < 3:
             return
 
-        _, action, raw_id = parts
+        _, action, raw_id = parts[:3]
         if not raw_id.isdigit():
             return
 
         submission_id = int(raw_id)
 
+        # ---------------------------------------------------------
+        # Handle Advertiser Actions (Rating & User Editing) - No Staff Check
+        # ---------------------------------------------------------
+        if action == "rate":
+            stars = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 5
+            try:
+                sub = await self.bot.db.get_submission(submission_id)
+                if not sub:
+                    await interaction.response.send_message("❌ لم يتم العثور على الإعلان.", ephemeral=True)
+                    return
+
+                reviewer_id = sub.get("reviewed_by")
+                guild_id = sub.get("guild_id") or (interaction.guild.id if interaction.guild else 0)
+                if not reviewer_id:
+                    await interaction.response.send_message("❌ لم يتم تسجيل المشرف الذي راجع الإعلان.", ephemeral=True)
+                    return
+
+                await self.bot.db.save_review_rating(
+                    submission_id=submission_id,
+                    guild_id=guild_id,
+                    user_id=interaction.user.id,
+                    reviewer_id=reviewer_id,
+                    rating=stars,
+                )
+
+                # Disable buttons in DM message
+                try:
+                    if interaction.message:
+                        await interaction.message.edit(view=None)
+                except Exception:
+                    pass
+
+                await interaction.response.send_message(
+                    f"⭐ شكرًا لك! تم تسجيل تقييمك بنجاح ({stars}/5) للمشرف الذي راجع إعلانك.",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                logger.error(f"Error handling rate interaction for #{submission_id}: {e}", exc_info=True)
+                await interaction.response.send_message("❌ حدث خطأ أثناء تسجيل تقييمك.", ephemeral=True)
+            return
+
+        if action == "user_edit":
+            try:
+                sub = await self.bot.db.get_submission(submission_id)
+                if not sub or sub.get("status") != "PENDING":
+                    await interaction.response.send_message("⚠️ هذا الإعلان لم يعد معلقاً أو تمت معالجته بالفعل.", ephemeral=True)
+                    return
+
+                if interaction.user.id != sub.get("user_id"):
+                    await interaction.response.send_message("⛔ لا يمكنك تعديل إعلان يخص مستخدم آخر.", ephemeral=True)
+                    return
+
+                curr_reqs = sub.get("change_requests", 0)
+                max_reqs = sub.get("max_change_requests", 3)
+                if curr_reqs >= max_reqs:
+                    await interaction.response.send_message(
+                        f"⛔ لقد استنفدت الحد الأقصى لمحاولات التعديل ({max_reqs}/{max_reqs}). يرجى انتظار قرار الإدارة النهائي.",
+                        ephemeral=True,
+                    )
+                    return
+
+                modal = UserEditSubmissionModal(
+                    bot=self.bot,
+                    submission_id=submission_id,
+                    current_title=sub.get("title") or "",
+                    current_content=sub.get("content") or "",
+                    current_tags=sub.get("tags") or [],
+                )
+                await interaction.response.send_modal(modal)
+            except Exception as e:
+                logger.error(f"Error launching user edit modal for #{submission_id}: {e}", exc_info=True)
+                await interaction.response.send_message("❌ حدث خطأ أثناء فتح نموذج التعديل.", ephemeral=True)
+            return
+
         try:
-            # Enforce staff authorization
+            # Enforce staff authorization for staff actions
             if not is_staff(interaction.user):
                 embed = discord.Embed(
                     title="⛔ Access Denied",
@@ -353,6 +590,19 @@ class ModerationCog(commands.Cog, name="Moderation"):
                     color=discord.Color.blue(),
                 )
                 await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+            elif action == "request_changes":
+                curr_reqs = submission.get("change_requests", 0)
+                max_reqs = submission.get("max_change_requests", 3)
+                if curr_reqs >= max_reqs:
+                    await interaction.response.send_message(
+                        f"⚠️ هذا الإعلان وصل للحد الأقصى لطلبات التعديل ({max_reqs}/{max_reqs}). يرجى اتخاذ قرار القبول أو الرفض.",
+                        ephemeral=True,
+                    )
+                    return
+
+                modal = ChangeRequestModal(self, submission_id, interaction.message)
+                await interaction.response.send_modal(modal)
 
             elif action == "reject":
                 # Present rejection reasons view (instant response, zero timeout risk)
@@ -443,6 +693,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
                 image_url=submission.get("image_url"),
                 reviewer_id=interaction.user.id,
                 submission_id=submission_id,
+                tags=submission.get("tags"),
             )
         except Exception as e:
             logger.error(f"Failed to publish ad #{submission_id} via webhook: {e}", exc_info=True)
@@ -517,8 +768,13 @@ class ModerationCog(commands.Cog, name="Moderation"):
                         ),
                         color=discord.Color.green(),
                     )
-                    dm_embed.set_footer(text="AdSentry Notification Service")
-                await user.send(embed=dm_embed)
+                    dm_embed.set_footer(text="AdSentry Notification Service • Rate your reviewer below")
+                rating_view = ReviewRatingView(
+                    submission_id=submission_id,
+                    reviewer_id=interaction.user.id,
+                    guild_id=guild_id or 0,
+                )
+                await user.send(embed=dm_embed, view=rating_view)
         except discord.Forbidden:
             logger.info(f"Could not send DM to User {submission['user_id']} (DMs closed).")
         except Exception as e:
@@ -644,6 +900,99 @@ class ModerationCog(commands.Cog, name="Moderation"):
         )
 
     # -------------------------------------------------------------
+    # 3.1. Change Request Flow Execution
+    # -------------------------------------------------------------
+
+    async def complete_change_request(
+        self,
+        interaction: discord.Interaction,
+        submission_id: int,
+        notes: str,
+        review_message: discord.Message,
+    ) -> None:
+        """Records a change request, increments counter, notifies user with edit button, updates review card."""
+        submission = await self.bot.db.get_submission(submission_id)
+        if not submission or submission.get("status") != "PENDING":
+            await interaction.followup.send("⚠️ This submission is no longer pending review.", ephemeral=True)
+            return
+
+        try:
+            updated_sub = await self.bot.db.request_changes(
+                submission_id=submission_id,
+                reviewer_id=interaction.user.id,
+                note=notes,
+            )
+            if not updated_sub:
+                await interaction.followup.send("⚠️ تم استنفاد الحد الأقصى لمحاولات التعديل لهذا الإعلان.", ephemeral=True)
+                return
+
+            req_num = updated_sub.get("change_requests", 1)
+            max_reqs = updated_sub.get("max_change_requests", 3)
+            remaining = max(0, max_reqs - req_num)
+
+            # Send DM with Edit button to submitter
+            try:
+                user = await self.bot.fetch_user(submission["user_id"])
+                if user:
+                    is_arabic = (submission.get("language") == "ar") or any('\u0600' <= c <= '\u06FF' for c in (submission.get("category") or ""))
+                    if is_arabic:
+                        dm_embed = discord.Embed(
+                            title="✏️ طلب تعديل على إعلانك من إدارة السيرفر",
+                            description=(
+                                f"قام طاقم الإدارة بمراجعة إعلانك **{submission.get('title')}** وطلب إجراء بعض التعديلات قبل اعتماده:\n\n"
+                                f"📝 **الملاحظات والمطلوب تعديله:**\n> {notes}\n\n"
+                                f"⚠️ **المحاولات المتبقية:** لديك `{remaining}` محاولة متبقية لتعديل هذا الإعلان (من أصل {max_reqs}).\n"
+                                "اضغط على الزر أدناه لتعديل العنوان والمحتوى فوراً."
+                            ),
+                            color=discord.Color.gold(),
+                        )
+                        dm_embed.set_footer(text="AdSentry Moderation • طلب تعديل")
+                    else:
+                        dm_embed = discord.Embed(
+                            title="✏️ Revision Requested for Your Advertisement",
+                            description=(
+                                f"Staff reviewed your submission **{submission.get('title')}** and requested revisions before approval:\n\n"
+                                f"📝 **Reviewer Notes:**\n> {notes}\n\n"
+                                f"⚠️ **Remaining Attempts:** You have `{remaining}` attempt(s) remaining (out of {max_reqs}).\n"
+                                "Click the button below to edit your title and content now."
+                            ),
+                            color=discord.Color.gold(),
+                        )
+                        dm_embed.set_footer(text="AdSentry Moderation • Change Request")
+
+                    edit_view = UserEditSubmissionView(submission_id)
+                    await user.send(embed=dm_embed, view=edit_view)
+            except discord.Forbidden:
+                logger.info(f"Could not send change request DM to User {submission['user_id']} (DMs closed).")
+            except Exception as e:
+                logger.warning(f"Error sending change request DM: {e}")
+
+            # Update staff review card
+            try:
+                old_embed = review_message.embeds[0] if review_message.embeds else discord.Embed()
+                updated_embed = old_embed.copy()
+                updated_embed.color = discord.Color.gold()
+                updated_embed.title = f"📥 Ad Submission #{submission_id} [✏️ طلب تعديل ({req_num}/{max_reqs})]"
+                updated_embed.add_field(
+                    name=f"✏️ طلب تعديل بواسطة {interaction.user.display_name}",
+                    value=f"**الملاحظات:** {notes}\n**المحاولات:** `{req_num}/{max_reqs}`",
+                    inline=False,
+                )
+                # Keep buttons available for staff if they still have attempts
+                view = StaffReviewView(submission_id, can_request_changes=(req_num < max_reqs))
+                await review_message.edit(embed=updated_embed, view=view)
+            except Exception as e:
+                logger.warning(f"Failed to update review message after change request: {e}")
+
+            await interaction.followup.send(
+                f"✅ تم إرسال طلب التعديل رقم ({req_num}/{max_reqs}) لصاحب الإعلان بنجاح في الخاص مع زر التعديل.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            logger.error(f"Error completing change request for #{submission_id}: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ حدث خطأ أثناء إرسال طلب التعديل: `{e}`", ephemeral=True)
+
+    # -------------------------------------------------------------
     # 4. Background Expiry Sweeper Task
     # -------------------------------------------------------------
 
@@ -695,6 +1044,55 @@ class ModerationCog(commands.Cog, name="Moderation"):
 
                 # Mark expired in Supabase
                 await self.bot.db.mark_post_expired(post_id)
+
+            # ---------------------------------------------------------
+            # 4.1. Process 24-Hour Expiry Alerts
+            # ---------------------------------------------------------
+            try:
+                alert_posts = await self.bot.db.get_posts_needing_expiry_alert(hours_before=24)
+                for ap in alert_posts:
+                    ap_id = ap["id"]
+                    sub_info = ap.get("submissions") or {}
+                    user_id = sub_info.get("user_id")
+                    title = sub_info.get("title") or "إعلانك"
+                    expires_at_str = ap.get("expires_at")
+
+                    if user_id and expires_at_str:
+                        try:
+                            user = await self.bot.fetch_user(user_id)
+                            if user:
+                                dt = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
+                                ts = int(dt.timestamp())
+                                alert_embed = discord.Embed(
+                                    title="⏰ تنبيه: اقتراب موعد انتهاء إعلانك | Ad Expiring Soon",
+                                    description=(
+                                        f"نود تذكيرك بأن إعلانك **{title}** سينتهي خلال أقل من 24 ساعة!\n\n"
+                                        f"⏳ **موعد الانتهاء:** <t:{ts}:F> (<t:{ts}:R>)\n\n"
+                                        "بعد انتهاء الإعلان، ستتمكن من تقديم إعلان جديد مجدداً. شكراً لاستخدامك AdSentry!"
+                                    ),
+                                    color=discord.Color.gold(),
+                                )
+                                alert_embed.set_footer(text="AdSentry Expiry Alert System")
+                                await user.send(embed=alert_embed)
+                        except discord.Forbidden:
+                            pass
+                        except Exception as dm_err:
+                            logger.warning(f"Failed to send expiry alert DM to {user_id}: {dm_err}")
+
+                    await self.bot.db.mark_expiry_alert_sent(ap_id)
+            except Exception as alert_ex:
+                logger.error(f"Error processing expiry alerts: {alert_ex}", exc_info=True)
+
+            # ---------------------------------------------------------
+            # 4.2. Process Expired Pins
+            # ---------------------------------------------------------
+            try:
+                expired_pins = await self.bot.db.get_expired_pins()
+                for pin in expired_pins:
+                    await self.bot.db.unpin_ad(pin["id"])
+                    logger.info(f"Automatically unpinned ad #{pin['id']} after pin duration elapsed.")
+            except Exception as pin_ex:
+                logger.error(f"Error processing expired pins: {pin_ex}", exc_info=True)
 
         except Exception as e:
             logger.error(f"Error encountered during expiry sweeper loop: {e}", exc_info=True)
@@ -842,7 +1240,158 @@ class ModerationCog(commands.Cog, name="Moderation"):
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+    # -------------------------------------------------------------
+    # 6. Pinned Ads Management Slash Commands (Staff / Admin)
+    # -------------------------------------------------------------
+
+    pin_group = app_commands.Group(
+        name="ad-pin",
+        description="Pin or unpin featured announcements (Staff/Admin only)",
+        default_permissions=discord.Permissions(manage_messages=True),
+    )
+
+    @pin_group.command(
+        name="add",
+        description="Pin an active ad announcement to mark it as featured",
+    )
+    @app_commands.describe(
+        message_id="The Discord message ID of the published advertisement",
+        hours="How many hours it should stay pinned (leave empty for permanent pin)",
+    )
+    async def pin_active_ad(
+        self,
+        interaction: discord.Interaction,
+        message_id: str,
+        hours: int | None = None,
+    ) -> None:
+        """Pins an active advertisement post."""
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("❌ هذا الأمر مخصص للمشرفين فقط.", ephemeral=True)
+            return
+
+        if not message_id.isdigit():
+            await interaction.response.send_message("❌ يرجى إدخال Message ID صحيح.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            client = await self.bot.db.get_client()
+            res = await client.table("active_posts").select("id, channel_id, message_id").eq("message_id", int(message_id)).limit(1).execute()
+            if not res.data:
+                await interaction.followup.send("❌ لم يتم العثور على إعلان منشور بهذا المعرف (Message ID).", ephemeral=True)
+                return
+
+            post = res.data[0]
+            await self.bot.db.pin_ad(post_id=post["id"], staff_id=interaction.user.id, duration_hours=hours)
+
+            # Try to Discord pin the message in channel
+            channel = self.bot.get_channel(post["channel_id"])
+            if channel and isinstance(channel, discord.TextChannel):
+                try:
+                    msg = await channel.fetch_message(int(message_id))
+                    await msg.pin(reason=f"AdSentry Featured Pin by {interaction.user}")
+                except Exception as ex:
+                    logger.warning(f"Could not Discord pin message {message_id}: {ex}")
+
+            duration_str = f"لمدة `{hours}` ساعة" if hours else "بشكل دائم"
+            await interaction.followup.send(
+                f"📌 تم تثبيت الإعلان بنجاح {duration_str}!",
+                ephemeral=True,
+            )
+        except Exception as e:
+            logger.error(f"Error pinning ad {message_id}: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ حدث خطأ أثناء تثبيت الإعلان: `{e}`", ephemeral=True)
+
+    @pin_group.command(
+        name="remove",
+        description="Unpin a featured advertisement announcement",
+    )
+    @app_commands.describe(
+        message_id="The Discord message ID of the published advertisement",
+    )
+    async def unpin_active_ad(
+        self,
+        interaction: discord.Interaction,
+        message_id: str,
+    ) -> None:
+        """Unpins an active advertisement post."""
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("❌ هذا الأمر مخصص للمشرفين فقط.", ephemeral=True)
+            return
+
+        if not message_id.isdigit():
+            await interaction.response.send_message("❌ يرجى إدخال Message ID صحيح.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            client = await self.bot.db.get_client()
+            res = await client.table("active_posts").select("id, channel_id, message_id").eq("message_id", int(message_id)).limit(1).execute()
+            if not res.data:
+                await interaction.followup.send("❌ لم يتم العثور على إعلان منشور بهذا المعرف.", ephemeral=True)
+                return
+
+            post = res.data[0]
+            await self.bot.db.unpin_ad(post_id=post["id"])
+
+            channel = self.bot.get_channel(post["channel_id"])
+            if channel and isinstance(channel, discord.TextChannel):
+                try:
+                    msg = await channel.fetch_message(int(message_id))
+                    await msg.unpin(reason=f"AdSentry Unpin by {interaction.user}")
+                except Exception:
+                    pass
+
+            await interaction.followup.send("📌 تم إلغاء تثبيت الإعلان بنجاح.", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error unpinning ad {message_id}: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ حدث خطأ أثناء إلغاء التثبيت: `{e}`", ephemeral=True)
+
+    # -------------------------------------------------------------
+    # 7. Reviewer Stats Command
+    # -------------------------------------------------------------
+
+    @app_commands.command(
+        name="reviewer-stats",
+        description="⭐ عرض إحصائيات وتقييمات المراجعين في السيرفر | View reviewer ratings & stats",
+    )
+    @app_commands.describe(
+        reviewer="المشرف المراد عرض تقييماته (اتركه فارغاً لعرض تقييماتك)",
+    )
+    async def reviewer_stats(
+        self,
+        interaction: discord.Interaction,
+        reviewer: discord.Member | None = None,
+    ) -> None:
+        """Shows reviewer rating stats."""
+        target = reviewer or interaction.user
+        if not interaction.guild:
+            await interaction.response.send_message("❌ هذا الأمر داخل السيرفرات فقط.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        stats = await self.bot.db.get_reviewer_stats(target.id, interaction.guild.id)
+        avg = stats.get("avg_rating", 0.0)
+        cnt = stats.get("review_count", 0)
+
+        stars_visual = "⭐" * int(round(avg)) if avg > 0 else "لا توجد تقييمات بعد"
+        embed = discord.Embed(
+            title=f"⭐ تقييم المشرف: {target.display_name}",
+            description=(
+                f"👤 **المشرف:** {target.mention}\n\n"
+                f"📊 **متوسط التقييم:** `{avg}/5.0`\n"
+                f"✨ **النجوم:** {stars_visual}\n"
+                f"📝 **عدد التقييمات المستلمة:** `{cnt}` تقييم"
+            ),
+            color=discord.Color.gold(),
+        )
+        if target.display_avatar:
+            embed.set_thumbnail(url=target.display_avatar.url)
+        embed.set_footer(text="AdSentry Staff Quality System")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
 
 async def setup(bot: commands.Bot) -> None:
     """Extension entry point for loading the Moderation cog."""
     await bot.add_cog(ModerationCog(bot))
+

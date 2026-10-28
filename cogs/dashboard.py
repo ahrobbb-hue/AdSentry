@@ -14,7 +14,7 @@ from cogs.recruitment import (
     RecruitmentRoleSelectView,
     close_announcement,
 )
-from cogs.eventhub import RegisterEventView
+from cogs.eventhub import RegisterEventView, build_event_embed
 
 logger = logging.getLogger("AdSentry.Dashboard")
 
@@ -234,9 +234,11 @@ class EventCreateModal(discord.ui.Modal, title="إنشاء فعالية"):
     capacity = discord.ui.TextInput(label="عدد المقاعد", default="25", max_length=3)
     reminder = discord.ui.TextInput(label="التذكير قبل الموعد بالساعات (0 لتعطيله)", default="24", max_length=3)
 
-    def __init__(self, cog: "DashboardCog") -> None:
+    def __init__(self, cog: "DashboardCog", event_channel: discord.TextChannel, admin_channel: discord.TextChannel | None = None) -> None:
         super().__init__()
         self.cog = cog
+        self.event_channel = event_channel
+        self.admin_channel = admin_channel
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not _staff(interaction) or not interaction.guild:
@@ -254,28 +256,129 @@ class EventCreateModal(discord.ui.Modal, title="إنشاء فعالية"):
         client = None
         event_id: int | None = None
         try:
-            config = await self.cog.bot.db.get_guild_config(interaction.guild.id)
-            channel = interaction.guild.get_channel(int((config or {}).get("announcement_channel_id") or 0))
-            if not isinstance(channel, discord.TextChannel):
-                await interaction.followup.send("اضبط قناة الإعلان أولًا عبر `/ad-setup`.", ephemeral=True); return
             client = await self.cog.bot.db.get_client()
             reminder_at = (start - timedelta(hours=reminder_hours)).isoformat() if reminder_hours else None
-            result = await client.table("events").insert({"guild_id": interaction.guild.id, "created_by": interaction.user.id, "title": self.title_input.value.strip(), "description": self.description.value.strip(), "channel_id": channel.id, "starts_at": start.isoformat(), "capacity": capacity, "status": "OPEN", "reminder_at": reminder_at}).execute()
+            result = await client.table("events").insert({
+                "guild_id": interaction.guild.id,
+                "created_by": interaction.user.id,
+                "title": self.title_input.value.strip(),
+                "description": self.description.value.strip(),
+                "channel_id": self.event_channel.id,
+                "admin_channel_id": self.admin_channel.id if self.admin_channel else None,
+                "starts_at": start.isoformat(),
+                "capacity": capacity,
+                "status": "OPEN",
+                "reminder_at": reminder_at,
+            }).execute()
             event = result.data[0]
             event_id = int(event["id"])
-            embed = discord.Embed(title=self.title_input.value, description=self.description.value, color=discord.Color.blurple())
-            embed.add_field(name="الموعد", value=f"<t:{int(start.timestamp())}:F> · <t:{int(start.timestamp())}:R>")
-            embed.add_field(name="المقاعد", value=f"0 / {capacity}")
-            message = await channel.send(embed=embed, view=RegisterEventView(event_id), allowed_mentions=discord.AllowedMentions.none())
+            embed = build_event_embed(
+                self.title_input.value.strip(),
+                self.description.value.strip(),
+                start,
+                capacity,
+                event_id=event_id,
+                organizer=interaction.user,
+            )
+            message = await self.event_channel.send(
+                embed=embed,
+                view=RegisterEventView(event_id),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             self.cog.bot.add_view(RegisterEventView(event_id))
             await client.table("events").update({"announcement_message_id": message.id}).eq("id", event["id"]).execute()
-            await interaction.followup.send(f"تم إنشاء الفعالية #{event['id']} ونشرها في {channel.mention}.", ephemeral=True)
+            admin_note = f" · إشعارات الإدارة: {self.admin_channel.mention}" if self.admin_channel else ""
+            await interaction.followup.send(
+                f"✅  تم إنشاء الفعالية **#{event_id}** ونشرها في {self.event_channel.mention}{admin_note}.",
+                ephemeral=True,
+            )
         except Exception:
             logger.exception("Dashboard event creation failed")
             if event_id and client:
                 try: await client.table("events").update({"status": "CANCELLED"}).eq("id", event_id).execute()
                 except Exception: logger.exception("Could not roll back incomplete dashboard event %s", event_id)
-            await interaction.followup.send("تعذر إنشاء الفعالية. تحقق من ترحيل EventHub وصلاحيات قناة الإعلان.", ephemeral=True)
+            await interaction.followup.send("تعذر إنشاء الفعالية. تحقق من ترحيل EventHub وصلاحيات القناة.", ephemeral=True)
+
+
+class EventChannelPickerView(discord.ui.View):
+    """Step 1: pick the public event channel. Step 2 (optional): pick admin channel."""
+
+    def __init__(self, cog: "DashboardCog") -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.event_channel: discord.TextChannel | None = None
+        self.admin_channel: discord.TextChannel | None = None
+
+        # Public event channel picker
+        event_picker = discord.ui.ChannelSelect(
+            channel_types=[discord.ChannelType.text],
+            placeholder="📢  اختر القناة العامة لنشر الفعالية",
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+        event_picker.callback = self._pick_event_channel  # type: ignore[method-assign]
+        self.add_item(event_picker)
+
+        # Admin/private notification channel picker (optional)
+        admin_picker = discord.ui.ChannelSelect(
+            channel_types=[discord.ChannelType.text],
+            placeholder="🔔  اختر قناة الإشعارات الإدارية (اختياري)",
+            min_values=0,
+            max_values=1,
+            row=1,
+        )
+        admin_picker.callback = self._pick_admin_channel  # type: ignore[method-assign]
+        self.add_item(admin_picker)
+
+    async def _pick_event_channel(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("استخدم هذا داخل السيرفر.", ephemeral=True); return
+        ch_id = int(interaction.data["values"][0])
+        channel = interaction.guild.get_channel(ch_id)
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("اختر قناة نصية.", ephemeral=True); return
+        if not channel.permissions_for(interaction.guild.me).send_messages:
+            await interaction.response.send_message(f"البوت لا يستطيع الإرسال في {channel.mention}.", ephemeral=True); return
+        self.event_channel = channel
+        await interaction.response.edit_message(
+            content=self._summary(),
+            view=self,
+        )
+
+    async def _pick_admin_channel(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("استخدم هذا داخل السيرفر.", ephemeral=True); return
+        values = interaction.data.get("values", [])
+        if not values:
+            self.admin_channel = None
+            await interaction.response.edit_message(content=self._summary(), view=self)
+            return
+        ch_id = int(values[0])
+        channel = interaction.guild.get_channel(ch_id)
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("اختر قناة نصية.", ephemeral=True); return
+        if not channel.permissions_for(interaction.guild.me).send_messages:
+            await interaction.response.send_message(f"البوت لا يستطيع الإرسال في {channel.mention}.", ephemeral=True); return
+        self.admin_channel = channel
+        await interaction.response.edit_message(content=self._summary(), view=self)
+
+    def _summary(self) -> str:
+        ev = self.event_channel.mention if self.event_channel else "لم تُحدَّد"
+        adm = self.admin_channel.mention if self.admin_channel else "بدون إشعارات إدارية"
+        return (
+            f"📢  **قناة الفعالية:** {ev}\n"
+            f"🔔  **قناة الإشعارات الإدارية:** {adm}\n\n"
+            "اختر القنوات ثم اضغط **التالي** لملء تفاصيل الفعالية."
+        )
+
+    @discord.ui.button(label="التالي ← تفاصيل الفعالية", style=discord.ButtonStyle.success, row=2)
+    async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.event_channel:
+            await interaction.response.send_message("اختر قناة الفعالية العامة أولًا.", ephemeral=True); return
+        await interaction.response.send_modal(
+            EventCreateModal(self.cog, self.event_channel, self.admin_channel)
+        )
 
 
 class EventAttendanceModal(discord.ui.Modal, title="تسجيل الحضور"):
@@ -337,7 +440,11 @@ class EventDashboardView(discord.ui.View):
     @discord.ui.button(label="إنشاء فعالية", emoji="✨", style=discord.ButtonStyle.success)
     async def create(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction): await interaction.response.send_message("للإدارة فقط.", ephemeral=True); return
-        await interaction.response.send_modal(EventCreateModal(self.cog))
+        await interaction.response.send_message(
+            "**الخطوة 1:** اختر قناة نشر الفعالية وقناة الإشعارات الإدارية (اختيارية)، ثم اضغط **التالي**.",
+            view=EventChannelPickerView(self.cog),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="قائمة الفعاليات", emoji="📋", style=discord.ButtonStyle.primary)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
