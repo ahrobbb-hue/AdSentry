@@ -23,6 +23,10 @@ class SupabaseDatabase:
         self.key = (key or Config.get_supabase_key()).strip()
         self.client: AsyncClient | None = None
         self._guild_configs_cache: dict[int, dict[str, Any]] = {}
+        # Track when each guild config was last fetched for TTL-based cache invalidation
+        self._guild_configs_fetched_at: dict[int, datetime] = {}
+        # Cache TTL: re-fetch from DB after 5 minutes to pick up external changes
+        _GUILD_CONFIG_TTL_SECONDS = 300
 
     async def connect(self) -> None:
         """Initializes the Supabase asynchronous client."""
@@ -171,10 +175,17 @@ class SupabaseDatabase:
     async def get_guild_config(self, guild_id: int) -> dict[str, Any] | None:
         """
         Retrieves the channel configuration for a guild.
-        Checks cache first, then fetches from Supabase.
+        Checks cache first (TTL: 5 minutes), then fetches from Supabase.
         Falls back to .env if unconfigured in database.
         """
-        if guild_id in self._guild_configs_cache:
+        CACHE_TTL = 300  # seconds
+        now = datetime.now(timezone.utc)
+        cached_at = self._guild_configs_fetched_at.get(guild_id)
+        if (
+            guild_id in self._guild_configs_cache
+            and cached_at is not None
+            and (now - cached_at).total_seconds() < CACHE_TTL
+        ):
             return self._guild_configs_cache[guild_id]
 
         client = await self.get_client()
@@ -183,9 +194,13 @@ class SupabaseDatabase:
             if response.data:
                 config = response.data[0]
                 self._guild_configs_cache[guild_id] = config
+                self._guild_configs_fetched_at[guild_id] = now
                 return config
         except Exception as e:
             logger.warning(f"Could not fetch server_configs for guild {guild_id}: {e}")
+            # Return stale cache on DB error rather than breaking
+            if guild_id in self._guild_configs_cache:
+                return self._guild_configs_cache[guild_id]
 
         # Fallback to .env values if set
         if Config.STAFF_REVIEW_CHANNEL_ID and Config.ANNOUNCEMENT_CHANNEL_ID:
@@ -219,12 +234,17 @@ class SupabaseDatabase:
 
         try:
             await client.table("server_configs").upsert(payload).execute()
-            self._guild_configs_cache[guild_id] = payload
+            # Always refresh the full row from DB to pick up any columns set by other means
+            refreshed = await client.table("server_configs").select("*").eq("guild_id", guild_id).limit(1).execute()
+            if refreshed.data:
+                self._guild_configs_cache[guild_id] = refreshed.data[0]
+            else:
+                self._guild_configs_cache[guild_id] = payload
             logger.info(
                 f"Configured guild {guild_id}: Announcement Channel={announcement_channel_id}, "
                 f"Review Channel={staff_review_channel_id}, Panel Message ID={panel_id}"
             )
-            return payload
+            return self._guild_configs_cache[guild_id]
         except Exception as e:
             logger.error(f"Failed to save server_configs for guild {guild_id}: {e}", exc_info=True)
             raise
@@ -729,14 +749,17 @@ class SupabaseDatabase:
             return []
 
     async def delete_active_post(self, post_id: int) -> bool:
-        """Deletes an active post record from the database (used when user self-deletes an ad)."""
+        """Marks an active post as expired (soft delete) so statistics are preserved.
+        Used when a user self-deletes their ad via /my-ads."""
         client = await self.get_client()
         try:
-            await client.table("active_posts").delete().eq("id", post_id).execute()
-            logger.info(f"Deleted active post #{post_id} from database.")
+            await client.table("active_posts").update({
+                "is_expired": True,
+            }).eq("id", post_id).execute()
+            logger.info(f"Soft-deleted (expired) active post #{post_id} from database.")
             return True
         except Exception as e:
-            logger.error(f"Error deleting active post #{post_id}: {e}", exc_info=True)
+            logger.error(f"Error soft-deleting active post #{post_id}: {e}", exc_info=True)
             return False
 
     # -------------------------------------------------------------
@@ -824,3 +847,342 @@ class SupabaseDatabase:
         except Exception as e:
             logger.error(f"Error getting interest count for post #{post_id}: {e}", exc_info=True)
             return 0
+
+    # -------------------------------------------------------------
+    # Templates Operations (NEW)
+    # -------------------------------------------------------------
+
+    async def save_template(
+        self,
+        user_id: int,
+        guild_id: int,
+        name: str,
+        category: str,
+        title: str | None,
+        content: str,
+        tags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Saves or updates an ad template for a user."""
+        client = await self.get_client()
+        payload = {
+            "user_id": user_id,
+            "guild_id": guild_id,
+            "name": name[:50],
+            "category": category,
+            "title": title,
+            "content": content,
+            "tags": tags or [],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            response = await client.table("ad_templates").upsert(payload).execute()
+            logger.info(f"Saved template '{name}' for user {user_id}")
+            return response.data[0] if response.data else payload
+        except Exception as e:
+            logger.error(f"Error saving template for user {user_id}: {e}", exc_info=True)
+            raise
+
+    async def get_user_templates(self, user_id: int, guild_id: int) -> list[dict[str, Any]]:
+        """Retrieves all templates for a specific user in a guild."""
+        client = await self.get_client()
+        try:
+            response = (
+                await client.table("ad_templates")
+                .select("*")
+                .eq("user_id", user_id)
+                .eq("guild_id", guild_id)
+                .order("updated_at", desc=True)
+                .execute()
+            )
+            return response.data or []
+        except Exception as e:
+            logger.error(f"Error fetching templates for user {user_id}: {e}", exc_info=True)
+            return []
+
+    async def get_template(self, template_id: int, user_id: int) -> dict[str, Any] | None:
+        """Retrieves a specific template by ID (with ownership check)."""
+        client = await self.get_client()
+        try:
+            response = (
+                await client.table("ad_templates")
+                .select("*")
+                .eq("id", template_id)
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+            return response.data[0] if response.data else None
+        except Exception as e:
+            logger.error(f"Error fetching template {template_id}: {e}", exc_info=True)
+            return None
+
+    async def delete_template(self, template_id: int, user_id: int) -> bool:
+        """Deletes a template (with ownership check)."""
+        client = await self.get_client()
+        try:
+            response = (
+                await client.table("ad_templates")
+                .delete()
+                .eq("id", template_id)
+                .eq("user_id", user_id)
+                .execute()
+            )
+            return bool(response.data)
+        except Exception as e:
+            logger.error(f"Error deleting template {template_id}: {e}", exc_info=True)
+            return False
+
+    # -------------------------------------------------------------
+    # Change Request Operations (NEW)
+    # -------------------------------------------------------------
+
+    async def request_changes(
+        self,
+        submission_id: int,
+        reviewer_id: int,
+        note: str,
+    ) -> dict[str, Any] | None:
+        """
+        Records a change request from a reviewer.
+        Increments change_requests counter and stores the note.
+        Returns updated submission or None if max attempts reached.
+        """
+        client = await self.get_client()
+        try:
+            # Get current submission
+            submission = await self.get_submission(submission_id)
+            if not submission:
+                return None
+
+            current_requests = submission.get("change_requests", 0)
+            max_requests = submission.get("max_change_requests", 3)
+
+            if current_requests >= max_requests:
+                logger.warning(f"Submission {submission_id} has reached max change requests ({max_requests})")
+                return None
+
+            # Increment counter and save note
+            new_count = current_requests + 1
+            update_payload = {
+                "change_requests": new_count,
+                "last_change_note": note[:1000],
+                "change_requested_by": reviewer_id,
+                "change_requested_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+            response = await client.table("submissions").update(update_payload).eq("id", submission_id).execute()
+
+            # Save to history table
+            await client.table("submission_change_history").insert({
+                "submission_id": submission_id,
+                "request_number": new_count,
+                "requested_by": reviewer_id,
+                "note": note[:1000],
+                "old_content": submission.get("content", ""),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+
+            logger.info(f"Change request #{new_count} recorded for submission {submission_id}")
+            return response.data[0] if response.data else None
+
+        except Exception as e:
+            logger.error(f"Error requesting changes for submission {submission_id}: {e}", exc_info=True)
+            raise
+
+    async def update_submission_content(
+        self,
+        submission_id: int,
+        title: str | None,
+        content: str,
+        tags: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Updates the content of a pending submission (for change requests)."""
+        client = await self.get_client()
+        try:
+            # Get current submission for history
+            submission = await self.get_submission(submission_id)
+            if not submission or submission.get("status") != "PENDING":
+                return None
+
+            update_payload: dict[str, Any] = {
+                "title": title,
+                "content": content,
+            }
+            if tags is not None:
+                update_payload["tags"] = tags
+
+            response = await client.table("submissions").update(update_payload).eq("id", submission_id).execute()
+
+            # Update history if there was a change request
+            if submission.get("change_requests", 0) > 0:
+                await client.table("submission_change_history").update({
+                    "new_content": content,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("submission_id", submission_id).eq("request_number", submission["change_requests"]).execute()
+
+            logger.info(f"Updated content for submission {submission_id}")
+            return response.data[0] if response.data else None
+
+        except Exception as e:
+            logger.error(f"Error updating submission {submission_id}: {e}", exc_info=True)
+            raise
+
+    # -------------------------------------------------------------
+    # Review Rating Operations (NEW)
+    # -------------------------------------------------------------
+
+    async def save_review_rating(
+        self,
+        submission_id: int,
+        guild_id: int,
+        user_id: int,
+        reviewer_id: int,
+        rating: int,
+        feedback: str | None = None,
+    ) -> dict[str, Any]:
+        """Saves a rating from a submitter about their review experience."""
+        client = await self.get_client()
+        if not (1 <= rating <= 5):
+            raise ValueError("Rating must be between 1 and 5")
+
+        payload = {
+            "submission_id": submission_id,
+            "guild_id": guild_id,
+            "user_id": user_id,
+            "reviewer_id": reviewer_id,
+            "rating": rating,
+            "feedback": feedback[:500] if feedback else None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        try:
+            response = await client.table("review_ratings").upsert(payload).execute()
+            logger.info(f"Saved rating {rating}/5 for submission {submission_id}")
+            return response.data[0] if response.data else payload
+        except Exception as e:
+            logger.error(f"Error saving rating for submission {submission_id}: {e}", exc_info=True)
+            raise
+
+    async def get_reviewer_stats(self, reviewer_id: int, guild_id: int) -> dict[str, Any]:
+        """Gets average rating and review count for a reviewer."""
+        client = await self.get_client()
+        try:
+            response = (
+                await client.table("review_ratings")
+                .select("rating")
+                .eq("reviewer_id", reviewer_id)
+                .eq("guild_id", guild_id)
+                .execute()
+            )
+            ratings = response.data or []
+            if not ratings:
+                return {"avg_rating": 0.0, "review_count": 0}
+
+            avg = sum(r["rating"] for r in ratings) / len(ratings)
+            return {"avg_rating": round(avg, 2), "review_count": len(ratings)}
+
+        except Exception as e:
+            logger.error(f"Error fetching reviewer stats for {reviewer_id}: {e}", exc_info=True)
+            return {"avg_rating": 0.0, "review_count": 0}
+
+    # -------------------------------------------------------------
+    # Expiry Alerts (NEW)
+    # -------------------------------------------------------------
+
+    async def get_posts_needing_expiry_alert(self, hours_before: int = 24) -> list[dict[str, Any]]:
+        """
+        Returns posts that will expire within X hours and haven't been alerted yet.
+        """
+        client = await self.get_client()
+        try:
+            now = datetime.now(timezone.utc)
+            alert_threshold = now + timedelta(hours=hours_before)
+
+            response = (
+                await client.table("active_posts")
+                .select("*, submissions(id, user_id, user_name, title)")
+                .eq("is_expired", False)
+                .eq("expiry_alert_sent", False)
+                .not_.is_("expires_at", "null")
+                .lte("expires_at", alert_threshold.isoformat())
+                .execute()
+            )
+            return response.data or []
+        except Exception as e:
+            logger.error(f"Error fetching posts needing expiry alert: {e}", exc_info=True)
+            return []
+
+    async def mark_expiry_alert_sent(self, post_id: int) -> bool:
+        """Marks that an expiry alert has been sent for a post."""
+        client = await self.get_client()
+        try:
+            await client.table("active_posts").update({"expiry_alert_sent": True}).eq("id", post_id).execute()
+            logger.info(f"Marked expiry alert sent for post {post_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error marking expiry alert for post {post_id}: {e}", exc_info=True)
+            return False
+
+    # -------------------------------------------------------------
+    # Pinned Ads Operations (NEW)
+    # -------------------------------------------------------------
+
+    async def pin_ad(
+        self,
+        post_id: int,
+        staff_id: int,
+        duration_hours: int | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        Pins an ad to the top. If duration_hours is provided, sets expiration.
+        """
+        client = await self.get_client()
+        try:
+            now = datetime.now(timezone.utc)
+            payload: dict[str, Any] = {
+                "is_pinned": True,
+                "pinned_at": now.isoformat(),
+                "pinned_by": staff_id,
+            }
+            if duration_hours:
+                payload["pin_expires_at"] = (now + timedelta(hours=duration_hours)).isoformat()
+
+            response = await client.table("active_posts").update(payload).eq("id", post_id).execute()
+            logger.info(f"Pinned ad {post_id} by staff {staff_id}")
+            return response.data[0] if response.data else None
+
+        except Exception as e:
+            logger.error(f"Error pinning ad {post_id}: {e}", exc_info=True)
+            raise
+
+    async def unpin_ad(self, post_id: int) -> bool:
+        """Unpins an ad."""
+        client = await self.get_client()
+        try:
+            await client.table("active_posts").update({
+                "is_pinned": False,
+                "pin_expires_at": None,
+            }).eq("id", post_id).execute()
+            logger.info(f"Unpinned ad {post_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error unpinning ad {post_id}: {e}", exc_info=True)
+            return False
+
+    async def get_expired_pins(self) -> list[dict[str, Any]]:
+        """Returns pinned ads whose pin duration has expired."""
+        client = await self.get_client()
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            response = (
+                await client.table("active_posts")
+                .select("*")
+                .eq("is_pinned", True)
+                .not_.is_("pin_expires_at", "null")
+                .lte("pin_expires_at", now)
+                .execute()
+            )
+            return response.data or []
+        except Exception as e:
+            logger.error(f"Error fetching expired pins: {e}", exc_info=True)
+            return []

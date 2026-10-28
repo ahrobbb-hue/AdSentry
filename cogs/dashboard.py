@@ -32,37 +32,37 @@ class SystemDashboardView(discord.ui.View):
         super().__init__(timeout=300)
         self.cog = cog
 
-    @discord.ui.button(label="التوظيف والإدارة", emoji="👥", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="التوظيف والإدارة", emoji="�", style=discord.ButtonStyle.primary, row=0)
     async def recruitment(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _admin(interaction):
             await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await self.cog.show_recruitment(interaction, edit=True)
 
-    @discord.ui.button(label="الفعاليات", emoji="📅", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="الفعاليات", emoji="🎪", style=discord.ButtonStyle.primary, row=0)
     async def events(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction):
             await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await self.cog.show_events(interaction, edit=True)
 
-    @discord.ui.button(label="تقديم إجازة", emoji="🌴", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="تقديم إجازة", emoji="�️", style=discord.ButtonStyle.primary, row=0)
     async def staffflow(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction):
             await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await self.cog.show_staffflow(interaction, edit=True)
 
-    @discord.ui.button(label="شكوى إدارية", emoji="📨", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="شكوى إدارية", emoji="�", style=discord.ButtonStyle.primary, row=0)
     async def complaint(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction):
             await interaction.response.send_message("هذا الإجراء لطاقم السيرفر فقط.", ephemeral=True); return
         await interaction.response.send_message("اختر تصنيف الشكوى ثم اكتب تفاصيلها:", view=ComplaintCategoryView(self.cog), ephemeral=True)
 
-    @discord.ui.button(label="إعداد قنوات التقديم", emoji="⚙️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="إعداد القنوات", emoji="⚙️", style=discord.ButtonStyle.secondary, row=1)
     async def channel_setup(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _admin(interaction) or not interaction.guild:
             await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await interaction.response.send_message("اختر حتى ثلاث قنوات خاصة لاستقبال بطاقات المتقدمين. تأكد أن صلاحيات القنوات مخصصة لفريق المراجعة.", view=ReviewChannelSetupView(self.cog), ephemeral=True)
 
-    @discord.ui.button(label="تحديث اللوحة", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="تحديث", emoji="�", style=discord.ButtonStyle.secondary, row=1)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog.show_home(interaction, edit=True)
 
@@ -74,33 +74,33 @@ class PersistentDashboardView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
 
-    @discord.ui.button(label="التوظيف والإدارة", emoji="👥", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:recruitment", row=0)
+    @discord.ui.button(label="التوظيف والإدارة", emoji="�", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:recruitment", row=0)
     async def recruitment(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _admin(interaction): await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await self.cog.show_recruitment(interaction)
 
-    @discord.ui.button(label="الفعاليات", emoji="📅", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:events", row=0)
+    @discord.ui.button(label="الفعاليات", emoji="🎪", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:events", row=0)
     async def events(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction): await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await self.cog.show_events(interaction)
 
-    @discord.ui.button(label="تقديم إجازة", emoji="🌴", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:staff", row=0)
+    @discord.ui.button(label="تقديم إجازة", emoji="�️", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:staff", row=0)
     async def staffflow(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction): await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await self.cog.show_staffflow(interaction)
 
-    @discord.ui.button(label="شكوى إدارية", emoji="📨", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:complaint", row=0)
+    @discord.ui.button(label="شكوى إدارية", emoji="�", style=discord.ButtonStyle.primary, custom_id="adsentry:ops:complaint", row=0)
     async def complaint(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction):
             await interaction.response.send_message("هذا الإجراء لطاقم السيرفر فقط.", ephemeral=True); return
         await interaction.response.send_message("اختر تصنيف الشكوى ثم اكتب تفاصيلها:", view=ComplaintCategoryView(self.cog), ephemeral=True)
 
-    @discord.ui.button(label="قنوات مراجعة التقديم", emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="adsentry:ops:channels", row=1)
+    @discord.ui.button(label="إعداد القنوات", emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="adsentry:ops:channels", row=1)
     async def channels(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _admin(interaction): await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await interaction.response.send_message("اختر حتى ثلاث قنوات خاصة لبطاقات المتقدمين:", view=ReviewChannelSetupView(self.cog), ephemeral=True)
 
-    @discord.ui.button(label="تحديث الملخص", emoji="🔄", style=discord.ButtonStyle.secondary, custom_id="adsentry:ops:refresh", row=1)
+    @discord.ui.button(label="تحديث", emoji="�", style=discord.ButtonStyle.secondary, custom_id="adsentry:ops:refresh", row=1)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction): await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True); return
         await self.cog.refresh_persistent_panel(interaction)
@@ -150,7 +150,7 @@ class RecruitmentDashboardView(discord.ui.View):
         super().__init__(timeout=300)
         self.cog = cog
 
-    @discord.ui.button(label="إنشاء تقديم جديد", emoji="➕", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="إنشاء تقديم", emoji="✨", style=discord.ButtonStyle.success)
     async def create_opening(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _admin(interaction) or not interaction.guild:
             await interaction.response.send_message("هذه العملية للإدارة فقط.", ephemeral=True); return
@@ -170,11 +170,11 @@ class RecruitmentDashboardView(discord.ui.View):
             logger.exception("Could not open recruitment creation flow from dashboard")
             await interaction.followup.send("تعذر فتح نموذج التقديم. تأكد من تشغيل ترحيل لوحة التوظيف وقاعدة البيانات.", ephemeral=True)
 
-    @discord.ui.button(label="تحديث", emoji="🔄", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="تحديث", emoji="�", style=discord.ButtonStyle.secondary)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog.show_recruitment(interaction, edit=True)
 
-    @discord.ui.button(label="إغلاق تقديم", emoji="🔒", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="إغلاق تقديم", emoji="�", style=discord.ButtonStyle.danger)
     async def close_opening(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild or not _admin(interaction): await interaction.response.send_message("للإدارة فقط.", ephemeral=True); return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -193,9 +193,18 @@ class OpeningReviewChannelView(discord.ui.View):
         super().__init__(timeout=180)
         self.cog = cog
         self.public_channel = public_channel
+        options = []
+        for row in rows[:3]:
+            ch = cog.bot.get_channel(int(row["channel_id"]))
+            ch_name = f"#{ch.name}" if isinstance(ch, discord.TextChannel) else f"#{row['channel_id']}"
+            options.append(discord.SelectOption(
+                label=f"قناة المراجعة {row['slot']} — {ch_name}"[:100],
+                value=str(row["channel_id"]),
+                description=f"الفتحة {row['slot']}",
+            ))
         self.select = discord.ui.Select(
             placeholder="اختر قناة من القنوات المضبوطة",
-            options=[discord.SelectOption(label=f"قناة المراجعة {row['slot']}", value=str(row["channel_id"]), description=f"القناة #{row['channel_id']}") for row in rows[:3]],
+            options=options,
         )
         self.select.callback = self.choose  # type: ignore[method-assign]
         self.add_item(self.select)
@@ -325,7 +334,7 @@ class EventDashboardView(discord.ui.View):
     def __init__(self, cog: "DashboardCog") -> None:
         super().__init__(timeout=300); self.cog = cog
 
-    @discord.ui.button(label="إنشاء فعالية", emoji="➕", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="إنشاء فعالية", emoji="✨", style=discord.ButtonStyle.success)
     async def create(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction): await interaction.response.send_message("للإدارة فقط.", ephemeral=True); return
         await interaction.response.send_modal(EventCreateModal(self.cog))
@@ -334,7 +343,7 @@ class EventDashboardView(discord.ui.View):
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog.show_events(interaction, edit=True)
 
-    @discord.ui.button(label="إغلاق تسجيل فعالية", emoji="🔒", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="إغلاق تسجيل", emoji="�", style=discord.ButtonStyle.secondary)
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild or not _staff(interaction): await interaction.response.send_message("للإدارة فقط.", ephemeral=True); return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -343,7 +352,7 @@ class EventDashboardView(discord.ui.View):
         if not rows: await interaction.followup.send("لا توجد فعاليات مفتوحة.", ephemeral=True); return
         await interaction.followup.send("اختر الفعالية:", view=EventCloseSelectView(self.cog, rows), ephemeral=True)
 
-    @discord.ui.button(label="تسجيل الحضور", emoji="✅", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="تسجيل الحضور", emoji="✔️", style=discord.ButtonStyle.secondary)
     async def attendance(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction): await interaction.response.send_message("للإدارة فقط.", ephemeral=True); return
         await interaction.response.send_modal(EventAttendanceModal(self.cog))
@@ -744,23 +753,41 @@ class StaffDecisionModal(discord.ui.Modal):
 
 
 class StaffCaseDecisionView(discord.ui.View):
+    """Persistent approval/rejection buttons attached to staff case review messages."""
+
     def __init__(self, cog: "DashboardCog", case_id: int) -> None:
         super().__init__(timeout=None)
-        self.cog, self.case_id = cog, case_id
-        for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                item.custom_id = f"adsentry:staff-case:{case_id}:{item.label.lower()}"
+        self.cog = cog
+        self.case_id = case_id
+        # Build buttons programmatically so custom_ids include the case_id and survive restarts.
+        approve_btn = discord.ui.Button(
+            label="قبول",
+            emoji="✅",
+            style=discord.ButtonStyle.success,
+            custom_id=f"adsentry:staff-case:{case_id}:approve",
+        )
+        approve_btn.callback = self._approve  # type: ignore[method-assign]
+        self.add_item(approve_btn)
 
-    @discord.ui.button(label="قبول", emoji="✅", style=discord.ButtonStyle.success)
-    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        reject_btn = discord.ui.Button(
+            label="رفض",
+            emoji="❌",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"adsentry:staff-case:{case_id}:reject",
+        )
+        reject_btn.callback = self._reject  # type: ignore[method-assign]
+        self.add_item(reject_btn)
+
+    async def _approve(self, interaction: discord.Interaction) -> None:
         if not _admin(interaction):
-            await interaction.response.send_message("مراجعة طلبات الإجازة متاحة للمالك وAdministrator فقط.", ephemeral=True); return
+            await interaction.response.send_message("مراجعة طلبات الإجازة متاحة للمالك وAdministrator فقط.", ephemeral=True)
+            return
         await interaction.response.send_modal(StaffDecisionModal(self.cog, self.case_id, "APPROVED"))
 
-    @discord.ui.button(label="رفض", emoji="❌", style=discord.ButtonStyle.danger)
-    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def _reject(self, interaction: discord.Interaction) -> None:
         if not _admin(interaction):
-            await interaction.response.send_message("مراجعة طلبات الإجازة متاحة للمالك وAdministrator فقط.", ephemeral=True); return
+            await interaction.response.send_message("مراجعة طلبات الإجازة متاحة للمالك وAdministrator فقط.", ephemeral=True)
+            return
         await interaction.response.send_modal(StaffDecisionModal(self.cog, self.case_id, "REJECTED"))
 
 
@@ -933,7 +960,8 @@ class DashboardCog(commands.Cog):
             cases = (await client.table("staff_cases").select("id,review_message_id").eq("status", "PENDING").not_.is_("review_message_id", "null").execute()).data or []
             for case in cases:
                 if case.get("review_message_id"):
-                    self.bot.add_view(StaffCaseDecisionView(self, int(case["id"])), message_id=int(case["review_message_id"]))
+                    view = StaffCaseDecisionView(self, int(case["id"]))
+                    self.bot.add_view(view, message_id=int(case["review_message_id"]))
         except Exception:
             logger.exception("Could not restore persistent StaffFlow decision buttons")
 

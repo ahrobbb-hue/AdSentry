@@ -30,8 +30,9 @@ class AdInterestButton(discord.ui.Button):
 
     def __init__(self, post_id: int, interest_count: int = 0) -> None:
         super().__init__(
-            label=f"⭐ مهتم / Interested ({interest_count})",
+            label=f"مهتم / Interested ({interest_count})",
             style=discord.ButtonStyle.secondary,
+            emoji="⭐",
             custom_id=f"adsentry:interest:{post_id}",
             row=0,
         )
@@ -115,17 +116,30 @@ class AdInterestButton(discord.ui.Button):
 
         # Update button label on the message via Webhook
         try:
-            view = discord.ui.View.from_message(interaction.message)  # type: ignore
-            for item in view.children:
-                if isinstance(item, discord.ui.Button) and (
-                    (item.custom_id and item.custom_id.startswith("adsentry:interest:")) or
-                    (item.label and "مهتم" in item.label)
-                ):
-                    item.label = f"⭐ مهتم / Interested ({count})"
-                    item.custom_id = f"adsentry:interest:{resolved_post_id}"
-
             channel = interaction.channel
             text_channel = channel.parent if isinstance(channel, discord.Thread) else channel
+
+            # Build a fresh AdInterestView with the updated count so all buttons are correct
+            try:
+                # Try to fetch the thread URL from the existing message buttons
+                thread_url: str | None = None
+                if interaction.message:
+                    for component_row in (interaction.message.components or []):
+                        for component in getattr(component_row, "children", []):
+                            if (
+                                isinstance(component, discord.Button)
+                                and component.url
+                                and "discord.com/channels" in (component.url or "")
+                            ):
+                                thread_url = component.url
+                                break
+                updated_view = AdInterestView(
+                    post_id=resolved_post_id,
+                    interest_count=count,
+                    thread_url=thread_url,
+                )
+            except Exception:
+                updated_view = AdInterestView(post_id=resolved_post_id, interest_count=count)
 
             wh: discord.Webhook | None = None
 
@@ -134,7 +148,11 @@ class AdInterestButton(discord.ui.Button):
                 client = await bot.db.get_client()
                 ap_res = await client.table("active_posts").select("webhook_url").eq("message_id", interaction.message.id).limit(1).execute()
                 if ap_res.data and ap_res.data[0].get("webhook_url"):
-                    wh = discord.Webhook.from_url(ap_res.data[0]["webhook_url"], client=bot)
+                    # discord.py 2.x: Webhook.from_url needs an aiohttp session
+                    wh = discord.Webhook.from_url(
+                        ap_res.data[0]["webhook_url"],
+                        session=bot.http._HTTPClient__session,  # type: ignore[attr-defined]
+                    )
             except Exception as e:
                 logger.debug(f"Could not load webhook_url from active_posts: {e}")
 
@@ -161,13 +179,23 @@ class AdInterestButton(discord.ui.Button):
 
             # 3. Apply the edit
             if wh:
-                if isinstance(channel, discord.Thread):
-                    await wh.edit_message(message_id=interaction.message.id, view=view, thread=channel)
-                else:
-                    await wh.edit_message(message_id=interaction.message.id, view=view)
-                logger.info(f"Updated interest button on msg #{interaction.message.id} -> count={count}")
+                try:
+                    if isinstance(channel, discord.Thread):
+                        await wh.edit_message(message_id=interaction.message.id, view=updated_view, thread=channel)
+                    else:
+                        await wh.edit_message(message_id=interaction.message.id, view=updated_view)
+                    logger.info(f"Updated interest button on msg #{interaction.message.id} -> count={count}")
+                except Exception as wh_err:
+                    logger.debug(f"Webhook edit failed, falling back to message edit: {wh_err}")
+                    try:
+                        await interaction.message.edit(view=updated_view)  # type: ignore
+                    except Exception:
+                        pass
             else:
-                await interaction.message.edit(view=view)  # type: ignore
+                try:
+                    await interaction.message.edit(view=updated_view)  # type: ignore
+                except Exception:
+                    pass
         except Exception as e:
             logger.error(f"Failed to update ad interest button label on message: {e}", exc_info=True)
 
@@ -177,8 +205,9 @@ class AdVerifyButton(discord.ui.Button):
 
     def __init__(self, post_id: int = 0) -> None:
         super().__init__(
-            label="🛡️ فحص التوثيق | Verify",
+            label="فحص التوثيق | Verify",
             style=discord.ButtonStyle.secondary,
+            emoji="🛡️",
             custom_id=f"adsentry:verify:{post_id}",
             row=0,
         )
@@ -305,8 +334,9 @@ class TranslateButton(discord.ui.Button):
 
     def __init__(self, post_id: int, ad_content: str, ad_title: str) -> None:
         super().__init__(
-            label="🌐 ترجمة / Translate",
+            label="ترجمة / Translate",
             style=discord.ButtonStyle.secondary,
+            emoji="🌐",
             custom_id=f"adsentry:translate:{post_id}",
             row=0,
         )
@@ -405,8 +435,9 @@ class MyAdDeleteButton(discord.ui.Button):
         self.post_data = post
         self.guild_id = guild_id
         super().__init__(
-            label=f"🗑️ حذف | Delete: {(post.get('title') or 'Ad')[:25]}",
+            label=f"حذف | Delete: {(post.get('title') or 'Ad')[:25]}",
             style=discord.ButtonStyle.danger,
+            emoji="🗑️",
             custom_id=f"adsentry:myads_delete:{post['id']}",
         )
 
@@ -586,7 +617,7 @@ class FeaturesCog(commands.Cog, name="Features"):
 
         embed = discord.Embed(
             title=f"📋 إعلاناتي النشطة | My Active Ads ({len(ads)})",
-            description="إعلاناتك النشطة الحالية في السيرفر. يمكنك حذف أي إعلان مبكراً باستخدام الزر أدناه.",
+            description="إعلاناتك النشطة الحالية في السيرفر. يمكنك حذف أي إعلان باستخدام الزر أدناه.",
             color=discord.Color.blurple(),
         )
 

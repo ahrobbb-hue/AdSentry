@@ -27,28 +27,46 @@ def resolve_category_theme(category: str) -> dict[str, Any]:
     """Resolves matching color, emoji, and badges for a given category name."""
     cat_lower = (category or "").lower()
 
-    if any(k in cat_lower for k in ("program", "برمج", "dev", "code")):
+    if any(k in cat_lower for k in ("program", "برمج", "dev", "code", "تطوير")):
         return {
             "emoji": "💻",
-            "color": discord.Color.from_rgb(0, 210, 106),  # Emerald Cyber Green
+            "color": discord.Color.from_rgb(0, 210, 106),
             "badge": "💻 البرمجة والتطوير | Programming",
+        }
+    if any(k in cat_lower for k in ("bot", "بوت", "tool", "أداة", "أدوات")):
+        return {
+            "emoji": "🤖",
+            "color": discord.Color.from_rgb(114, 137, 218),
+            "badge": "🤖 بوتات وأدوات | Bots & Tools",
         }
     if any(k in cat_lower for k in ("server", "سيرفر", "مجتمع", "communit")):
         return {
             "emoji": "🌐",
-            "color": discord.Color.from_rgb(88, 101, 242),  # Discord Blurple
+            "color": discord.Color.from_rgb(88, 101, 242),
             "badge": "🌐 سيرفرات ديسكورد | Discord Servers",
         }
-    if any(k in cat_lower for k in ("job", "وظائف", "توظيف", "hiring", "work", "عمل", "خدم", "service")):
+    if any(k in cat_lower for k in ("host", "استضافة", "cloud", "سحاب", "vps")):
+        return {
+            "emoji": "☁️",
+            "color": discord.Color.from_rgb(52, 152, 219),
+            "badge": "☁️ استضافة وسحابيات | Hosting & Cloud",
+        }
+    if any(k in cat_lower for k in ("learn", "تعليم", "resource", "مصادر", "course", "كورس")):
+        return {
+            "emoji": "📚",
+            "color": discord.Color.from_rgb(230, 126, 34),
+            "badge": "📚 تعليم ومصادر | Learning & Resources",
+        }
+    if any(k in cat_lower for k in ("job", "وظائف", "توظيف", "hiring", "work", "عمل", "خدم", "service", "freelance", "حر")):
         return {
             "emoji": "💼",
-            "color": discord.Color.from_rgb(241, 196, 15),  # Executive Amber Gold
+            "color": discord.Color.from_rgb(241, 196, 15),
             "badge": "💼 وظائف وخدمات | Jobs & Services",
         }
 
     return {
         "emoji": "📌",
-        "color": discord.Color.from_rgb(52, 152, 219),  # Modern Electric Blue
+        "color": discord.Color.from_rgb(52, 152, 219),
         "badge": f"📌 {category}",
     }
 
@@ -76,8 +94,13 @@ async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook
     """Finds an existing AdSentry webhook or creates a new one in the target channel."""
     try:
         webhooks = await channel.webhooks()
+        # Prefer a webhook we own (has a token) and is named AdSentry
         for wh in webhooks:
-            if wh.name.startswith("AdSentry") or wh.token is not None:
+            if wh.token is not None and wh.name.startswith("AdSentry"):
+                return wh
+        # Fall back to any webhook we own
+        for wh in webhooks:
+            if wh.token is not None:
                 return wh
 
         webhook = await channel.create_webhook(

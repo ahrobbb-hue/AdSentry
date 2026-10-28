@@ -88,6 +88,14 @@ class StaffReviewView(discord.ui.View):
         )
         self.add_item(
             discord.ui.Button(
+                label="Request Changes",
+                style=discord.ButtonStyle.secondary,
+                emoji="✏️",
+                custom_id=f"adsentry:request_changes:{submission_id}",
+            )
+        )
+        self.add_item(
+            discord.ui.Button(
                 label="Reject",
                 style=discord.ButtonStyle.danger,
                 emoji="❌",
@@ -105,7 +113,7 @@ class ExpiryDurationSelect(discord.ui.Select):
                 label="1 Day",
                 value="1d",
                 description="Auto-deletes after 24 hours",
-                emoji="⏱️",
+                emoji="⏰",
             ),
             discord.SelectOption(
                 label="1 Week",
@@ -167,31 +175,31 @@ class RejectionReasonSelect(discord.ui.Select):
     def __init__(self, cog: ModerationCog, submission_id: int, review_message: discord.Message) -> None:
         options = [
             discord.SelectOption(
-                label="محتوى مخالف لسياسات النشر | Prohibited Content",
+                label="محتوى مخالف | Prohibited Content",
                 value="المحتوى يخالف سياسات وقوانين نشر الإعلانات في السيرفر (Prohibited/Inappropriate Content)",
                 description="Contains NSFW, harmful, or prohibited content",
                 emoji="🚫",
             ),
             discord.SelectOption(
-                label="روابط معطلة أو منتهية | Broken / Invalid Link",
+                label="روابط معطلة | Broken Link",
                 value="رابط الدعوة أو الموقع غير صالح أو منتهي الصلاحية (Invalid/Expired Invite Link)",
                 description="The provided Discord invite or URL is broken",
                 emoji="🔗",
             ),
             discord.SelectOption(
-                label="قسم غير مناسب للإعلان | Miscategorized Ad",
+                label="قسم غير مناسب | Miscategorized",
                 value="تم تقديم الإعلان في تصنيف غير مناسب لمحتواه (Submitted in wrong category)",
                 description="Please re-submit in the proper channel/category",
                 emoji="📌",
             ),
             discord.SelectOption(
-                label="إعلان مكرر أو سبام | Duplicate or Spam",
+                label="إعلان مكرر | Duplicate/Spam",
                 value="إعلان مكرر أو محاولة سبام غير مصرح بها (Duplicate or spam submission)",
                 description="Repeated submissions within a short timeframe",
                 emoji="⚠️",
             ),
             discord.SelectOption(
-                label="كتابة سبب مخصص يدوي | Custom Reason...",
+                label="سبب مخصص | Custom Reason",
                 value="CUSTOM_MODAL",
                 description="Open a text box to write custom rejection feedback",
                 emoji="✍️",

@@ -425,13 +425,13 @@ class CategorySelect(discord.ui.Select):
                 discord.SelectOption(
                     label="برمجة وتطوير",
                     value="برمجة وتطوير 💻",
-                    description="مشاريع برمجية، مواقع، تطبيقات، سكربتات، أكواد",
+                    description="مشاريع برمجية، مواقع، تطبيقات، سكربتات",
                     emoji="💻",
                 ),
                 discord.SelectOption(
                     label="بوتات وأدوات",
                     value="بوتات وأدوات 🤖",
-                    description="بوتات ديسكورد، أدوات تقنية، أتمتة، مكاتب برمجية",
+                    description="بوتات ديسكورد، أدوات تقنية، أتمتة",
                     emoji="🤖",
                 ),
             ]
@@ -439,9 +439,9 @@ class CategorySelect(discord.ui.Select):
             if is_admin:
                 options.append(
                     discord.SelectOption(
-                        label="سيرفرات ديسكورد ومجتمعات",
+                        label="سيرفرات ومجتمعات",
                         value="سيرفرات ومجتمعات 🌐",
-                        description="سيرفرات ديسكورد ومجتمعات تقنية (خاص بالإدارة والمالك)",
+                        description="سيرفرات ديسكورد ومجتمعات تقنية (للإدارة)",
                         emoji="🌐",
                     )
                 )
@@ -449,25 +449,25 @@ class CategorySelect(discord.ui.Select):
                 discord.SelectOption(
                     label="خدمات وعمل حر",
                     value="خدمات وعمل حر 💼",
-                    description="خدمات برمجية، تصميم جرافيك، عمل حر، استشارات",
+                    description="خدمات برمجية، تصميم، عمل حر",
                     emoji="💼",
                 ),
                 discord.SelectOption(
                     label="استضافة وسحابيات",
                     value="استضافة وسحابيات ☁️",
-                    description="استضافة بوتات، سيرفرات VPS، واستضافة مواقع",
+                    description="استضافة بوتات، سيرفرات VPS، مواقع",
                     emoji="☁️",
                 ),
                 discord.SelectOption(
                     label="تعليم ومصادر",
                     value="تعليم ومصادر 📚",
-                    description="شروحات برمجية، كورسات، كتب، ومصادر تعلم",
+                    description="شروحات، كورسات، كتب، ومصادر تعلم",
                     emoji="📚",
                 ),
                 discord.SelectOption(
                     label="وظائف وتوظيف",
                     value="وظائف وتوظيف 🎯",
-                    description="فرص عمل، عروض توظيف، والبحث عن مطورين",
+                    description="فرص عمل، عروض توظيف",
                     emoji="🎯",
                 ),
                 discord.SelectOption(
@@ -483,13 +483,13 @@ class CategorySelect(discord.ui.Select):
                 discord.SelectOption(
                     label="Programming & Dev",
                     value="Programming & Dev 💻",
-                    description="Software projects, apps, websites, scripts, code",
+                    description="Software projects, apps, websites, scripts",
                     emoji="💻",
                 ),
                 discord.SelectOption(
                     label="Bots & Tools",
                     value="Bots & Tools 🤖",
-                    description="Discord bots, developer tools, automation, APIs",
+                    description="Discord bots, developer tools, automation",
                     emoji="🤖",
                 ),
             ]
@@ -497,7 +497,7 @@ class CategorySelect(discord.ui.Select):
             if is_admin:
                 options.append(
                     discord.SelectOption(
-                        label="Discord Servers & Communities",
+                        label="Discord Servers",
                         value="Servers & Communities 🌐",
                         description="Discord servers & communities (Admin/Owner only)",
                         emoji="🌐",
@@ -507,31 +507,31 @@ class CategorySelect(discord.ui.Select):
                 discord.SelectOption(
                     label="Services & Freelance",
                     value="Services & Freelance 💼",
-                    description="Freelance dev, UI/UX design, consulting, commissions",
+                    description="Freelance dev, UI/UX design, consulting",
                     emoji="💼",
                 ),
                 discord.SelectOption(
                     label="Hosting & Cloud",
                     value="Hosting & Cloud ☁️",
-                    description="Bot hosting, VPS servers, domains & cloud infra",
+                    description="Bot hosting, VPS servers, domains",
                     emoji="☁️",
                 ),
                 discord.SelectOption(
                     label="Learning & Resources",
                     value="Learning & Resources 📚",
-                    description="Tutorials, developer courses, guides & documentation",
+                    description="Tutorials, courses, guides & documentation",
                     emoji="📚",
                 ),
                 discord.SelectOption(
                     label="Jobs & Hiring",
                     value="Jobs & Hiring 🎯",
-                    description="Paid gigs, job openings, developer recruitment",
+                    description="Paid gigs, job openings, recruitment",
                     emoji="🎯",
                 ),
                 discord.SelectOption(
                     label="Others & General",
                     value="Others & General 📌",
-                    description="General announcements and miscellaneous promos",
+                    description="General announcements and misc promos",
                     emoji="📌",
                 ),
             ])
@@ -1113,6 +1113,61 @@ class SubmissionsCog(commands.Cog, name="Submissions"):
             embed.set_thumbnail(url=target.display_avatar.url)
         embed.set_footer(text="AdSentry Cooldown Manager")
 
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @ad_group.command(
+        name="cancel",
+        description="إلغاء طلب إعلانك المعلق | Cancel your pending ad submission",
+    )
+    async def cancel_submission_cmd(self, interaction: discord.Interaction) -> None:
+        """Allows users to cancel their own pending advertisement submission."""
+        await interaction.response.defer(ephemeral=True)
+        
+        # Check if user has a pending submission
+        has_pending = await self.bot.db.has_pending_submission(interaction.user.id)
+        if not has_pending:
+            embed = discord.Embed(
+                title="❌ لا توجد طلبات معلقة | No Pending Submissions",
+                description=(
+                    "**لا يوجد لديك أي إعلان معلق حالياً.**\n"
+                    "You don't have any pending advertisement submissions.\n\n"
+                    "💡 يمكنك تقديم إعلان جديد الآن عبر `/ad submit`"
+                ),
+                color=discord.Color.gold(),
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        # Cancel the pending submission(s)
+        try:
+            cancelled_count = await self.bot.db.cancel_pending_submissions(interaction.user.id)
+            if cancelled_count > 0:
+                embed = discord.Embed(
+                    title="✅ تم إلغاء الطلب | Submission Cancelled",
+                    description=(
+                        f"**تم إلغاء طلب إعلانك المعلق بنجاح!**\n"
+                        f"Successfully cancelled {cancelled_count} pending submission(s).\n\n"
+                        "🎉 يمكنك الآن تقديم إعلان جديد عبر `/ad submit`"
+                    ),
+                    color=discord.Color.green(),
+                )
+                if interaction.user.display_avatar:
+                    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+                embed.set_footer(text="AdSentry • تم إلغاء الطلب المعلق")
+            else:
+                embed = discord.Embed(
+                    title="⚠️ حدث خطأ | Error",
+                    description="تعذر إلغاء الطلب. يرجى المحاولة لاحقاً أو التواصل مع الإدارة.",
+                    color=discord.Color.red(),
+                )
+        except Exception as e:
+            logger.error(f"Error cancelling submission for user {interaction.user.id}: {e}", exc_info=True)
+            embed = discord.Embed(
+                title="❌ فشل الإلغاء | Cancellation Failed",
+                description=f"حدث خطأ أثناء إلغاء الطلب:\n`{e}`",
+                color=discord.Color.red(),
+            )
+        
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     def create_panel_embed(self) -> discord.Embed:
