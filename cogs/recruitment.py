@@ -574,67 +574,97 @@ class ApplicationReviewView(discord.ui.View):
                 except (discord.HTTPException, discord.NotFound):
                     member = None
 
-            # ── عند القبول أو الرفض: سحب رتبة Applicant المؤقتة + إغلاق قناة join-requests ──
-            if decision in {"ACCEPTED", "REJECTED"} and member and interaction.guild:
-                applicant_role_name, _ = get_applicant_role_info(opening.get("title", "")) if opening else ("", 1)
-                if applicant_role_name:
-                    app_role = discord.utils.get(interaction.guild.roles, name=applicant_role_name)
-                    if app_role and app_role in member.roles and app_role < interaction.guild.me.top_role and interaction.guild.me.guild_permissions.manage_roles:
-                        try:
-                            await member.remove_roles(app_role, reason=f"Recruitment #{application_id} {decision}")
-                            logger.info("Removed applicant role %s from %s", applicant_role_name, member.id)
-                        except discord.HTTPException:
-                            logger.exception("Could not remove applicant role %s", applicant_role_name)
-
-                # ── إغلاق قناة join-requests على المتقدم (من review_channel_id في الـ opening) ──
-                if opening and opening.get("review_channel_id"):
-                    applicant_ch = interaction.guild.get_channel(int(opening["review_channel_id"]))
-                    if isinstance(applicant_ch, discord.TextChannel):
-                        try:
-                            await applicant_ch.set_permissions(
-                                member,
-                                overwrite=None,
-                                reason=f"Recruitment #{application_id} {decision} — removing applicant access",
-                            )
-                        except discord.HTTPException:
-                            logger.exception("Could not remove join-requests overwrite for applicant %s", member.id)
-
-            # ── إذا قُبل: محاولة منح الرتبة الرسمية ──
+            # ── عند القبول أو الرفض: سحب رتبة Applicant المؤقتة وإغلاق قناة الطلب ──
             role_result = ""
-            if decision == "ACCEPTED" and opening and member and interaction.guild:
-                target_role = None
-                if opening.get("grant_role_id"):
-                    target_role = interaction.guild.get_role(opening["grant_role_id"])
-                if not target_role:
-                    t_title = opening.get("title", "").strip()
-                    target_role = discord.utils.get(interaction.guild.roles, name=t_title)
+            app_role = None
+            if decision in {"ACCEPTED", "REJECTED"}:
+                if member and interaction.guild:
+                    applicant_role_name, _ = get_applicant_role_info(opening.get("title", "")) if opening else ("", 1)
+                    if applicant_role_name:
+                        app_role = discord.utils.get(interaction.guild.roles, name=applicant_role_name)
+                        if app_role and app_role in member.roles:
+                            bot_member = interaction.guild.me
+                            if (
+                                bot_member
+                                and app_role < bot_member.top_role
+                                and bot_member.guild_permissions.manage_roles
+                            ):
+                                try:
+                                    await member.remove_roles(app_role, reason=f"Recruitment #{application_id} {decision}")
+                                    logger.info("Removed applicant role %s from %s", applicant_role_name, member.id)
+                                    role_result += f"\n✅ تم سحب رتبة التقديم المؤقتة **{applicant_role_name}**."
+                                except discord.HTTPException:
+                                    logger.exception("Could not remove applicant role %s", applicant_role_name)
+                                    role_result += f"\n⚠️ تعذّر سحب رتبة التقديم المؤقتة **{applicant_role_name}**؛ يرجى سحبها يدوياً."
+                            else:
+                                role_result += f"\n⚠️ لا يملك البوت صلاحية سحب رتبة التقديم المؤقتة **{applicant_role_name}**؛ يرجى سحبها يدوياً."
+                        else:
+                            role_result += f"\nℹ️ رتبة التقديم المؤقتة **{applicant_role_name}** غير موجودة لدى المتقدم."
+                    else:
+                        role_result += "\n⚠️ تعذّر تحديد رتبة التقديم المؤقتة لسحبها."
+
+                    # ── إزالة صلاحية المتقدم من قناة join-requests ──
+                    if opening and opening.get("review_channel_id"):
+                        applicant_ch = interaction.guild.get_channel(int(opening["review_channel_id"]))
+                        if isinstance(applicant_ch, discord.TextChannel):
+                            try:
+                                await applicant_ch.set_permissions(
+                                    member,
+                                    overwrite=None,
+                                    reason=f"Recruitment #{application_id} {decision} — removing applicant access",
+                                )
+                                role_result += "\n✅ تم إلغاء صلاحية المتقدم من قناة الطلب."
+                            except discord.HTTPException:
+                                logger.exception("Could not remove join-requests overwrite for applicant %s", member.id)
+                                role_result += "\n⚠️ تعذّر إلغاء صلاحية المتقدم من قناة الطلب؛ يرجى إزالتها يدوياً."
+                else:
+                    role_result += "\n⚠️ تعذّر العثور على المتقدم لسحب رتبته المؤقتة أو صلاحياته من قناة الطلب."
+
+            # ── عند القبول: منح الرتبة الرسمية فقط ──
+            if decision == "ACCEPTED":
+                role_title_hint = opening.get("title", "الرتبة المناسبة") if opening else "الرتبة المناسبة"
+                if opening and member and interaction.guild:
+                    target_role = None
+                    if opening.get("grant_role_id"):
+                        target_role = interaction.guild.get_role(opening["grant_role_id"])
                     if not target_role:
                         import re
-                        clean_t = re.sub(r'^[^\w\s]+', '', t_title).strip()
-                        if clean_t:
-                            for r in interaction.guild.roles:
-                                if r.name.lower() == clean_t.lower() or clean_t.lower() in r.name.lower():
-                                    target_role = r
+                        t_title = opening.get("title", "").strip()
+                        clean_title = re.sub(r'^[^\w\s]+', '', t_title).strip()
+                        for role_name in (t_title, clean_title):
+                            if role_name:
+                                target_role = next(
+                                    (role for role in interaction.guild.roles if role.name.casefold() == role_name.casefold()),
+                                    None,
+                                )
+                                if target_role:
                                     break
-                if target_role:
-                    try:
-                        if (
-                            not target_role.is_default()
-                            and not target_role.managed
-                            and target_role < interaction.guild.me.top_role
-                            and interaction.guild.me.guild_permissions.manage_roles
-                        ):
-                            await member.add_roles(target_role, reason=f"Accepted for recruitment opening #{opening['id']}")
-                            role_result = f"\n✅ تم منح رتبة **{target_role.name}** للمتقدم تلقائياً."
-                        else:
-                            role_result = f"\n⚠️ **تذكير:** يرجى منح {member.mention} رتبة **{target_role.name}** يدوياً (البوت لا يملك الصلاحية الكافية)."
-                    except (discord.HTTPException, discord.NotFound, PermissionError):
-                        logger.exception("Application accepted, but its configured role could not be assigned")
-                        role_result = f"\n⚠️ **تذكير:** تعذّر منح الرتبة تلقائياً — يرجى منح {member.mention} رتبة **{target_role.name}** يدوياً."
+                    if target_role and app_role and target_role.id == app_role.id:
+                        target_role = None
+
+                    if target_role:
+                        bot_member = interaction.guild.me
+                        try:
+                            if (
+                                not target_role.is_default()
+                                and not target_role.managed
+                                and bot_member
+                                and target_role < bot_member.top_role
+                                and bot_member.guild_permissions.manage_roles
+                            ):
+                                await member.add_roles(target_role, reason=f"Accepted for recruitment opening #{opening['id']}")
+                                role_result += f"\n✅ تم منح الرتبة الرسمية **{target_role.name}** للمتقدم تلقائياً."
+                            else:
+                                role_result += f"\n⚠️ **تذكير:** يرجى منح {member.mention} الرتبة الرسمية **{target_role.name}** يدوياً (البوت لا يملك الصلاحية الكافية)."
+                        except (discord.HTTPException, discord.NotFound, PermissionError):
+                            logger.exception("Application accepted, but its configured role could not be assigned")
+                            role_result += f"\n⚠️ **تذكير:** تعذّر منح الرتبة الرسمية تلقائياً — يرجى منح {member.mention} **{target_role.name}** يدوياً."
+                    else:
+                        role_result += f"\n📌 **تذكير:** لا تنسَ منح {member.mention} الرتبة الرسمية **{role_title_hint}** يدوياً."
                 else:
-                    # لا توجد رتبة محددة → تذكير يدوي
-                    role_title_hint = opening.get("title", "الرتبة المناسبة") if opening else "الرتبة المناسبة"
-                    role_result = f"\n📌 **تذكير:** لا تنسَ منح {member.mention} رتبة **{role_title_hint}** يدوياً."
+                    role_result += f"\n📌 **تذكير:** تعذّر منح الرتبة الرسمية تلقائياً؛ يرجى منح المتقدم **{role_title_hint}** يدوياً."
+            elif decision == "REJECTED":
+                role_result = f"\n❌ تم رفض الطلب.{role_result}"
 
             # ── إرسال DM للمتقدم ──
             try:
