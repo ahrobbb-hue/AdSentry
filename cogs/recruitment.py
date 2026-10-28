@@ -94,6 +94,15 @@ async def resolve_review_channel(guild: discord.Guild, bot: commands.Bot, slot: 
     return None
 
 
+async def resolve_staff_review_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    """Find the ads-and-staff channel where review cards (Accept/Reject/Interview) are posted."""
+    for ch in guild.text_channels:
+        name = ch.name.lower().replace(" ", "-").replace("_", "-")
+        if "ads-and-staff" in name or "ads_and_staff" in name:
+            return ch
+    return None
+
+
 def _can_manage(interaction: discord.Interaction) -> bool:
     return bool(interaction.guild and is_admin(interaction.user))
 
@@ -382,13 +391,24 @@ class ApplicationModal(discord.ui.Modal):
                     await close_announcement(self.bot, latest)
                 await interaction.followup.send("This application closed before your submission was received.", ephemeral=True)
                 return
-            review_channel = self.bot.get_channel(current["review_channel_id"])
-            if not isinstance(review_channel, discord.TextChannel):
-                review_channel = await self.bot.fetch_channel(current["review_channel_id"])
-            if not isinstance(review_channel, discord.TextChannel):
-                raise RuntimeError("Configured review destination is not a text channel")
+            # ── الحصول على قناة join-requests الخاصة بالمتقدم ──
+            applicant_channel = self.bot.get_channel(current["review_channel_id"])
+            if not isinstance(applicant_channel, discord.TextChannel):
+                try:
+                    applicant_channel = await self.bot.fetch_channel(current["review_channel_id"])
+                except Exception:
+                    applicant_channel = None
 
-            # 1. Determine and grant applicant role
+            # ── الحصول على قناة ads-and-staff لنشر بطاقة المراجعة ──
+            staff_channel = await resolve_staff_review_channel(interaction.guild)
+            if not isinstance(staff_channel, discord.TextChannel):
+                # fallback: إذا لم توجد ads-and-staff نرسل لقناة join-requests
+                staff_channel = applicant_channel
+
+            if not isinstance(staff_channel, discord.TextChannel):
+                raise RuntimeError("Could not find ads-and-staff or any review channel")
+
+            # 1. تحديد رتبة Applicant ومنحها للمتقدم
             applicant_role_name, _ = get_applicant_role_info(current["title"])
             guild = interaction.guild
             applicant_role = discord.utils.get(guild.roles, name=applicant_role_name)
@@ -409,31 +429,48 @@ class ApplicationModal(discord.ui.Modal):
                 except discord.HTTPException:
                     logger.exception("Could not assign applicant role %s", applicant_role_name)
 
-            # 2. Unlock the corresponding review channel for the applicant
-            if isinstance(review_channel, discord.TextChannel) and isinstance(interaction.user, discord.Member):
+            # 2. فتح قناة join-requests للمتقدم فقط (قراءة فقط لمتابعة طلبه)
+            if isinstance(applicant_channel, discord.TextChannel) and isinstance(interaction.user, discord.Member):
                 try:
-                    await review_channel.set_permissions(
+                    await applicant_channel.set_permissions(
                         interaction.user,
                         view_channel=True,
                         read_message_history=True,
-                        send_messages=True,
-                        reason=f"AdSentry applicant access to #{review_channel.name} for #{record['id']}",
+                        send_messages=False,
+                        reason=f"AdSentry applicant access to #{applicant_channel.name} for #{record['id']}",
                     )
                 except discord.HTTPException:
                     logger.exception("Could not set channel overwrites for applicant")
 
-            embed = discord.Embed(title=f"New staff application · #{record['id']}", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
+            # 3. إرسال بطاقة المراجعة (مع أزرار Accept/Reject/Interview) إلى ads-and-staff
+            embed = discord.Embed(
+                title=f"New staff application · #{record['id']}",
+                color=discord.Color.blurple(),
+                timestamp=datetime.now(timezone.utc),
+            )
             embed.add_field(name="Applicant", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
-            embed.add_field(name="Position applied for", value=current["title"], inline=False)
+            embed.add_field(name="Position applied for", value=f"{current['title']}", inline=False)
             embed.add_field(name="Experience", value=self.experience.value[:1024], inline=False)
             embed.add_field(name="Motivation", value=self.motivation.value[:1024], inline=False)
             embed.add_field(name="Availability", value=self.availability.value[:1024], inline=False)
             for field in self.custom_inputs:
                 embed.add_field(name=field.label, value=field.value[:1024], inline=False)
-            await review_channel.send(embed=embed, view=ApplicationReviewView(record["id"]), allowed_mentions=discord.AllowedMentions.none())
-            
-            role_msg = f" وتم منحك رتبة **{applicant_role_name}** وفُتحت لك قناة {review_channel.mention} لمتابعة مراجعة طلبك." if applicant_role else f" وفُتحت لك قناة {review_channel.mention} لمتابعة مراجعة طلبك."
-            await interaction.followup.send(f"✅ تم إرسال طلبك بنجاح إلى الإدارة!{role_msg}", ephemeral=True)
+            if isinstance(applicant_channel, discord.TextChannel):
+                embed.add_field(name="📋 Application Channel", value=applicant_channel.mention, inline=False)
+
+            await staff_channel.send(
+                embed=embed,
+                view=ApplicationReviewView(record["id"]),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+            # 4. إشعار المتقدم بنجاح تقديم الطلب
+            channel_msg = f" وفُتحت لك قناة {applicant_channel.mention} لمتابعة طلبك." if isinstance(applicant_channel, discord.TextChannel) else ""
+            role_msg = f" وتم منحك رتبة **{applicant_role_name}**" if applicant_role else ""
+            await interaction.followup.send(
+                f"✅ تم إرسال طلبك بنجاح إلى الإدارة!{role_msg}{channel_msg}",
+                ephemeral=True,
+            )
         except Exception as exc:
             logger.exception("Could not process recruitment application")
             await interaction.followup.send("We couldn't submit your application. Please contact staff and try again later.", ephemeral=True)
@@ -471,8 +508,12 @@ class ApplicationReviewView(discord.ui.View):
             self.add_item(button)
 
     async def review(self, interaction: discord.Interaction) -> None:
+        # ── الأزرار تعمل فقط للـ Owner والـ Admin ──
         if not _can_manage(interaction):
-            await interaction.response.send_message("Only authorized staff can review applications.", ephemeral=True)
+            await interaction.response.send_message(
+                "⛔ هذه الأزرار متاحة للأونر والأدمن فقط.",
+                ephemeral=True,
+            )
             return
         custom_id = str((interaction.data or {}).get("custom_id", ""))
         parts = custom_id.split(":")
@@ -494,15 +535,30 @@ class ApplicationReviewView(discord.ui.View):
                 message = "No more seats are available; this opening has reached its capacity." if reason == "capacity" else "This application was already reviewed or is no longer available."
                 await interaction.followup.send(message, ephemeral=True)
                 return
+
+            # ── تحديث بطاقة المراجعة في ads-and-staff ──
             if interaction.message:
                 embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed(title=f"Application #{application_id}")
-                embed.color = discord.Color.blurple() if decision == "INTERVIEW" else (discord.Color.green() if decision == "ACCEPTED" else discord.Color.red())
-                embed.add_field(name="Stage", value=f"{decision.title()} by {interaction.user.mention}", inline=False)
+                embed.color = (
+                    discord.Color.blurple() if decision == "INTERVIEW"
+                    else discord.Color.green() if decision == "ACCEPTED"
+                    else discord.Color.red()
+                )
+                decision_label = {"INTERVIEW": "📞 مقابلة صوتية", "ACCEPTED": "✅ تم القبول", "REJECTED": "❌ تم الرفض"}.get(decision, decision.title())
+                embed.add_field(
+                    name="القرار | Decision",
+                    value=f"{decision_label} بواسطة {interaction.user.mention}",
+                    inline=False,
+                )
                 try:
-                    await interaction.message.edit(embed=embed, view=None if decision != "INTERVIEW" else ApplicationReviewView(application_id))
+                    await interaction.message.edit(
+                        embed=embed,
+                        view=None if decision != "INTERVIEW" else ApplicationReviewView(application_id),
+                    )
                 except discord.HTTPException:
                     logger.exception("Decision saved but review card could not be updated for application %s", application_id)
-            # 1. Fetch applicant member
+
+            # ── جلب عضو المتقدم ──
             member = interaction.guild.get_member(application["user_id"]) if interaction.guild else None  # type: ignore[union-attr]
             if not member and interaction.guild:
                 try:
@@ -510,7 +566,7 @@ class ApplicationReviewView(discord.ui.View):
                 except (discord.HTTPException, discord.NotFound):
                     member = None
 
-            # 2. On ACCEPTED or REJECTED: remove temporary applicant role and revoke review channel access
+            # ── عند القبول أو الرفض: سحب رتبة Applicant المؤقتة + إغلاق قناة join-requests ──
             if decision in {"ACCEPTED", "REJECTED"} and member and interaction.guild:
                 applicant_role_name, _ = get_applicant_role_info(opening.get("title", "")) if opening else ("", 1)
                 if applicant_role_name:
@@ -518,16 +574,24 @@ class ApplicationReviewView(discord.ui.View):
                     if app_role and app_role in member.roles and app_role < interaction.guild.me.top_role and interaction.guild.me.guild_permissions.manage_roles:
                         try:
                             await member.remove_roles(app_role, reason=f"Recruitment #{application_id} {decision}")
+                            logger.info("Removed applicant role %s from %s", applicant_role_name, member.id)
                         except discord.HTTPException:
                             logger.exception("Could not remove applicant role %s", applicant_role_name)
 
-                if isinstance(interaction.channel, discord.TextChannel):
-                    try:
-                        await interaction.channel.set_permissions(member, overwrite=None, reason=f"Recruitment #{application_id} {decision}")
-                    except discord.HTTPException:
-                        logger.exception("Could not remove channel overwrite for applicant %s", member.id)
+                # ── إغلاق قناة join-requests على المتقدم (من review_channel_id في الـ opening) ──
+                if opening and opening.get("review_channel_id"):
+                    applicant_ch = interaction.guild.get_channel(int(opening["review_channel_id"]))
+                    if isinstance(applicant_ch, discord.TextChannel):
+                        try:
+                            await applicant_ch.set_permissions(
+                                member,
+                                overwrite=None,
+                                reason=f"Recruitment #{application_id} {decision} — removing applicant access",
+                            )
+                        except discord.HTTPException:
+                            logger.exception("Could not remove join-requests overwrite for applicant %s", member.id)
 
-            # 3. If ACCEPTED: assign official staff role
+            # ── إذا قُبل: محاولة منح الرتبة الرسمية ──
             role_result = ""
             if decision == "ACCEPTED" and opening and member and interaction.guild:
                 target_role = None
@@ -546,25 +610,47 @@ class ApplicationReviewView(discord.ui.View):
                                     break
                 if target_role:
                     try:
-                        if not target_role.is_default() and not target_role.managed and target_role < interaction.guild.me.top_role and interaction.guild.me.guild_permissions.manage_roles:
+                        if (
+                            not target_role.is_default()
+                            and not target_role.managed
+                            and target_role < interaction.guild.me.top_role
+                            and interaction.guild.me.guild_permissions.manage_roles
+                        ):
                             await member.add_roles(target_role, reason=f"Accepted for recruitment opening #{opening['id']}")
-                            role_result = f" Role **{target_role.name}** assigned."
+                            role_result = f"\n✅ تم منح رتبة **{target_role.name}** للمتقدم تلقائياً."
                         else:
-                            role_result = " (Discord could not assign the role: role is higher than bot or bot lacks Manage Roles)."
+                            role_result = f"\n⚠️ **تذكير:** يرجى منح {member.mention} رتبة **{target_role.name}** يدوياً (البوت لا يملك الصلاحية الكافية)."
                     except (discord.HTTPException, discord.NotFound, PermissionError):
                         logger.exception("Application accepted, but its configured role could not be assigned")
-                        role_result = " (The application was accepted, but Discord could not assign the role)."
+                        role_result = f"\n⚠️ **تذكير:** تعذّر منح الرتبة تلقائياً — يرجى منح {member.mention} رتبة **{target_role.name}** يدوياً."
+                else:
+                    # لا توجد رتبة محددة → تذكير يدوي
+                    role_title_hint = opening.get("title", "الرتبة المناسبة") if opening else "الرتبة المناسبة"
+                    role_result = f"\n📌 **تذكير:** لا تنسَ منح {member.mention} رتبة **{role_title_hint}** يدوياً."
+
+            # ── إرسال DM للمتقدم ──
             try:
-                applicant = await bot.fetch_user(application["user_id"])
+                applicant_user = await bot.fetch_user(application["user_id"])
                 role_title = opening.get("title", "the role") if opening else "the role"
-                dm_message = (f"The staff team would like to interview you for **{role_title}** in **{interaction.guild.name}**." if decision == "INTERVIEW"
-                              else f"Your application for **{role_title}** was {decision.lower()} in **{interaction.guild.name}**.")
-                await applicant.send(dm_message)  # type: ignore[union-attr]
+                if decision == "INTERVIEW":
+                    dm_message = f"📞 فريق الستاف يريد إجراء مقابلة صوتية معك بخصوص تقديمك لـ **{role_title}** في **{interaction.guild.name}**.\nسيتم التواصل معك قريباً!"
+                elif decision == "ACCEPTED":
+                    dm_message = f"🎉 تهانينا! تم **قبول** طلبك للانضمام كـ **{role_title}** في **{interaction.guild.name}**!\nمرحباً بك في الفريق! 🎊"
+                else:
+                    dm_message = f"❌ نأسف لإبلاغك بأنه تم **رفض** طلبك لـ **{role_title}** في **{interaction.guild.name}**.\nيمكنك المحاولة مرة أخرى في المستقبل! 💪"
+                await applicant_user.send(dm_message)  # type: ignore[union-attr]
             except (discord.HTTPException, discord.NotFound):
                 logger.info("Could not DM applicant %s about decision", application["user_id"])
+
             if result.get("capacity_reached") and opening:
                 await close_announcement(bot, opening)
-            await interaction.followup.send(f"Application moved to {decision.lower()}.{role_result}", ephemeral=True)
+
+            # ── الرد على الأدمن/الأونر الذي اتخذ القرار ──
+            decision_ar = {"INTERVIEW": "مقابلة صوتية", "ACCEPTED": "قبول", "REJECTED": "رفض"}.get(decision, decision)
+            await interaction.followup.send(
+                f"✅ تم تحريك الطلب إلى **{decision_ar}**.{role_result}",
+                ephemeral=True,
+            )
         except Exception:
             logger.exception("Could not review application %s", application_id)
             await interaction.followup.send("Could not save the decision. Please try again.", ephemeral=True)
