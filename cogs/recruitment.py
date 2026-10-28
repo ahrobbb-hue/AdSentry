@@ -15,13 +15,83 @@ from cogs.moderation import is_admin
 logger = logging.getLogger("AdSentry.Recruitment")
 
 DEFAULT_RECRUITMENT_ROLES = (
-    "Administrator",
-    "Moderator",
-    "Ticket Support",
-    "Management",
-    "Events Team",
-    "Design Team",
+    "🎫 Ticket Support",
+    "🛡️ Moderator",
+    "💼 Management",
+    "👑 Administrator",
+    "🎪 Events Team",
+    "🎨 Design Team",
 )
+
+
+def get_applicant_role_info(role_name: str) -> tuple[str, int]:
+    """
+    Returns (applicant_role_name, recommended_slot) for a given recruitment role name.
+    All role names are strictly in English with expressive emojis.
+    Slot 1 = join-requests-1 (Low / Entry ranks: Ticket Support, Events Team, Design Team, Helper)
+    Slot 2 = join-requests-2 (Medium ranks: Moderator, Management, Supervisor)
+    Slot 3 = join-requests-3 (High ranks: Administrator, Head Mod, Executive, Owner)
+    """
+    import re
+    clean_name = role_name.strip()
+    low = clean_name.lower()
+
+    # High ranks -> Slot 3 (join-requests-3)
+    if any(k in low for k in ["admin", "administrator", "owner", "executive", "co-owner", "رئيس", "أدمن", "ادمن", "مدير عام"]):
+        return "👑 Applicant | Administrator", 3
+
+    # Medium ranks -> Slot 2 (join-requests-2)
+    if any(k in low for k in ["management", "manager", "supervisor", "مانجر", "مشرف", "إدارة", "ادارة"]):
+        return "💼 Applicant | Management", 2
+    if any(k in low for k in ["moderator", "mod", "مراقب"]):
+        return "🛡️ Applicant | Moderator", 2
+
+    # Low / Entry ranks -> Slot 1 (join-requests-1)
+    if any(k in low for k in ["ticket", "support", "helper", "تكت", "دعم", "مساعد"]):
+        return "🎫 Applicant | Ticket Support", 1
+    if any(k in low for k in ["event", "events", "فعاليات"]):
+        return "🎪 Applicant | Events Team", 1
+    if any(k in low for k in ["design", "designer", "media", "تصميم", "مصمم"]):
+        return "🎨 Applicant | Design Team", 1
+
+    # Default for custom roles: format as "📋 Applicant | <English Name>"
+    cleaned = re.sub(r'^[^\w\s]+', '', clean_name).strip() or clean_name
+    return f"📋 Applicant | {cleaned}", 1
+
+
+async def resolve_review_channel(guild: discord.Guild, bot: commands.Bot, slot: int) -> discord.TextChannel | None:
+    """Find the review channel for the given slot (1, 2, or 3)."""
+    # 1. Check database recruitment_review_channels
+    try:
+        client = await bot.db.get_client() if hasattr(bot.db, "get_client") else getattr(bot.db, "client", None)
+        if client:
+            res = (
+                await client.table("recruitment_review_channels")
+                .select("channel_id")
+                .eq("guild_id", guild.id)
+                .eq("slot", slot)
+                .maybe_single()
+                .execute()
+            )
+            if res and res.data and res.data.get("channel_id"):
+                ch = guild.get_channel(int(res.data["channel_id"]))
+                if isinstance(ch, discord.TextChannel):
+                    return ch
+    except Exception:
+        pass
+
+    # 2. Match exact slot channel name e.g. join-requests-1 / join-requests-2 / join-requests-3
+    needle = f"join-requests-{slot}"
+    for ch in guild.text_channels:
+        if needle in ch.name.lower():
+            return ch
+
+    # 3. Fallback to any join-requests channel
+    for ch in guild.text_channels:
+        if "join-requests" in ch.name.lower() or "طلبات-الانضمام" in ch.name:
+            return ch
+
+    return None
 
 
 def _can_manage(interaction: discord.Interaction) -> bool:
@@ -37,7 +107,7 @@ def _deadline_passed(opening: dict[str, Any]) -> bool:
 
 
 class RecruitmentDetailsModal(discord.ui.Modal):
-    def __init__(self, title: str | None, public_channel: discord.TextChannel, review_channel: discord.TextChannel, bot: commands.Bot, grant_role: discord.Role | None = None) -> None:
+    def __init__(self, title: str | None, public_channel: discord.TextChannel, review_channel: discord.TextChannel | None, bot: commands.Bot, grant_role: discord.Role | None = None) -> None:
         super().__init__(title="Create recruitment opening", timeout=600)
         self.role_title = title
         self.public_channel = public_channel
@@ -77,8 +147,16 @@ class RecruitmentDetailsModal(discord.ui.Modal):
             await interaction.response.send_message("Add at most two extra questions, each no longer than 45 characters.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
+
+        target_review = self.review_channel
+        if not target_review and interaction.guild:
+            _, slot = get_applicant_role_info(title)
+            target_review = await resolve_review_channel(interaction.guild, self.bot, slot)
+            if not target_review:
+                target_review = self.public_channel
+
         try:
-            await publish_opening(self.bot, interaction, title, description, self.public_channel, self.review_channel,
+            await publish_opening(self.bot, interaction, title, description, self.public_channel, target_review,
                                   seat_limit=seat_limit, duration_hours=duration_hours, questions=questions, grant_role=self.grant_role)
             await interaction.followup.send("Recruitment is now open.", ephemeral=True)
         except Exception:
@@ -87,7 +165,7 @@ class RecruitmentDetailsModal(discord.ui.Modal):
 
 
 class RecruitmentRoleSelect(discord.ui.Select):
-    def __init__(self, options: list[discord.SelectOption], public_channel: discord.TextChannel, review_channel: discord.TextChannel, grant_role: discord.Role | None) -> None:
+    def __init__(self, options: list[discord.SelectOption], public_channel: discord.TextChannel, review_channel: discord.TextChannel | None, grant_role: discord.Role | None = None) -> None:
         super().__init__(placeholder="Choose the role you are recruiting for", min_values=1, max_values=1, options=options, row=0)
         self.public_channel = public_channel
         self.review_channel = review_channel
@@ -99,19 +177,78 @@ class RecruitmentRoleSelect(discord.ui.Select):
             return
         bot: commands.Bot = interaction.client  # type: ignore[assignment]
         value = self.values[0]
+        chosen_title = None if value == "__other__" else value
+
+        target_review = self.review_channel
+        if not target_review and interaction.guild:
+            _, slot = get_applicant_role_info(chosen_title or "")
+            target_review = await resolve_review_channel(interaction.guild, bot, slot)
+            if not target_review:
+                target_review = self.public_channel
+
         await interaction.response.send_modal(RecruitmentDetailsModal(
-            title=None if value == "__other__" else value,
+            title=chosen_title,
             public_channel=self.public_channel,
-            review_channel=self.review_channel,
+            review_channel=target_review,
             bot=bot,
             grant_role=self.grant_role,
         ))
 
 
 class RecruitmentRoleSelectView(discord.ui.View):
-    def __init__(self, options: list[discord.SelectOption], public_channel: discord.TextChannel, review_channel: discord.TextChannel, grant_role: discord.Role | None = None) -> None:
+    def __init__(self, options: list[discord.SelectOption], public_channel: discord.TextChannel, review_channel: discord.TextChannel | None = None, grant_role: discord.Role | None = None) -> None:
         super().__init__(timeout=180)
         self.add_item(RecruitmentRoleSelect(options, public_channel, review_channel, grant_role))
+
+
+class RecruitmentPublishChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, bot: commands.Bot, review_channel: discord.TextChannel | None = None, grant_role: discord.Role | None = None) -> None:
+        super().__init__(
+            channel_types=[discord.ChannelType.text],
+            placeholder="📢 اختر القناة التي تريد نشر الإعلان فيها | Announcement Channel",
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+        self.bot = bot
+        self.review_channel = review_channel
+        self.grant_role = grant_role
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not _can_manage(interaction) or not interaction.guild:
+            await interaction.response.send_message("Only authorized staff can create recruitment openings.", ephemeral=True)
+            return
+        selected_ch = self.values[0]
+        if not isinstance(selected_ch, discord.TextChannel):
+            selected_ch = interaction.guild.get_channel(selected_ch.id)  # type: ignore[union-attr]
+        if not isinstance(selected_ch, discord.TextChannel):
+            await interaction.response.send_message("Please select a valid text channel.", ephemeral=True)
+            return
+
+        options = [discord.SelectOption(label=role, value=role) for role in DEFAULT_RECRUITMENT_ROLES]
+        try:
+            configured = await self.bot.db.get_custom_recruitment_roles(interaction.guild.id)
+            existing = {role.casefold() for role in DEFAULT_RECRUITMENT_ROLES}
+            for row in configured:
+                label = row["label"].strip()
+                if label and label.casefold() not in existing and len(options) < 24:
+                    options.append(discord.SelectOption(label=label, value=label))
+                    existing.add(label.casefold())
+        except Exception:
+            pass
+        options.append(discord.SelectOption(label="📋 Other / Custom Role", value="__other__", description="Enter custom English role"))
+
+        view = RecruitmentRoleSelectView(options, selected_ch, self.review_channel, self.grant_role)
+        await interaction.response.edit_message(
+            content=f"📢 **تم اختيار قناة النشر:** {selected_ch.mention}\n**الخطوة 2:** اختر الرتبة المطلوبة أدناه (سيتم توجيه الطلبات تلقائياً إلى قناة المراجعة المخصصة لها):",
+            view=view,
+        )
+
+
+class RecruitmentPublishChannelPickerView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, review_channel: discord.TextChannel | None = None, grant_role: discord.Role | None = None) -> None:
+        super().__init__(timeout=300)
+        self.add_item(RecruitmentPublishChannelSelect(bot, review_channel, grant_role))
 
 
 async def publish_opening(
@@ -250,6 +387,41 @@ class ApplicationModal(discord.ui.Modal):
                 review_channel = await self.bot.fetch_channel(current["review_channel_id"])
             if not isinstance(review_channel, discord.TextChannel):
                 raise RuntimeError("Configured review destination is not a text channel")
+
+            # 1. Determine and grant applicant role
+            applicant_role_name, _ = get_applicant_role_info(current["title"])
+            guild = interaction.guild
+            applicant_role = discord.utils.get(guild.roles, name=applicant_role_name)
+            if not applicant_role and guild.me.guild_permissions.manage_roles:
+                try:
+                    applicant_role = await guild.create_role(
+                        name=applicant_role_name,
+                        color=discord.Color.gold(),
+                        mentionable=False,
+                        reason=f"AdSentry applicant role for {current['title']}",
+                    )
+                except discord.HTTPException:
+                    logger.exception("Could not create applicant role %s", applicant_role_name)
+
+            if applicant_role and applicant_role < guild.me.top_role and isinstance(interaction.user, discord.Member):
+                try:
+                    await interaction.user.add_roles(applicant_role, reason=f"Applied for {current['title']}")
+                except discord.HTTPException:
+                    logger.exception("Could not assign applicant role %s", applicant_role_name)
+
+            # 2. Unlock the corresponding review channel for the applicant
+            if isinstance(review_channel, discord.TextChannel) and isinstance(interaction.user, discord.Member):
+                try:
+                    await review_channel.set_permissions(
+                        interaction.user,
+                        view_channel=True,
+                        read_message_history=True,
+                        send_messages=True,
+                        reason=f"AdSentry applicant access to #{review_channel.name} for #{record['id']}",
+                    )
+                except discord.HTTPException:
+                    logger.exception("Could not set channel overwrites for applicant")
+
             embed = discord.Embed(title=f"New staff application · #{record['id']}", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
             embed.add_field(name="Applicant", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
             embed.add_field(name="Position applied for", value=current["title"], inline=False)
@@ -259,7 +431,9 @@ class ApplicationModal(discord.ui.Modal):
             for field in self.custom_inputs:
                 embed.add_field(name=field.label, value=field.value[:1024], inline=False)
             await review_channel.send(embed=embed, view=ApplicationReviewView(record["id"]), allowed_mentions=discord.AllowedMentions.none())
-            await interaction.followup.send("Your application was sent to the staff team for review.", ephemeral=True)
+            
+            role_msg = f" وتم منحك رتبة **{applicant_role_name}** وفُتحت لك قناة {review_channel.mention} لمتابعة مراجعة طلبك." if applicant_role else f" وفُتحت لك قناة {review_channel.mention} لمتابعة مراجعة طلبك."
+            await interaction.followup.send(f"✅ تم إرسال طلبك بنجاح إلى الإدارة!{role_msg}", ephemeral=True)
         except Exception as exc:
             logger.exception("Could not process recruitment application")
             await interaction.followup.send("We couldn't submit your application. Please contact staff and try again later.", ephemeral=True)
@@ -328,20 +502,58 @@ class ApplicationReviewView(discord.ui.View):
                     await interaction.message.edit(embed=embed, view=None if decision != "INTERVIEW" else ApplicationReviewView(application_id))
                 except discord.HTTPException:
                     logger.exception("Decision saved but review card could not be updated for application %s", application_id)
-            role_result = ""
-            if decision == "ACCEPTED" and opening and opening.get("grant_role_id"):
+            # 1. Fetch applicant member
+            member = interaction.guild.get_member(application["user_id"]) if interaction.guild else None  # type: ignore[union-attr]
+            if not member and interaction.guild:
                 try:
-                    role = interaction.guild.get_role(opening["grant_role_id"])  # type: ignore[union-attr]
-                    member = interaction.guild.get_member(application["user_id"])  # type: ignore[union-attr]
-                    if not member:
-                        member = await interaction.guild.fetch_member(application["user_id"])  # type: ignore[union-attr]
-                    if not role or role.is_default() or role.managed or role >= interaction.guild.me.top_role:  # type: ignore[union-attr]
-                        raise PermissionError("Configured role is missing or above the bot's role")
-                    await member.add_roles(role, reason=f"Accepted for recruitment opening #{opening['id']}")
-                    role_result = f" Role {role.name} assigned."
-                except (discord.HTTPException, discord.NotFound, PermissionError):
-                    logger.exception("Application accepted, but its configured role could not be assigned")
-                    role_result = " The application was accepted, but Discord could not assign the configured role."
+                    member = await interaction.guild.fetch_member(application["user_id"])  # type: ignore[union-attr]
+                except (discord.HTTPException, discord.NotFound):
+                    member = None
+
+            # 2. On ACCEPTED or REJECTED: remove temporary applicant role and revoke review channel access
+            if decision in {"ACCEPTED", "REJECTED"} and member and interaction.guild:
+                applicant_role_name, _ = get_applicant_role_info(opening.get("title", "")) if opening else ("", 1)
+                if applicant_role_name:
+                    app_role = discord.utils.get(interaction.guild.roles, name=applicant_role_name)
+                    if app_role and app_role in member.roles and app_role < interaction.guild.me.top_role and interaction.guild.me.guild_permissions.manage_roles:
+                        try:
+                            await member.remove_roles(app_role, reason=f"Recruitment #{application_id} {decision}")
+                        except discord.HTTPException:
+                            logger.exception("Could not remove applicant role %s", applicant_role_name)
+
+                if isinstance(interaction.channel, discord.TextChannel):
+                    try:
+                        await interaction.channel.set_permissions(member, overwrite=None, reason=f"Recruitment #{application_id} {decision}")
+                    except discord.HTTPException:
+                        logger.exception("Could not remove channel overwrite for applicant %s", member.id)
+
+            # 3. If ACCEPTED: assign official staff role
+            role_result = ""
+            if decision == "ACCEPTED" and opening and member and interaction.guild:
+                target_role = None
+                if opening.get("grant_role_id"):
+                    target_role = interaction.guild.get_role(opening["grant_role_id"])
+                if not target_role:
+                    t_title = opening.get("title", "").strip()
+                    target_role = discord.utils.get(interaction.guild.roles, name=t_title)
+                    if not target_role:
+                        import re
+                        clean_t = re.sub(r'^[^\w\s]+', '', t_title).strip()
+                        if clean_t:
+                            for r in interaction.guild.roles:
+                                if r.name.lower() == clean_t.lower() or clean_t.lower() in r.name.lower():
+                                    target_role = r
+                                    break
+                if target_role:
+                    try:
+                        if not target_role.is_default() and not target_role.managed and target_role < interaction.guild.me.top_role and interaction.guild.me.guild_permissions.manage_roles:
+                            await member.add_roles(target_role, reason=f"Accepted for recruitment opening #{opening['id']}")
+                            role_result = f" Role **{target_role.name}** assigned."
+                        else:
+                            role_result = " (Discord could not assign the role: role is higher than bot or bot lacks Manage Roles)."
+                    except (discord.HTTPException, discord.NotFound, PermissionError):
+                        logger.exception("Application accepted, but its configured role could not be assigned")
+                        role_result = " (The application was accepted, but Discord could not assign the role)."
             try:
                 applicant = await bot.fetch_user(application["user_id"])
                 role_title = opening.get("title", "the role") if opening else "the role"
@@ -412,18 +624,30 @@ class RecruitmentCog(commands.Cog):
     async def before_recruitment_expiry_sweeper(self) -> None:
         await self.bot.wait_until_ready()
 
-    @recruitment.command(name="create", description="Create an opening using the role picker")
-    @app_commands.describe(public_channel="Where the opening will be announced", review_channel="Private staff channel for applications", grant_role="Optional Discord role to grant when an applicant is accepted")
+    @recruitment.command(name="create", description="Create an opening with channel and role pickers")
+    @app_commands.describe(
+        public_channel="Where the opening will be announced (optional, picker shown if omitted)",
+        review_channel="Private staff review channel (optional, automatically routed to slot 1/2/3 if omitted)",
+        grant_role="Optional Discord role to grant when an applicant is accepted",
+    )
     async def create_recruitment(
         self,
         interaction: discord.Interaction,
-        public_channel: discord.TextChannel,
-        review_channel: discord.TextChannel,
+        public_channel: discord.TextChannel | None = None,
+        review_channel: discord.TextChannel | None = None,
         grant_role: discord.Role | None = None,
     ) -> None:
         if not _can_manage(interaction) or not interaction.guild:
             await interaction.response.send_message("Only authorized staff can create recruitment openings.", ephemeral=True)
             return
+
+        # If public channel not given, let admin pick from ChannelSelect
+        if public_channel is None:
+            msg = "📢 **Step 1:** Choose the announcement channel for this recruitment opening:\n*(Applications will be automatically routed to join-requests-1/2/3 based on the role tier)*"
+            view = RecruitmentPublishChannelPickerView(self.bot, review_channel=review_channel, grant_role=grant_role)
+            await interaction.response.send_message(msg, view=view, ephemeral=True)
+            return
+
         try:
             options = [discord.SelectOption(label=role, value=role) for role in DEFAULT_RECRUITMENT_ROLES]
             configured = await self.bot.db.get_custom_recruitment_roles(interaction.guild.id)
@@ -433,9 +657,10 @@ class RecruitmentCog(commands.Cog):
                 if label and label.casefold() not in existing and len(options) < 24:
                     options.append(discord.SelectOption(label=label, value=label))
                     existing.add(label.casefold())
-            options.append(discord.SelectOption(label="Other", value="__other__", description="Enter a custom role name"))
+            options.append(discord.SelectOption(label="📋 Other / Custom Role", value="__other__", description="Enter a custom English role name"))
             await interaction.response.send_message(
-                "Choose the role for this opening. Selecting **Other** will ask you to enter its name.",
+                f"📢 **Selected Announcement Channel:** {public_channel.mention}\n"
+                f"**Step 2:** Choose the recruitment role from the list below:",
                 view=RecruitmentRoleSelectView(options, public_channel, review_channel, grant_role),
                 ephemeral=True,
             )

@@ -790,13 +790,242 @@ class ApplicationReviewView(discord.ui.View):
 # Modals
 # ──────────────────────────────────────────────────────────────────────────────
 
+class EventHubTimePickerView(discord.ui.View):
+    """Interactive Date & Time Picker using Discord Select Menus for EventHub."""
+
+    def __init__(
+        self,
+        announce_channel: discord.TextChannel,
+        admin_channel: discord.TextChannel | None,
+        title: str,
+        description: str,
+        capacity: int,
+        reg_type: str,
+        questions: list[str],
+        prizes: str | None,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.announce_channel = announce_channel
+        self.admin_channel = admin_channel
+        self.title = title
+        self.description = description
+        self.capacity = capacity
+        self.reg_type = reg_type
+        self.questions = questions
+        self.prizes = prizes
+
+        self.tz = timezone(timedelta(hours=3))
+        now_local = datetime.now(self.tz)
+
+        tomorrow = (now_local + timedelta(days=1)).date()
+        self.selected_date = tomorrow.isoformat()
+        self.selected_time = "20:00"
+
+        self._build_date_select(now_local)
+        self._build_time_select()
+        self._build_preset_select()
+
+    def _build_date_select(self, now_local: datetime) -> None:
+        arabic_days = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
+        arabic_months = [
+            "", "يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو",
+            "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"
+        ]
+        options = []
+        for i in range(14):
+            day = (now_local + timedelta(days=i)).date()
+            weekday_name = arabic_days[day.weekday()]
+            month_name = arabic_months[day.month]
+            tag = " (اليوم)" if i == 0 else " (غداً)" if i == 1 else " (عطلة نهاية الأسبوع)" if day.weekday() in (4, 5) else ""
+            label = f"{weekday_name} {day.day} {month_name}{tag}"
+            options.append(discord.SelectOption(
+                label=label[:100],
+                value=day.isoformat(),
+                description=f"التاريخ: {day.isoformat()}",
+                default=(day.isoformat() == self.selected_date),
+            ))
+        self.date_select = discord.ui.Select(
+            placeholder="📅 اختر تاريخ الفعالية من القائمة",
+            options=options,
+            row=0,
+        )
+        self.date_select.callback = self._on_date_change
+        self.add_item(self.date_select)
+
+    def _build_time_select(self) -> None:
+        time_choices = [
+            ("16:00", "04:00 PM (4:00 عصراً)"),
+            ("17:00", "05:00 PM (5:00 مساءً)"),
+            ("18:00", "06:00 PM (6:00 مساءً - المغرب)"),
+            ("19:00", "07:00 PM (7:00 مساءً)"),
+            ("20:00", "08:00 PM (8:00 مساءً - العشاء) [وقت مقترح]"),
+            ("21:00", "09:00 PM (9:00 مساءً - وقت الذروة)"),
+            ("22:00", "10:00 PM (10:00 مساءً)"),
+            ("23:00", "11:00 PM (11:00 مساءً)"),
+            ("00:00", "12:00 AM (12:00 منتصف الليل)"),
+            ("01:00", "01:00 AM (1:00 فجراً)"),
+            ("13:00", "01:00 PM (1:00 ظهراً)"),
+            ("14:00", "02:00 PM (2:00 ظهراً)"),
+            ("15:00", "03:00 PM (3:00 عصراً)"),
+            ("10:00", "10:00 AM (10:00 صباحاً)"),
+            ("11:00", "11:00 AM (11:00 صباحاً)"),
+            ("12:00", "12:00 PM (12:00 ظهراً)"),
+        ]
+        options = [
+            discord.SelectOption(label=label, value=val, default=(val == self.selected_time))
+            for val, label in time_choices
+        ]
+        self.time_select = discord.ui.Select(
+            placeholder="⏰ اختر ساعة وتوقيت الفعالية من القائمة",
+            options=options,
+            row=1,
+        )
+        self.time_select.callback = self._on_time_change
+        self.add_item(self.time_select)
+
+    def _build_preset_select(self) -> None:
+        preset_choices = [
+            ("+2h", "⚡ بعد ساعتين من الآن"),
+            ("+4h", "⚡ بعد 4 ساعات من الآن"),
+            ("+6h", "⚡ بعد 6 ساعات من الآن"),
+            ("tonight_9pm", "🌙 الليلة الساعة 9:00 مساءً"),
+            ("tomorrow_8pm", "📅 غداً الساعة 8:00 مساءً"),
+            ("weekend_8pm", "🎉 نهاية الأسبوع (الجمعة 8:30 مساءً)"),
+        ]
+        options = [
+            discord.SelectOption(label=label, value=val)
+            for val, label in preset_choices
+        ]
+        self.preset_select = discord.ui.Select(
+            placeholder="⚡ خيارات سريعة جاهزة (اختياري)",
+            options=options,
+            row=2,
+        )
+        self.preset_select.callback = self._on_preset_change
+        self.add_item(self.preset_select)
+
+    def get_selected_datetime(self) -> datetime:
+        d = datetime.fromisoformat(self.selected_date).date()
+        h, m = map(int, self.selected_time.split(":"))
+        local_dt = datetime(d.year, d.month, d.day, h, m, tzinfo=self.tz)
+        return local_dt.astimezone(timezone.utc)
+
+    def render_content(self) -> str:
+        dt_utc = self.get_selected_datetime()
+        ts = int(dt_utc.timestamp())
+        admin_info = f" · إشعارات الإدارة: {self.admin_channel.mention}" if self.admin_channel else ""
+        return (
+            f"🎪 **تحديد موعد الفعالية: {self.title}**\n\n"
+            f"📅 **الموعد المختار حالياً:** <t:{ts}:F> (<t:{ts}:R>)\n"
+            f"👥 **المقاعد:** `{self.capacity}`  ·  📢 **القناة:** {self.announce_channel.mention}{admin_info}\n\n"
+            "👇 **حدد التاريخ والساعة المناسبة من القوائم أدناه، ثم اضغط على زر التأكيد:**"
+        )
+
+    def _refresh_defaults(self) -> None:
+        for opt in self.date_select.options:
+            opt.default = (opt.value == self.selected_date)
+        for opt in self.time_select.options:
+            opt.default = (opt.value == self.selected_time)
+
+    async def _on_date_change(self, interaction: discord.Interaction) -> None:
+        self.selected_date = self.date_select.values[0]
+        self._refresh_defaults()
+        await interaction.response.edit_message(content=self.render_content(), view=self)
+
+    async def _on_time_change(self, interaction: discord.Interaction) -> None:
+        self.selected_time = self.time_select.values[0]
+        self._refresh_defaults()
+        await interaction.response.edit_message(content=self.render_content(), view=self)
+
+    async def _on_preset_change(self, interaction: discord.Interaction) -> None:
+        val = self.preset_select.values[0]
+        now_local = datetime.now(self.tz)
+        if val == "+2h":
+            target = now_local + timedelta(hours=2)
+        elif val == "+4h":
+            target = now_local + timedelta(hours=4)
+        elif val == "+6h":
+            target = now_local + timedelta(hours=6)
+        elif val == "tonight_9pm":
+            target = now_local.replace(hour=21, minute=0, second=0, microsecond=0)
+            if target <= now_local:
+                target += timedelta(days=1)
+        elif val == "tomorrow_8pm":
+            target = (now_local + timedelta(days=1)).replace(hour=20, minute=0, second=0, microsecond=0)
+        elif val == "weekend_8pm":
+            days_ahead = (4 - now_local.weekday()) % 7
+            if days_ahead == 0 and now_local.hour >= 20:
+                days_ahead = 7
+            target = (now_local + timedelta(days=days_ahead)).replace(hour=20, minute=30, second=0, microsecond=0)
+        else:
+            target = now_local + timedelta(hours=24)
+
+        self.selected_date = target.date().isoformat()
+        self.selected_time = f"{target.hour:02d}:00"
+        self._refresh_defaults()
+        await interaction.response.edit_message(content=self.render_content(), view=self)
+
+    @discord.ui.button(label="تأكيد ونشر الفعالية 🚀", style=discord.ButtonStyle.success, row=3)
+    async def confirm_event(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        start_utc = self.get_selected_datetime()
+        if start_utc <= datetime.now(timezone.utc):
+            await interaction.response.send_message("❌ الموعد المحدد أصبح في الماضي؛ يرجى اختيار موعد قادم.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        client = await interaction.client.db.get_client()  # type: ignore[attr-defined]
+        await _get_or_create_event_role(interaction.guild)
+        payload: dict = {
+            "guild_id": interaction.guild.id,
+            "created_by": interaction.user.id,
+            "title": self.title[:100],
+            "description": self.description[:1500],
+            "channel_id": self.announce_channel.id,
+            "starts_at": start_utc.isoformat(),
+            "capacity": self.capacity,
+            "status": "OPEN",
+            "reminder_at": (start_utc - timedelta(hours=24)).isoformat(),
+            "registration_type": self.reg_type,
+            "form_questions": self.questions,
+            "prizes": self.prizes,
+            "enable_waitlist": True,
+        }
+        if self.admin_channel:
+            payload["admin_channel_id"] = self.admin_channel.id
+        ev = (await client.table("events").insert(payload).execute()).data[0]
+        event_id = int(ev["id"])
+        pub_view = RegisterView(event_id, self.reg_type)
+        msg = await self.announce_channel.send(embed=_event_embed(ev), view=pub_view, allowed_mentions=discord.AllowedMentions.none())
+        interaction.client.add_view(pub_view)  # type: ignore[attr-defined]
+        await client.table("events").update({"announcement_message_id": msg.id}).eq("id", event_id).execute()
+        if self.admin_channel:
+            adm_view = AdminView(event_id)
+            amsg = await self.admin_channel.send(
+                embed=_admin_embed(ev, creator=str(interaction.user)),
+                view=adm_view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            interaction.client.add_view(adm_view)  # type: ignore[attr-defined]
+            await client.table("events").update({"admin_message_id": amsg.id}).eq("id", event_id).execute()
+
+        ts = int(start_utc.timestamp())
+        await interaction.edit_original_response(
+            content=f"🎉 **تم إنشاء الفعالية #{event_id} ونشرها بنجاح في {self.announce_channel.mention}**!\n"
+                    f"📅 **الموعد:** <t:{ts}:F> (<t:{ts}:R>)",
+            view=None,
+        )
+
+    @discord.ui.button(label="إلغاء ❌", style=discord.ButtonStyle.secondary, row=3)
+    async def cancel_event(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="❌ تم إلغاء إنشاء الفعالية.", view=None)
+
+
 class EventCreateModal(discord.ui.Modal, title="🎪  إنشاء فعالية جديدة"):
-    """Staff modal — 5 fields and the event goes live. No slash params to memorise."""
+    """Staff modal — fills metadata and opens interactive DateTimePicker."""
 
     f_title    = discord.ui.TextInput(label="اسم الفعالية", max_length=100, placeholder="مثال: بطولة فوت سيك")
     f_desc     = discord.ui.TextInput(label="الوصف", style=discord.TextStyle.paragraph, max_length=1500, placeholder="تفاصيل الفعالية...")
     f_capacity = discord.ui.TextInput(label="عدد المقاعد", max_length=4, default="25", placeholder="25")
-    f_date     = discord.ui.TextInput(label="الموعد  ( DD/MM HH:MM  أو  +48h )", max_length=20, placeholder="15/11 21:00")
     f_extras   = discord.ui.TextInput(
         label="إضافات — سطر الجوائز: ... ثم أسئلة النموذج",
         style=discord.TextStyle.paragraph, max_length=600, required=False,
@@ -815,15 +1044,7 @@ class EventCreateModal(discord.ui.Modal, title="🎪  إنشاء فعالية ج
             capacity = max(1, min(500, int(self.f_capacity.value.strip())))
         except ValueError:
             return await interaction.response.send_message("❌  عدد المقاعد يجب أن يكون رقماً بين 1 و500.", ephemeral=True)
-        try:
-            start_utc = _parse_date(self.f_date.value)
-            if start_utc <= datetime.now(timezone.utc):
-                raise ValueError
-        except ValueError:
-            return await interaction.response.send_message(
-                "❌  الموعد غير صحيح أو في الماضي.\n**أمثلة:** `15/11 21:00`  ·  `15/11/2026 21:00`  ·  `+48h`",
-                ephemeral=True,
-            )
+
         prizes: str | None = None
         questions: list[str] = []
         if self.f_extras.value:
@@ -837,37 +1058,20 @@ class EventCreateModal(discord.ui.Modal, title="🎪  إنشاء فعالية ج
                 else:
                     questions.append(line)
         reg_type = "FORM" if questions else "DIRECT"
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        client = await interaction.client.db.get_client()  # type: ignore[attr-defined]
-        await _get_or_create_event_role(interaction.guild)
-        payload: dict = {
-            "guild_id": interaction.guild.id, "created_by": interaction.user.id,
-            "title": self.f_title.value[:100], "description": self.f_desc.value[:1500],
-            "channel_id": self.announce_channel.id,
-            "starts_at": start_utc.isoformat(), "capacity": capacity, "status": "OPEN",
-            "reminder_at": (start_utc - timedelta(hours=24)).isoformat(),
-            "registration_type": reg_type, "form_questions": questions,
-            "prizes": prizes, "enable_waitlist": True,
-        }
-        if self.admin_channel:
-            payload["admin_channel_id"] = self.admin_channel.id
-        ev = (await client.table("events").insert(payload).execute()).data[0]
-        event_id = int(ev["id"])
-        pub_view = RegisterView(event_id, reg_type)
-        msg = await self.announce_channel.send(embed=_event_embed(ev), view=pub_view, allowed_mentions=discord.AllowedMentions.none())
-        interaction.client.add_view(pub_view)  # type: ignore[attr-defined]
-        await client.table("events").update({"announcement_message_id": msg.id}).eq("id", event_id).execute()
-        if self.admin_channel:
-            adm_view = AdminView(event_id)
-            amsg = await self.admin_channel.send(
-                embed=_admin_embed(ev, creator=str(interaction.user)),
-                view=adm_view,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            interaction.client.add_view(adm_view)  # type: ignore[attr-defined]
-            await client.table("events").update({"admin_message_id": amsg.id}).eq("id", event_id).execute()
-        await interaction.followup.send(
-            f"✅  تم إنشاء الفعالية **#{event_id}** ونشرها في {self.announce_channel.mention}!",
+
+        picker = EventHubTimePickerView(
+            announce_channel=self.announce_channel,
+            admin_channel=self.admin_channel,
+            title=self.f_title.value.strip(),
+            description=self.f_desc.value.strip(),
+            capacity=capacity,
+            reg_type=reg_type,
+            questions=questions,
+            prizes=prizes,
+        )
+        await interaction.response.send_message(
+            content=picker.render_content(),
+            view=picker,
             ephemeral=True,
         )
 
