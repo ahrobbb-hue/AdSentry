@@ -19,11 +19,12 @@ from utils import setup_logger
 logger = setup_logger("AdSentry", level=Config.LOG_LEVEL)
 
 
-async def start_health_check_server() -> None:
+async def start_health_check_server() -> web.AppRunner | None:
     """Starts an asynchronous HTTP server to satisfy Render Web Service port checks."""
     port_str = os.getenv("PORT")
     if not port_str:
-        return
+        return None
+    runner: web.AppRunner | None = None
     try:
         port = int(port_str)
         app = web.Application()
@@ -34,8 +35,21 @@ async def start_health_check_server() -> None:
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
         logger.info(f"Render Web Service health-check listening on port {port}")
+        return runner
     except Exception as e:
+        if runner is not None:
+            await runner.cleanup()
         logger.warning(f"Could not bind health-check server on PORT {port_str}: {e}")
+        return None
+
+
+def register_persistent_views(bot: commands.Bot, active_post_ids: list[int]) -> None:
+    """Registers the post-specific controls needed to handle interactions after restart."""
+    from cogs.features import AdInterestView, TranslateView
+
+    bot.add_view(TranslateView(post_id=0, ad_content="", ad_title=""))
+    for post_id in dict.fromkeys([0, *active_post_ids]):
+        bot.add_view(AdInterestView(post_id=post_id))
 
 
 class AdSentryBot(commands.Bot):
@@ -53,16 +67,21 @@ class AdSentryBot(commands.Bot):
         )
 
         self.db = SupabaseDatabase()
+        self.health_check_runner: web.AppRunner | None = None
 
     async def setup_hook(self) -> None:
         """Executes asynchronous setup before the bot connects to Discord gateway."""
         logger.info("Initializing AdSentry Core Systems...")
 
         # 1. Initialize Supabase Database Connection
+        database_ready = False
         try:
             await self.db.connect()
-            await self.db.check_connection()
-            logger.info("Supabase database handler initialized.")
+            database_ready = await self.db.check_connection()
+            if database_ready:
+                logger.info("Supabase database handler initialized.")
+            else:
+                logger.warning("Supabase is unreachable; database-backed features may be unavailable.")
         except Exception as e:
             logger.warning(f"Notice during Supabase initialization: {e}")
 
@@ -79,13 +98,16 @@ class AdSentryBot(commands.Bot):
                 except Exception as e:
                     logger.error(f"Failed to load extension {cog_name}: {e}", exc_info=True)
 
-        # 3. Register Persistent Views (survive bot restarts)
-        # These views have timeout=None and use stable custom_id patterns
-        from cogs.features import AdInterestView, TranslateView
-        # Register generic persistent view instances — Discord matches them by custom_id prefix
-        self.add_view(AdInterestView(post_id=0))
-        self.add_view(TranslateView(post_id=0, ad_content="", ad_title=""))
-        logger.info("Registered persistent AdInterestView and TranslateView.")
+        # 3. Restore post-specific persistent views. Discord matches custom IDs
+        # exactly; registering an ID of 0 does not cover buttons with a post ID.
+        active_post_ids: list[int] = []
+        if database_ready:
+            try:
+                active_post_ids = await self.db.get_active_post_ids()
+            except Exception:
+                logger.exception("Could not restore active ad button handlers from Supabase.")
+        register_persistent_views(self, active_post_ids)
+        logger.info("Registered persistent ad interest and translation views.")
 
         # 4. Synchronize Application (Slash) Commands
         if Config.GUILD_ID:
@@ -102,7 +124,7 @@ class AdSentryBot(commands.Bot):
             logger.info(f"Synced {len(synced)} global slash command(s).")
 
         # 5. Start Render Web Service Health-Check Server (if PORT is set)
-        await start_health_check_server()
+        self.health_check_runner = await start_health_check_server()
 
     async def on_ready(self) -> None:
         """Triggered when the bot is connected and ready."""
@@ -134,6 +156,9 @@ class AdSentryBot(commands.Bot):
     async def close(self) -> None:
         """Gracefully cleanup connections upon bot shutdown."""
         logger.info("Shutting down AdSentry...")
+        if self.health_check_runner is not None:
+            await self.health_check_runner.cleanup()
+            self.health_check_runner = None
         await self.db.close()
         await super().close()
 

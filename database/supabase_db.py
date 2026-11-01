@@ -578,6 +578,28 @@ class SupabaseDatabase:
             logger.error(f"Error creating active post for submission #{submission_id}: {e}", exc_info=True)
             raise
 
+    async def get_active_post_ids(self) -> list[int]:
+        """Returns IDs for active posts whose persistent controls must be restored."""
+        client = await self.get_client()
+        post_ids: list[int] = []
+        page_size = 1000
+        offset = 0
+
+        while True:
+            response = (
+                await client.table("active_posts")
+                .select("id")
+                .eq("is_expired", False)
+                .order("id")
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            rows = response.data or []
+            post_ids.extend(int(row["id"]) for row in rows if row.get("id") is not None)
+            if len(rows) < page_size:
+                return post_ids
+            offset += page_size
+
     async def get_expired_posts(self) -> list[dict[str, Any]]:
         """
         Retrieves all active posts whose expiration timestamp has passed and are not yet marked expired.
