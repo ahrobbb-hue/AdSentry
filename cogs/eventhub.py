@@ -1,6 +1,7 @@
 """EventHub: professional events management — UX-optimised for staff and members."""
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -17,7 +18,14 @@ from cogs.moderation import is_staff
 
 logger = logging.getLogger("AdSentry.EventHub")
 
-EVENT_ROLE_NAME = "🎉 Events"
+EVENT_ROLE_NAMES = ("Event", "Event 2", "Event 3", "Event 4", "Event 5")
+_EVENT_ROLE_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _event_role_name(slot: int) -> str:
+    if not 1 <= slot <= len(EVENT_ROLE_NAMES):
+        raise ValueError(f"Event role slot must be between 1 and {len(EVENT_ROLE_NAMES)}.")
+    return EVENT_ROLE_NAMES[slot - 1]
 
 # ─── Smart Date Parser ────────────────────────────────────────────────────────
 
@@ -208,46 +216,133 @@ def _confirm_embed(ev: dict) -> discord.Embed:
 # Role helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def _get_or_create_event_role(guild: discord.Guild) -> discord.Role | None:
-    role = discord.utils.get(guild.roles, name=EVENT_ROLE_NAME)
-    if role:
-        return role
-    try:
-        return await guild.create_role(
-            name=EVENT_ROLE_NAME,
-            color=discord.Color.from_rgb(114, 137, 218),
-            mentionable=True,
-            reason="AdSentry EventHub — رتبة المشاركين الموحدة",
-        )
-    except discord.Forbidden:
+async def _ensure_event_roles(guild: discord.Guild) -> list[discord.Role]:
+    lock = _EVENT_ROLE_LOCKS.setdefault(guild.id, asyncio.Lock())
+    async with lock:
+        return await _create_event_roles(guild)
+
+
+async def _create_event_roles(guild: discord.Guild) -> list[discord.Role]:
+    bot_member = guild.me
+    if bot_member is None or not bot_member.guild_permissions.manage_roles:
+        raise RuntimeError("AdSentry needs Manage Roles to provision event roles.")
+
+    roles_by_name = {role.name: role for role in guild.roles}
+    legacy_role = roles_by_name.get("🎉 Events")
+    if legacy_role and _event_role_name(1) not in roles_by_name:
+        try:
+            await legacy_role.edit(name=_event_role_name(1), reason="AdSentry EventHub role migration")
+            roles_by_name.pop(legacy_role.name, None)
+            roles_by_name[_event_role_name(1)] = legacy_role
+        except discord.HTTPException:
+            logger.exception("Could not rename the legacy EventHub participant role in guild %s", guild.id)
+
+    roles: list[discord.Role] = []
+    for slot in range(1, len(EVENT_ROLE_NAMES) + 1):
+        name = _event_role_name(slot)
+        role = roles_by_name.get(name)
+        if role is None:
+            role = await guild.create_role(
+                name=name,
+                color=discord.Color.from_rgb(114, 137, 218),
+                mentionable=False,
+                reason="AdSentry EventHub participant role",
+            )
+            roles_by_name[name] = role
+        if role >= bot_member.top_role:
+            raise RuntimeError(f"AdSentry's highest role must be above {name}.")
+        roles.append(role)
+    return roles
+
+
+async def _event_role(
+    guild: discord.Guild,
+    event_id: int,
+    client: Any,
+) -> discord.Role | None:
+    rows = (
+        await client.table("events")
+        .select("role_slot,role_id")
+        .eq("id", event_id)
+        .eq("guild_id", guild.id)
+        .limit(1)
+        .execute()
+    ).data or []
+    if not rows:
         return None
 
+    event = rows[0]
+    slot = event.get("role_slot")
+    if slot is not None and 1 <= int(slot) <= len(EVENT_ROLE_NAMES):
+        roles = await _ensure_event_roles(guild)
+        role = roles[int(slot) - 1]
+        if event.get("role_id") != role.id:
+            await client.table("events").update({"role_id": role.id}).eq("id", event_id).execute()
+        return role
 
-async def _grant_event_role(guild: discord.Guild, user_id: int) -> None:
-    role = await _get_or_create_event_role(guild)
+    role_id = event.get("role_id")
+    return guild.get_role(int(role_id)) if role_id else None
+
+
+async def _grant_event_role(
+    guild: discord.Guild,
+    user_id: int,
+    event_id: int,
+    client: Any,
+) -> discord.Role | None:
+    try:
+        role = await _event_role(guild, event_id, client)
+    except Exception:
+        logger.exception("Could not resolve participant role for event %s in guild %s", event_id, guild.id)
+        return None
     if not role:
+        logger.error("Could not resolve participant role for event %s in guild %s", event_id, guild.id)
+        return None
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except discord.NotFound:
+            return None
+        except discord.HTTPException:
+            logger.exception("Could not fetch participant %s for event %s", user_id, event_id)
+            return None
+    if role not in member.roles:
+        try:
+            await member.add_roles(role, reason=f"Registered for EventHub event #{event_id}")
+        except discord.HTTPException:
+            logger.exception("Could not assign event role %s to member %s", role.id, user_id)
+            return None
+    return role
+
+
+async def _revoke_event_role(
+    guild: discord.Guild,
+    user_id: int,
+    event_id: int,
+    client: Any,
+) -> None:
+    try:
+        role = await _event_role(guild, event_id, client)
+    except Exception:
+        logger.exception("Could not resolve role to revoke for event %s in guild %s", event_id, guild.id)
         return
     member = guild.get_member(user_id)
-    if member and role not in member.roles:
+    if role and member and role in member.roles:
         try:
-            await member.add_roles(role, reason="تسجيل في فعالية")
+            await member.remove_roles(role, reason=f"Cancelled EventHub event #{event_id} registration")
         except discord.HTTPException:
-            pass
-
-
-async def _revoke_event_role(guild: discord.Guild, user_id: int) -> None:
-    role = discord.utils.get(guild.roles, name=EVENT_ROLE_NAME)
-    if not role:
-        return
-    member = guild.get_member(user_id)
-    if member and role in member.roles:
-        try:
-            await member.remove_roles(role, reason="انتهاء/إلغاء الفعالية")
-        except discord.HTTPException:
-            pass
+            logger.exception("Could not remove event role %s from member %s", role.id, user_id)
 
 
 async def _strip_role_all(guild: discord.Guild, event_id: int, client: Any) -> None:
+    try:
+        role = await _event_role(guild, event_id, client)
+    except Exception:
+        logger.exception("Could not resolve role to remove for closed event %s", event_id)
+        return
+    if role is None:
+        return
     rows = (
         await client.table("event_participants")
         .select("user_id")
@@ -256,7 +351,12 @@ async def _strip_role_all(guild: discord.Guild, event_id: int, client: Any) -> N
         .execute()
     ).data or []
     for r in rows:
-        await _revoke_event_role(guild, int(r["user_id"]))
+        member = guild.get_member(int(r["user_id"]))
+        if member and role in member.roles:
+            try:
+                await member.remove_roles(role, reason=f"EventHub event #{event_id} closed")
+            except discord.HTTPException:
+                logger.exception("Could not remove event role %s from member %s", role.id, member.id)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -357,10 +457,10 @@ class RegisterView(discord.ui.View):
             return await interaction.followup.send("ℹ️  أنت لست مسجلًا في هذه الفعالية أصلاً.", ephemeral=True)
         if result == "error":
             return await interaction.followup.send("⚠️  تعذر إلغاء تسجيلك، حاول مجدداً.", ephemeral=True)
-        await _revoke_event_role(interaction.guild, interaction.user.id)
+        await _revoke_event_role(interaction.guild, interaction.user.id, self.event_id, client)
         promoted_id = d.get("promoted_user_id")
         if promoted_id:
-            await _grant_event_role(interaction.guild, int(promoted_id))
+            await _grant_event_role(interaction.guild, int(promoted_id), self.event_id, client)
             promo = interaction.guild.get_member(int(promoted_id))
             if promo:
                 try:
@@ -395,12 +495,16 @@ class _ConfirmView(discord.ui.View):
         }).execute()
         d = (resp.data[0] if isinstance(resp.data, list) else resp.data) or {}
         result = d.get("result", "error")
+        role = None
         if result == "registered":
-            await _grant_event_role(interaction.guild, interaction.user.id)
+            role = await _grant_event_role(interaction.guild, interaction.user.id, self.event_id, client)
         await _refresh_embed(interaction.client, self.event_id)  # type: ignore[arg-type]
         self.stop()
         msgs = {
-            "registered": "✅  تم تسجيلك! ستجد رتبة الفعالية على ملفك الشخصي.",
+            "registered": (
+                f"✅  تم تسجيلك! أُضيفت لك رتبة `{role.name}`."
+                if role else "✅  تم تسجيلك، لكن تعذرت إضافة رتبة المسابقة؛ أبلغ الإدارة."
+            ),
             "waitlist":   f"⏳  امتلأت المقاعد — أنت في قائمة الانتظار (المركز {d.get('position', '؟')}).",
             "duplicate":  "ℹ️  أنت مسجل مسبقًا في هذه الفعالية.",
             "full":       "❌  اكتملت المقاعد وقائمة الانتظار مغلقة.",
@@ -457,9 +561,14 @@ class FormModal(discord.ui.Modal):
                 "📬  وصل طلبك للمشرفين! سنُعلمك بالقرار عبر الرسائل الخاصة.", ephemeral=True
             )
         if result == "registered":
-            await _grant_event_role(interaction.guild, interaction.user.id)
+            role = await _grant_event_role(interaction.guild, interaction.user.id, self.event_id, client)
+        else:
+            role = None
         msgs = {
-            "registered": "✅  تم قبول تسجيلك مباشرةً!",
+            "registered": (
+                f"✅  تم قبول تسجيلك مباشرةً! أُضيفت لك رتبة `{role.name}`."
+                if role else "✅  تم قبول تسجيلك مباشرةً، لكن تعذرت إضافة رتبة المسابقة؛ أبلغ الإدارة."
+            ),
             "waitlist":   f"⏳  أنت في قائمة الانتظار (المركز {d.get('position', '؟')}).",
             "suspended":  "🚫  أنت موقوف مؤقتاً عن الفعاليات.",
             "duplicate":  "ℹ️  طلبك قيد المراجعة أو أنت مسجل مسبقاً.",
@@ -760,8 +869,9 @@ class ApplicationReviewView(discord.ui.View):
         if not res:
             return await interaction.followup.send("الطلب مراجع مسبقاً.")
         p = res[0]
+        role = None
         if new_status == "REGISTERED":
-            await _grant_event_role(interaction.guild, int(p["user_id"]))
+            role = await _grant_event_role(interaction.guild, int(p["user_id"]), self.event_id, client)
         try:
             u = await interaction.client.fetch_user(int(p["user_id"]))  # type: ignore[attr-defined]
             await u.send(embed=discord.Embed(
@@ -778,7 +888,11 @@ class ApplicationReviewView(discord.ui.View):
             e.color = discord.Color.green()
             e.set_footer(text=f"✅  قبل من {interaction.user}  •  {new_status}")
             await interaction.message.edit(embed=e, view=None)
-        await interaction.followup.send(f"✅  قُبل الطلب كـ{new_status}.")
+        role_notice = (
+            f" أُضيفت رتبة `{role.name}`."
+            if role else " تعذرت إضافة رتبة المسابقة؛ تحقق من صلاحيات الرتب."
+        ) if new_status == "REGISTERED" else ""
+        await interaction.followup.send(f"✅  قُبل الطلب كـ{new_status}.{role_notice}")
 
     async def _reject(self, interaction: discord.Interaction) -> None:
         if not interaction.guild or not is_staff(interaction.user):
@@ -972,45 +1086,118 @@ class EventHubTimePickerView(discord.ui.View):
             await interaction.response.send_message("❌ الموعد المحدد أصبح في الماضي؛ يرجى اختيار موعد قادم.", ephemeral=True)
             return
 
+        if not interaction.guild:
+            await interaction.response.send_message("يجب إنشاء الفعالية داخل السيرفر.", ephemeral=True)
+            return
+
         await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            roles = await _ensure_event_roles(interaction.guild)
+        except Exception:
+            logger.exception("Could not provision EventHub participant roles for guild %s", interaction.guild.id)
+            await interaction.followup.send(
+                "تعذر تجهيز رتب المسابقات. تأكد أن للبوت صلاحية **Manage Roles** وأن رتبته أعلى من رتب Event.",
+                ephemeral=True,
+            )
+            return
+
         client = await interaction.client.db.get_client()  # type: ignore[attr-defined]
-        await _get_or_create_event_role(interaction.guild)
-        payload: dict = {
-            "guild_id": interaction.guild.id,
-            "created_by": interaction.user.id,
-            "title": self.title[:100],
-            "description": self.description[:1500],
-            "channel_id": self.announce_channel.id,
-            "starts_at": start_utc.isoformat(),
-            "capacity": self.capacity,
-            "status": "OPEN",
-            "reminder_at": (start_utc - timedelta(hours=24)).isoformat(),
-            "registration_type": self.reg_type,
-            "form_questions": self.questions,
-            "prizes": self.prizes,
-            "enable_waitlist": True,
-        }
-        if self.admin_channel:
-            payload["admin_channel_id"] = self.admin_channel.id
-        ev = (await client.table("events").insert(payload).execute()).data[0]
+        try:
+            response = await client.rpc("create_event_with_slot", {
+                "p_guild_id": interaction.guild.id,
+                "p_created_by": interaction.user.id,
+                "p_title": self.title[:100],
+                "p_description": self.description[:1500],
+                "p_channel_id": self.announce_channel.id,
+                "p_starts_at": start_utc.isoformat(),
+                "p_capacity": self.capacity,
+                "p_reminder_at": (start_utc - timedelta(hours=24)).isoformat(),
+                "p_registration_type": self.reg_type,
+                "p_form_questions": self.questions,
+                "p_prizes": self.prizes,
+                "p_admin_channel_id": self.admin_channel.id if self.admin_channel else None,
+                "p_role_ids": [role.id for role in roles],
+            }).execute()
+            result = response.data[0] if isinstance(response.data, list) else response.data
+            if not isinstance(result, dict):
+                raise RuntimeError("Event creation returned an invalid database response.")
+            if not result.get("created"):
+                if result.get("reason") == "limit":
+                    await interaction.followup.send(
+                        "وصل السيرفر إلى الحد الأقصى: توجد خمس فعاليات/مسابقات مفتوحة بالفعل. أغلق واحدة قبل إنشاء غيرها.",
+                        ephemeral=True,
+                    )
+                    return
+                raise RuntimeError(f"Event creation was rejected: {result.get('reason')}")
+            ev = result.get("event")
+            if not isinstance(ev, dict):
+                raise RuntimeError("The database did not return the created event.")
+        except Exception:
+            logger.exception("Could not create EventHub event for guild %s", interaction.guild.id)
+            await interaction.followup.send(
+                "تعذر إنشاء المسابقة. تحقق من تطبيق ترحيل `eventhub_contest_slots_migration.sql` ثم حاول مجددًا.",
+                ephemeral=True,
+            )
+            return
+
         event_id = int(ev["id"])
         pub_view = RegisterView(event_id, self.reg_type)
-        msg = await self.announce_channel.send(embed=_event_embed(ev), view=pub_view, allowed_mentions=discord.AllowedMentions.none())
-        interaction.client.add_view(pub_view)  # type: ignore[attr-defined]
-        await client.table("events").update({"announcement_message_id": msg.id}).eq("id", event_id).execute()
-        if self.admin_channel:
-            adm_view = AdminView(event_id)
-            amsg = await self.admin_channel.send(
-                embed=_admin_embed(ev, creator=str(interaction.user)),
-                view=adm_view,
+        msg: discord.Message | None = None
+        try:
+            msg = await self.announce_channel.send(
+                embed=_event_embed(ev),
+                view=pub_view,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-            interaction.client.add_view(adm_view)  # type: ignore[attr-defined]
-            await client.table("events").update({"admin_message_id": amsg.id}).eq("id", event_id).execute()
+            await client.table("events").update(
+                {"announcement_message_id": msg.id}
+            ).eq("id", event_id).execute()
+        except Exception:
+            logger.exception("Could not publish EventHub announcement for event %s", event_id)
+            if msg:
+                try:
+                    await msg.delete()
+                except discord.HTTPException:
+                    logger.exception("Could not remove incomplete announcement for event %s", event_id)
+            try:
+                await client.table("events").update({
+                    "status": "CANCELLED",
+                    "closed_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", event_id).eq("status", "OPEN").execute()
+            except Exception:
+                logger.exception("Could not release the reserved event slot for event %s", event_id)
+                await interaction.followup.send(
+                    "تعذر نشر الإعلان، كما تعذر تحرير خانة المسابقة تلقائيًا. أبلغ الإدارة لإغلاق الطلب من قاعدة البيانات.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.followup.send(
+                "تعذر نشر إعلان المسابقة في القناة المحددة؛ أُلغيت عملية الإنشاء حتى لا يبقى مقعد مفتوح محجوزًا.",
+                ephemeral=True,
+            )
+            return
+
+        interaction.client.add_view(pub_view)  # type: ignore[attr-defined]
+        if self.admin_channel:
+            try:
+                adm_view = AdminView(event_id)
+                amsg = await self.admin_channel.send(
+                    embed=_admin_embed(ev, creator=str(interaction.user)),
+                    view=adm_view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                interaction.client.add_view(adm_view)  # type: ignore[attr-defined]
+                await client.table("events").update(
+                    {"admin_message_id": amsg.id}
+                ).eq("id", event_id).execute()
+            except Exception:
+                logger.exception("Event %s was published but its admin control card could not be delivered", event_id)
 
         ts = int(start_utc.timestamp())
+        role_name = _event_role_name(int(ev["role_slot"]))
         await interaction.edit_original_response(
-            content=f"🎉 **تم إنشاء الفعالية #{event_id} ونشرها بنجاح في {self.announce_channel.mention}**!\n"
+            content=f"🎉 **تم إنشاء الفعالية/المسابقة #{event_id} ونشرها بنجاح في {self.announce_channel.mention}**!\n"
+                    f"🏷️ **رتبة المشاركين:** `{role_name}`\n"
                     f"📅 **الموعد:** <t:{ts}:F> (<t:{ts}:R>)",
             view=None,
         )
@@ -1375,6 +1562,7 @@ class EventHub(commands.GroupCog, group_name="event"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self._participant_roles_synced = False
 
     async def cog_load(self) -> None:
         self.reminder_sweeper.start()
@@ -1386,6 +1574,77 @@ class EventHub(commands.GroupCog, group_name="event"):
                 self.bot.add_view(AdminView(int(r["id"])))
         except Exception:
             logger.exception("Could not restore persistent event views")
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        if self._participant_roles_synced:
+            return
+        try:
+            client = await self.bot.db.get_client()
+            events = (
+                await client.table("events")
+                .select("id,guild_id,role_slot")
+                .eq("status", "OPEN")
+                .not_.is_("role_slot", "null")
+                .execute()
+            ).data or []
+            expected_roles: dict[tuple[int, int], set[int]] = {}
+            succeeded = True
+            for event in events:
+                guild = self.bot.get_guild(int(event["guild_id"]))
+                if guild is None:
+                    succeeded = False
+                    continue
+                role = await _event_role(guild, int(event["id"]), client)
+                if role is None:
+                    succeeded = False
+                    continue
+                participants = (
+                    await client.table("event_participants")
+                    .select("user_id")
+                    .eq("event_id", int(event["id"]))
+                    .eq("status", "REGISTERED")
+                    .execute()
+                ).data or []
+                for participant in participants:
+                    user_id = int(participant["user_id"])
+                    expected_roles.setdefault((guild.id, user_id), set()).add(role.id)
+                    member = guild.get_member(user_id)
+                    if member is None:
+                        try:
+                            member = await guild.fetch_member(user_id)
+                        except discord.NotFound:
+                            continue
+                        except discord.HTTPException:
+                            logger.exception("Could not load EventHub participant %s during role sync", user_id)
+                            succeeded = False
+                            continue
+                    if role not in member.roles:
+                        try:
+                            await member.add_roles(role, reason=f"Restore EventHub event #{event['id']} role")
+                        except discord.HTTPException:
+                            logger.exception("Could not restore EventHub role for participant %s", user_id)
+                            succeeded = False
+
+            for (guild_id, user_id), role_ids in expected_roles.items():
+                guild = self.bot.get_guild(guild_id)
+                member = guild.get_member(user_id) if guild else None
+                if guild is None or member is None:
+                    continue
+                for legacy_name in ("Event", "🎉 Events"):
+                    legacy_role = discord.utils.get(guild.roles, name=legacy_name)
+                    if legacy_role and legacy_role.id not in role_ids and legacy_role in member.roles:
+                        try:
+                            await member.remove_roles(
+                                legacy_role,
+                                reason="Replace shared EventHub role with event-specific roles",
+                            )
+                        except discord.HTTPException:
+                            logger.exception("Could not remove legacy EventHub role from participant %s", user_id)
+                            succeeded = False
+            self._participant_roles_synced = succeeded
+        except Exception:
+            logger.exception("Could not synchronize participant roles for open EventHub events")
 
     def cog_unload(self) -> None:
         self.reminder_sweeper.cancel()
@@ -1405,6 +1664,9 @@ class EventHub(commands.GroupCog, group_name="event"):
                     count = (await client.table("event_participants").select(
                         "id", count="exact"
                     ).eq("event_id", ev["id"]).execute()).count or 0
+                    guild = self.bot.get_guild(int(ev["guild_id"]))
+                    if guild:
+                        await _strip_role_all(guild, int(ev["id"]), client)
                     await _refresh_event_announcement(self.bot, client, int(ev["id"]))
                     if ev.get("admin_channel_id"):
                         await send_admin_event_notification(
@@ -1468,6 +1730,26 @@ class EventHub(commands.GroupCog, group_name="event"):
             return await interaction.response.send_message("هذا الأمر مخصص للإدارة.", ephemeral=True)
         if not announce_channel.permissions_for(interaction.guild.me).send_messages:
             return await interaction.response.send_message("❌  البوت لا يستطيع الإرسال في القناة المختارة.", ephemeral=True)
+        try:
+            client = await self.bot.db.get_client()
+            open_count = (
+                await client.table("events")
+                .select("id", count="exact")
+                .eq("guild_id", interaction.guild.id)
+                .eq("status", "OPEN")
+                .execute()
+            ).count or 0
+        except Exception:
+            logger.exception("Could not check the open EventHub count for guild %s", interaction.guild.id)
+            return await interaction.response.send_message(
+                "تعذر التحقق من عدد الفعاليات المفتوحة. تحقق من قاعدة البيانات وترحيل EventHub.",
+                ephemeral=True,
+            )
+        if open_count >= len(EVENT_ROLE_NAMES):
+            return await interaction.response.send_message(
+                "وصل السيرفر إلى الحد الأقصى: توجد خمس فعاليات/مسابقات مفتوحة بالفعل. أغلق واحدة قبل إنشاء غيرها.",
+                ephemeral=True,
+            )
         await interaction.response.send_modal(EventCreateModal(announce_channel, admin_channel))
 
 
@@ -1491,6 +1773,7 @@ class EventHub(commands.GroupCog, group_name="event"):
         reg_count = (await client.table("event_participants").select(
             "id", count="exact"
         ).eq("event_id", event_id).execute()).count or 0
+        await _strip_role_all(interaction.guild, event_id, client)
         await _refresh_event_announcement(self.bot, client, event_id)
         if ev.get("admin_channel_id"):
             await send_admin_event_notification(

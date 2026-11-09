@@ -1,13 +1,16 @@
 # EventHub and StaffFlow
 
-Run `database/eventhub_staffflow_migration.sql` once in the Supabase SQL Editor before using these features. The bot must use `SUPABASE_SERVICE_ROLE_KEY`; the tables have RLS enabled and expose no client-side policies. Configure the private staff review channel with `/ad-setup` before using StaffFlow requests.
+Run `database/eventhub_staffflow_migration.sql` and then `database/eventhub_advanced_migration.sql` in the Supabase SQL Editor before using the advanced EventHub features. Apply `database/eventhub_contest_slots_migration.sql` after them to enable up to five open events/contests per server and separate participant roles. The bot must use `SUPABASE_SERVICE_ROLE_KEY`; the tables have RLS enabled and expose no client-side policies. Configure the private staff review channel with `/ad-setup` before using StaffFlow requests.
 
 Staff can use `/dashboard` and open the EventHub, StaffFlow, or dedicated Shifts page to use graphical buttons and forms for the core actions below. The shifts page shows the 10 nearest scheduled shifts and lets administrators schedule a new shift. The slash commands remain available as shortcuts.
 
 ## EventHub (`/event`)
 
 - `/event create` publishes an event with an ISO 8601 start time, capacity (1–500), channel, and optional reminder lead time.
-- The announcement has a persistent registration button. Registration is serialized in PostgreSQL, preventing duplicates and seat-limit overruns when many members click at once.
+- A server can have up to five open events/contests at once. Each receives its own participant role: `Event`, `Event 2`, `Event 3`, `Event 4`, or `Event 5`. A slot and its role are reused after an event is closed.
+- The announcement has persistent registration and cancellation buttons. Successful registrations and waitlist promotions receive only that event's role; pending applications and waitlisted members do not receive it until accepted or promoted. Closing an event removes its role from registered participants.
+- Registration is serialized in PostgreSQL, preventing duplicates and seat-limit overruns when many members click at once. Concurrent event creation is also serialized, so the five-event limit cannot be exceeded by simultaneous staff actions.
+- The bot needs Discord's **Manage Roles** permission, and its highest role must be above the five `Event` roles.
 - `/event list` shows open events and current occupancy.
 - `/event attendance` records or corrects attendance for a registered member; staff only.
 - `/event close` closes registration; staff only. Reminders are sent automatically once when due.
