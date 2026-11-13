@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from cogs.eventhub import (
     RegisterView,
+    _available_event_role_slots,
     _event_end_datetime,
     _event_embed,
     _parse_event_duration,
@@ -31,6 +32,22 @@ def test_event_role_name_matches_slot(slot: int, name: str) -> None:
 def test_event_role_name_rejects_slots_outside_the_five_role_pool(slot: int) -> None:
     with pytest.raises(ValueError):
         _event_role_name(slot)
+
+
+def test_available_event_role_slots_excludes_slots_used_by_open_events() -> None:
+    open_events = [
+        {"role_slot": 1},
+        {"role_slot": 3},
+        {"role_slot": None},
+    ]
+
+    assert _available_event_role_slots(open_events) == [4, 5]
+
+
+def test_available_event_role_slots_reports_none_when_all_five_are_in_use() -> None:
+    open_events = [{"role_slot": slot} for slot in range(1, 6)]
+
+    assert _available_event_role_slots(open_events) == []
 
 
 @pytest.mark.parametrize(

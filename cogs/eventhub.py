@@ -27,6 +27,34 @@ def _event_role_name(slot: int) -> str:
         raise ValueError(f"Event role slot must be between 1 and {len(EVENT_ROLE_NAMES)}.")
     return EVENT_ROLE_NAMES[slot - 1]
 
+
+def _available_event_role_slots(open_events: list[dict]) -> list[int]:
+    occupied = {
+        int(event["role_slot"])
+        for event in open_events
+        if event.get("role_slot") is not None
+    }
+    unassigned_count = sum(event.get("role_slot") is None for event in open_events)
+    for slot in range(1, len(EVENT_ROLE_NAMES) + 1):
+        if unassigned_count == 0:
+            break
+        if slot not in occupied:
+            occupied.add(slot)
+            unassigned_count -= 1
+    return [slot for slot in range(1, len(EVENT_ROLE_NAMES) + 1) if slot not in occupied]
+
+
+async def get_available_event_role_slots(client: Any, guild_id: int) -> list[int]:
+    rows = (
+        await client.table("events")
+        .select("role_slot")
+        .eq("guild_id", guild_id)
+        .eq("status", "OPEN")
+        .execute()
+    ).data or []
+    return _available_event_role_slots(rows)
+
+
 # ─── Smart Date Parser ────────────────────────────────────────────────────────
 
 def _parse_date(text: str, tz_offset: int = 3) -> datetime:
@@ -1271,6 +1299,7 @@ class EventHubTimePickerView(discord.ui.View):
         questions: list[str],
         prizes: str | None,
         duration: timedelta,
+        available_role_slots: list[int],
     ) -> None:
         super().__init__(timeout=600)
         self.announce_channel = announce_channel
@@ -1282,6 +1311,8 @@ class EventHubTimePickerView(discord.ui.View):
         self.questions = questions
         self.prizes = prizes
         self.duration = duration
+        self.available_role_slots = available_role_slots
+        self.selected_role_slot: int | None = None
 
         self.tz = timezone(timedelta(hours=3))
         now_local = datetime.now(self.tz)
@@ -1293,6 +1324,7 @@ class EventHubTimePickerView(discord.ui.View):
         self._build_date_select(now_local)
         self._build_time_select()
         self._build_preset_select()
+        self._build_role_select()
 
     def _build_date_select(self, now_local: datetime) -> None:
         arabic_days = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
@@ -1373,6 +1405,25 @@ class EventHubTimePickerView(discord.ui.View):
         self.preset_select.callback = self._on_preset_change
         self.add_item(self.preset_select)
 
+    def _build_role_select(self) -> None:
+        options = [
+            discord.SelectOption(
+                label=f"{_event_role_name(slot)} · رتبة الفعالية",
+                value=str(slot),
+                default=(slot == self.selected_role_slot),
+            )
+            for slot in self.available_role_slots
+        ]
+        self.role_select = discord.ui.Select(
+            placeholder="🏷️ اختر رتبة هذه الفعالية",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=3,
+        )
+        self.role_select.callback = self._on_role_change
+        self.add_item(self.role_select)
+
     def get_selected_datetime(self) -> datetime:
         d = datetime.fromisoformat(self.selected_date).date()
         h, m = map(int, self.selected_time.split(":"))
@@ -1386,13 +1437,15 @@ class EventHubTimePickerView(discord.ui.View):
         dt_utc = self.get_selected_datetime()
         ts = int(dt_utc.timestamp())
         end_ts = int(self.get_end_datetime().timestamp())
+        role_name = _event_role_name(self.selected_role_slot) if self.selected_role_slot else "لم يتم اختيارها بعد"
         admin_info = f" · إشعارات الإدارة: {self.admin_channel.mention}" if self.admin_channel else ""
         return (
             f"🎪 **تحديد موعد الفعالية: {self.title}**\n\n"
             f"📅 **البداية:** <t:{ts}:F> (<t:{ts}:R>)\n"
             f"🕒 **النهاية:** <t:{end_ts}:F> · المدة `{_format_event_duration(self.duration)}`\n"
+            f"🏷️ **رتبة المشاركين:** `{role_name}`\n"
             f"👥 **المقاعد:** `{self.capacity}`  ·  📢 **القناة:** {self.announce_channel.mention}{admin_info}\n\n"
-            "👇 **حدد التاريخ والساعة المناسبة من القوائم أدناه، ثم اضغط على زر التأكيد:**"
+            "👇 **حدد الموعد والرتبة المناسبة من القوائم أدناه، ثم اضغط على زر التأكيد:**"
         )
 
     def _refresh_defaults(self) -> None:
@@ -1400,6 +1453,8 @@ class EventHubTimePickerView(discord.ui.View):
             opt.default = (opt.value == self.selected_date)
         for opt in self.time_select.options:
             opt.default = (opt.value == self.selected_time)
+        for opt in self.role_select.options:
+            opt.default = (opt.value == str(self.selected_role_slot))
 
     async def _on_date_change(self, interaction: discord.Interaction) -> None:
         self.selected_date = self.date_select.values[0]
@@ -1439,7 +1494,12 @@ class EventHubTimePickerView(discord.ui.View):
         self._refresh_defaults()
         await interaction.response.edit_message(content=self.render_content(), view=self)
 
-    @discord.ui.button(label="تأكيد ونشر الفعالية 🚀", style=discord.ButtonStyle.success, row=3)
+    async def _on_role_change(self, interaction: discord.Interaction) -> None:
+        self.selected_role_slot = int(self.role_select.values[0])
+        self._refresh_defaults()
+        await interaction.response.edit_message(content=self.render_content(), view=self)
+
+    @discord.ui.button(label="تأكيد ونشر الفعالية 🚀", style=discord.ButtonStyle.success, row=4)
     async def confirm_event(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         start_utc = self.get_selected_datetime()
         end_utc = self.get_end_datetime()
@@ -1449,6 +1509,9 @@ class EventHubTimePickerView(discord.ui.View):
 
         if not interaction.guild:
             await interaction.response.send_message("يجب إنشاء الفعالية داخل السيرفر.", ephemeral=True)
+            return
+        if self.selected_role_slot not in self.available_role_slots:
+            await interaction.response.send_message("اختر رتبة متاحة لهذه الفعالية قبل التأكيد.", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1479,6 +1542,7 @@ class EventHubTimePickerView(discord.ui.View):
                 "p_prizes": self.prizes,
                 "p_admin_channel_id": self.admin_channel.id if self.admin_channel else None,
                 "p_role_ids": [role.id for role in roles],
+                "p_role_slot": self.selected_role_slot,
             }).execute()
             result = response.data[0] if isinstance(response.data, list) else response.data
             if not isinstance(result, dict):
@@ -1486,7 +1550,13 @@ class EventHubTimePickerView(discord.ui.View):
             if not result.get("created"):
                 if result.get("reason") == "limit":
                     await interaction.followup.send(
-                        "وصل السيرفر إلى الحد الأقصى: توجد خمس فعاليات/مسابقات مفتوحة بالفعل. أغلق واحدة قبل إنشاء غيرها.",
+                        "وصل السيرفر إلى الحد الأقصى: توجد خمس فعاليات/مسابقات مفتوحة بالفعل. ألغِ فعالية أو انتظر انتهاءها قبل إنشاء غيرها.",
+                        ephemeral=True,
+                    )
+                    return
+                if result.get("reason") == "slot_taken":
+                    await interaction.followup.send(
+                        "هذه الرتبة حُجزت لفعالية أخرى أثناء تجهيز طلبك. أعد فتح الإنشاء واختر رتبة متاحة.",
                         ephemeral=True,
                     )
                     return
@@ -1497,7 +1567,7 @@ class EventHubTimePickerView(discord.ui.View):
         except Exception:
             logger.exception("Could not create EventHub event for guild %s", interaction.guild.id)
             await interaction.followup.send(
-                "تعذر إنشاء المسابقة. تحقق من تطبيق ترحيل `eventhub_event_duration_migration.sql` ثم حاول مجددًا.",
+                "تعذر إنشاء المسابقة. تحقق من تطبيق ترحيل `eventhub_manual_role_slots_migration.sql` ثم حاول مجددًا.",
                 ephemeral=True,
             )
             return
@@ -1565,7 +1635,7 @@ class EventHubTimePickerView(discord.ui.View):
             view=None,
         )
 
-    @discord.ui.button(label="إلغاء ❌", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="إلغاء ❌", style=discord.ButtonStyle.secondary, row=4)
     async def cancel_event(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.edit_message(content="❌ تم إلغاء إنشاء الفعالية.", view=None)
 
@@ -1619,6 +1689,24 @@ class EventCreateModal(discord.ui.Modal, title="🎪  إنشاء فعالية ج
                     questions.append(line)
         reg_type = "FORM" if questions else "DIRECT"
 
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            client = await interaction.client.db.get_client()  # type: ignore[attr-defined]
+            available_role_slots = await get_available_event_role_slots(client, interaction.guild.id)
+        except Exception:
+            logger.exception("Could not load available EventHub roles for guild %s", interaction.guild.id)
+            await interaction.edit_original_response(
+                content="تعذر تحميل رتب الفعاليات المتاحة. تحقق من قاعدة البيانات وحاول مجددًا.",
+                view=None,
+            )
+            return
+        if not available_role_slots:
+            await interaction.edit_original_response(
+                content="كل رتب الفعاليات الخمس مستخدمة حاليًا. ألغِ فعالية أو انتظر انتهاءها قبل إنشاء أخرى.",
+                view=None,
+            )
+            return
+
         picker = EventHubTimePickerView(
             announce_channel=self.announce_channel,
             admin_channel=self.admin_channel,
@@ -1629,11 +1717,11 @@ class EventCreateModal(discord.ui.Modal, title="🎪  إنشاء فعالية ج
             questions=questions,
             prizes=prizes,
             duration=duration,
+            available_role_slots=available_role_slots,
         )
-        await interaction.response.send_message(
+        await interaction.edit_original_response(
             content=picker.render_content(),
             view=picker,
-            ephemeral=True,
         )
 
 
@@ -2169,7 +2257,7 @@ class EventHub(commands.GroupCog, group_name="event"):
             )
         if open_count >= len(EVENT_ROLE_NAMES):
             return await interaction.response.send_message(
-                "وصل السيرفر إلى الحد الأقصى: توجد خمس فعاليات/مسابقات مفتوحة بالفعل. أغلق واحدة قبل إنشاء غيرها.",
+                "وصل السيرفر إلى الحد الأقصى: توجد خمس فعاليات/مسابقات مفتوحة بالفعل. ألغِ فعالية أو انتظر انتهاءها قبل إنشاء غيرها.",
                 ephemeral=True,
             )
         await interaction.response.send_modal(EventCreateModal(announce_channel, admin_channel))

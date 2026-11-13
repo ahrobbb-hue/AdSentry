@@ -24,6 +24,7 @@ from cogs.eventhub import (
     _parse_event_duration,
     build_event_embed,
     ensure_event_roles,
+    get_available_event_role_slots,
     refresh_event_announcement,
 )
 
@@ -262,6 +263,7 @@ class EventDateTimePickerView(discord.ui.View):
         capacity: int,
         reminder_hours: int,
         duration: timedelta,
+        available_role_slots: list[int],
     ) -> None:
         super().__init__(timeout=600)
         self.cog = cog
@@ -272,6 +274,8 @@ class EventDateTimePickerView(discord.ui.View):
         self.capacity = capacity
         self.reminder_hours = reminder_hours
         self.duration = duration
+        self.available_role_slots = available_role_slots
+        self.selected_role_slot: int | None = None
 
         # Use Saudi / Gulf timezone (UTC+3) as standard base
         self.tz = timezone(timedelta(hours=3))
@@ -286,6 +290,7 @@ class EventDateTimePickerView(discord.ui.View):
         self._build_date_select(now_local)
         self._build_time_select()
         self._build_preset_select()
+        self._build_role_select()
 
     def _build_date_select(self, now_local: datetime) -> None:
         arabic_days = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
@@ -376,6 +381,25 @@ class EventDateTimePickerView(discord.ui.View):
         self.preset_select.callback = self._on_preset_change
         self.add_item(self.preset_select)
 
+    def _build_role_select(self) -> None:
+        options = [
+            discord.SelectOption(
+                label=f"{EVENT_ROLE_NAMES[slot - 1]} · رتبة الفعالية",
+                value=str(slot),
+                default=(slot == self.selected_role_slot),
+            )
+            for slot in self.available_role_slots
+        ]
+        self.role_select = discord.ui.Select(
+            placeholder="🏷️ اختر رتبة هذه الفعالية",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=3,
+        )
+        self.role_select.callback = self._on_role_change
+        self.add_item(self.role_select)
+
     def get_selected_datetime(self) -> datetime:
         d = datetime.fromisoformat(self.selected_date).date()
         h, m = map(int, self.selected_time.split(":"))
@@ -389,11 +413,13 @@ class EventDateTimePickerView(discord.ui.View):
         dt_utc = self.get_selected_datetime()
         ts = int(dt_utc.timestamp())
         end_ts = int(self.get_end_datetime().timestamp())
+        role_name = EVENT_ROLE_NAMES[self.selected_role_slot - 1] if self.selected_role_slot else "لم يتم اختيارها بعد"
         admin_info = f" · إشعارات الإدارة: {self.admin_channel.mention}" if self.admin_channel else ""
         return (
             f"🎪 **تحديد موعد الفعالية: {self.title}**\n\n"
             f"📅 **البداية:** <t:{ts}:F> (<t:{ts}:R>)\n"
             f"🕒 **النهاية:** <t:{end_ts}:F> · المدة `{_format_event_duration(self.duration)}`\n"
+            f"🏷️ **رتبة المشاركين:** `{role_name}`\n"
             f"👥 **المقاعد:** `{self.capacity}`  ·  🔔 **التذكير:** قبل `{self.reminder_hours}` ساعة\n"
             f"📢 **قناة الفعالية:** {self.event_channel.mention}{admin_info}\n\n"
             "👇 **حدد التاريخ والساعة المناسبة من القوائم أدناه، ثم اضغط على زر التأكيد:**"
@@ -404,6 +430,8 @@ class EventDateTimePickerView(discord.ui.View):
             opt.default = (opt.value == self.selected_date)
         for opt in self.time_select.options:
             opt.default = (opt.value == self.selected_time)
+        for opt in self.role_select.options:
+            opt.default = (opt.value == str(self.selected_role_slot))
 
     async def _on_date_change(self, interaction: discord.Interaction) -> None:
         self.selected_date = self.date_select.values[0]
@@ -443,12 +471,20 @@ class EventDateTimePickerView(discord.ui.View):
         self._refresh_defaults()
         await interaction.response.edit_message(content=self.render_content(), view=self)
 
-    @discord.ui.button(label="تأكيد ونشر الفعالية 🚀", style=discord.ButtonStyle.success, row=3)
+    async def _on_role_change(self, interaction: discord.Interaction) -> None:
+        self.selected_role_slot = int(self.role_select.values[0])
+        self._refresh_defaults()
+        await interaction.response.edit_message(content=self.render_content(), view=self)
+
+    @discord.ui.button(label="تأكيد ونشر الفعالية 🚀", style=discord.ButtonStyle.success, row=4)
     async def confirm_event(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         start_utc = self.get_selected_datetime()
         end_utc = self.get_end_datetime()
         if start_utc <= datetime.now(timezone.utc):
             await interaction.response.send_message("❌ الموعد المحدد أصبح في الماضي؛ يرجى اختيار موعد قادم.", ephemeral=True)
+            return
+        if self.selected_role_slot not in self.available_role_slots:
+            await interaction.response.send_message("اختر رتبة متاحة لهذه الفعالية قبل التأكيد.", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -477,6 +513,7 @@ class EventDateTimePickerView(discord.ui.View):
                 "p_prizes": None,
                 "p_admin_channel_id": self.admin_channel.id if self.admin_channel else None,
                 "p_role_ids": [role.id for role in roles],
+                "p_role_slot": self.selected_role_slot,
             }).execute()
             result = response.data[0] if isinstance(response.data, list) else response.data
             if not isinstance(result, dict):
@@ -484,9 +521,18 @@ class EventDateTimePickerView(discord.ui.View):
             if not result.get("created"):
                 if result.get("reason") == "limit":
                     await interaction.followup.send(
-                        "وصلت إلى الحد الأقصى: توجد خمس فعاليات مفتوحة بالفعل. أغلق واحدة قبل إنشاء غيرها.",
+                        "وصلت إلى الحد الأقصى: توجد خمس فعاليات مفتوحة بالفعل. ألغِ فعالية أو انتظر انتهاءها قبل إنشاء غيرها.",
                         ephemeral=True,
                     )
+                    return
+                if result.get("reason") == "slot_taken":
+                    await interaction.followup.send(
+                        "هذه الرتبة حُجزت لفعالية أخرى أثناء تجهيز طلبك. أعد فتح الإنشاء واختر رتبة متاحة.",
+                        ephemeral=True,
+                    )
+                    return
+                if result.get("reason") == "invalid_slot":
+                    await interaction.followup.send("اختر رتبة فعالية صالحة ثم حاول مجددًا.", ephemeral=True)
                     return
                 raise RuntimeError(f"Event creation was rejected: {result.get('reason')}")
             event = result.get("event")
@@ -511,9 +557,11 @@ class EventDateTimePickerView(discord.ui.View):
             self.cog.bot.add_view(view)
             await client.table("events").update({"announcement_message_id": announcement.id}).eq("id", event_id).execute()
             admin_note = f" · إشعارات الإدارة: {self.admin_channel.mention}" if self.admin_channel else ""
+            role_name = EVENT_ROLE_NAMES[int(event["role_slot"]) - 1]
 
             await interaction.edit_original_response(
                 content=f"✅  **تم إنشاء الفعالية #{event_id} ونشرها بنجاح في {self.event_channel.mention}**{admin_note}!\n"
+                        f"🏷️ **رتبة المشاركين:** `{role_name}`\n"
                         f"📅 **البداية:** <t:{int(start_utc.timestamp())}:F> (<t:{int(start_utc.timestamp())}:R>)\n"
                         f"🕒 **النهاية:** <t:{int(end_utc.timestamp())}:F>",
                 view=None,
@@ -533,9 +581,12 @@ class EventDateTimePickerView(discord.ui.View):
                     await announcement.delete()
                 except discord.HTTPException:
                     logger.exception("Could not remove incomplete dashboard event announcement")
-            await interaction.followup.send("تعذر إنشاء الفعالية. يرجى مراجعة الصلاحيات وقاعدة البيانات.", ephemeral=True)
+            await interaction.followup.send(
+                "تعذر إنشاء الفعالية. تحقق من تطبيق ترحيل `eventhub_manual_role_slots_migration.sql` والصلاحيات.",
+                ephemeral=True,
+            )
 
-    @discord.ui.button(label="إلغاء ❌", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="إلغاء ❌", style=discord.ButtonStyle.secondary, row=4)
     async def cancel_event(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.edit_message(content="❌ تم إلغاء إنشاء الفعالية.", view=None)
 
@@ -574,6 +625,24 @@ class EventCreateModal(discord.ui.Modal, title="إنشاء فعالية"):
             )
             return
 
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            client = await self.cog.bot.db.get_client()
+            available_role_slots = await get_available_event_role_slots(client, interaction.guild.id)
+        except Exception:
+            logger.exception("Could not load available event roles for guild %s", interaction.guild.id)
+            await interaction.edit_original_response(
+                content="تعذر تحميل رتب الفعاليات المتاحة. تحقق من قاعدة البيانات وحاول مجددًا.",
+                view=None,
+            )
+            return
+        if not available_role_slots:
+            await interaction.edit_original_response(
+                content="كل رتب الفعاليات الخمس مستخدمة حاليًا. ألغِ فعالية أو انتظر انتهاءها قبل إنشاء أخرى.",
+                view=None,
+            )
+            return
+
         picker_view = EventDateTimePickerView(
             cog=self.cog,
             event_channel=self.event_channel,
@@ -583,11 +652,11 @@ class EventCreateModal(discord.ui.Modal, title="إنشاء فعالية"):
             capacity=capacity,
             reminder_hours=reminder_hours,
             duration=duration,
+            available_role_slots=available_role_slots,
         )
-        await interaction.response.send_message(
+        await interaction.edit_original_response(
             content=picker_view.render_content(),
             view=picker_view,
-            ephemeral=True,
         )
 
 
@@ -760,7 +829,7 @@ class EventDashboardView(discord.ui.View):
             return
         if open_count >= len(EVENT_ROLE_NAMES):
             await interaction.followup.send(
-                "وصلت إلى الحد الأقصى: توجد خمس فعاليات مفتوحة بالفعل. أغلق واحدة قبل إنشاء غيرها.",
+                "وصلت إلى الحد الأقصى: توجد خمس فعاليات مفتوحة بالفعل. ألغِ فعالية أو انتظر انتهاءها قبل إنشاء غيرها.",
                 ephemeral=True,
             )
             return
