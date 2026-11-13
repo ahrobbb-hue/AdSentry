@@ -107,12 +107,54 @@ def _can_manage(interaction: discord.Interaction) -> bool:
     return bool(interaction.guild and is_admin(interaction.user))
 
 
+def _can_manage_opening(interaction: discord.Interaction, opening: dict[str, Any]) -> bool:
+    return bool(
+        interaction.guild
+        and opening.get("guild_id") == interaction.guild.id
+        and (_can_manage(interaction) or opening.get("created_by") == interaction.user.id)
+    )
+
+
 def _deadline_passed(opening: dict[str, Any]) -> bool:
     raw = opening.get("closes_at")
     if not raw:
         return False
     deadline = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
     return deadline <= datetime.now(timezone.utc)
+
+
+def _parse_recruitment_deadline(value: str) -> datetime | None:
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        deadline = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Enter the deadline as ISO 8601, for example 2026-11-18T19:00+03:00.") from exc
+    if deadline.tzinfo is None or deadline.utcoffset() is None:
+        raise ValueError("The deadline must include a timezone, for example +03:00 or Z.")
+    if deadline <= datetime.now(timezone.utc):
+        raise ValueError("The closing deadline must be in the future.")
+    return deadline.astimezone(timezone.utc)
+
+
+def _opening_embed(opening: dict[str, Any]) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"Now accepting applications: {opening['title']}",
+        description=opening["description"],
+        color=discord.Color.green(),
+    )
+    seat_limit = opening.get("seat_limit")
+    closes_at = opening.get("closes_at")
+    details = [
+        f"Seats: {seat_limit}" if seat_limit else None,
+        f"Closes: <t:{int(datetime.fromisoformat(str(closes_at).replace('Z', '+00:00')).timestamp())}:f>" if closes_at else "Closes manually",
+    ]
+    embed.add_field(name="Details", value=" · ".join(value for value in details if value), inline=False)
+    if opening.get("grant_role_id"):
+        embed.add_field(name="Role after acceptance", value=f"<@&{opening['grant_role_id']}>", inline=False)
+    embed.set_footer(text=f"Opening #{opening['id']} · Apply using the button below")
+    return embed
 
 
 class RecruitmentDetailsModal(discord.ui.Modal):
@@ -324,14 +366,7 @@ async def publish_opening(
             "questions": questions or [],
             "grant_role_id": grant_role.id if grant_role else None,
         })
-        embed = discord.Embed(title=f"Now accepting applications: {title.strip()}", description=description.strip(), color=discord.Color.green())
-        details = [f"Seats: {seat_limit}" if seat_limit else None,
-                   f"Closes: <t:{int((datetime.now(timezone.utc) + timedelta(hours=duration_hours)).timestamp())}:f>" if duration_hours else "Closes manually"]
-        embed.add_field(name="Details", value=" · ".join(value for value in details if value), inline=False)
-        if grant_role:
-            embed.add_field(name="Role after acceptance", value=grant_role.mention, inline=False)
-        embed.set_footer(text=f"Opening #{opening['id']} · Apply using the button below")
-        announcement = await public_channel.send(embed=embed, view=ApplyView(opening["id"]), allowed_mentions=discord.AllowedMentions.none())
+        announcement = await public_channel.send(embed=_opening_embed(opening), view=ApplyView(opening["id"]), allowed_mentions=discord.AllowedMentions.none())
         await bot.db.set_recruitment_message(opening["id"], announcement.id)
         bot.add_view(ApplyView(opening["id"]))
     except Exception:
@@ -540,7 +575,12 @@ class ApplicationReviewView(discord.ui.View):
             result = await bot.db.review_recruitment_application(application_id, interaction.user.id, decision, interaction.guild.id)  # type: ignore[union-attr]
             if not result.get("changed"):
                 reason = result.get("reason")
-                message = "No more seats are available; this opening has reached its capacity." if reason == "capacity" else "This application was already reviewed or is no longer available."
+                if reason == "capacity":
+                    message = "No more seats are available; this opening has reached its capacity."
+                elif reason == "cancelled":
+                    message = "This recruitment was cancelled; applications can no longer be reviewed."
+                else:
+                    message = "This application was already reviewed or is no longer available."
                 await interaction.followup.send(message, ephemeral=True)
                 return
 
@@ -692,6 +732,212 @@ class ApplicationReviewView(discord.ui.View):
         except Exception:
             logger.exception("Could not review application %s", application_id)
             await interaction.followup.send("Could not save the decision. Please try again.", ephemeral=True)
+
+
+class RecruitmentEditModal(discord.ui.Modal):
+    def __init__(self, bot: commands.Bot, opening: dict[str, Any]) -> None:
+        super().__init__(title=f"Edit opening #{opening['id']}", timeout=600)
+        self.bot = bot
+        self.opening_id = opening["id"]
+        deadline = opening.get("closes_at")
+        if deadline:
+            deadline = datetime.fromisoformat(str(deadline).replace("Z", "+00:00")).isoformat(timespec="minutes")
+        self.title_input = discord.ui.TextInput(
+            label="Opening title",
+            default=opening["title"],
+            max_length=80,
+            required=True,
+        )
+        self.description_input = discord.ui.TextInput(
+            label="Description and requirements",
+            style=discord.TextStyle.paragraph,
+            default=opening["description"],
+            max_length=1800,
+            required=True,
+        )
+        self.seat_limit_input = discord.ui.TextInput(
+            label="Accepted seats (blank for unlimited)",
+            default=str(opening["seat_limit"]) if opening.get("seat_limit") else "",
+            max_length=3,
+            required=False,
+        )
+        self.deadline_input = discord.ui.TextInput(
+            label="Closing deadline (blank for manual)",
+            placeholder="2026-11-18T19:00+03:00",
+            default=deadline or "",
+            max_length=40,
+            required=False,
+        )
+        self.add_item(self.title_input)
+        self.add_item(self.description_input)
+        self.add_item(self.seat_limit_input)
+        self.add_item(self.deadline_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Use this form in the server.", ephemeral=True)
+            return
+        try:
+            current = await self.bot.db.get_recruitment(self.opening_id)
+            if not current or not _can_manage_opening(interaction, current):
+                await interaction.response.send_message("Only the opening creator or authorized staff can edit it.", ephemeral=True)
+                return
+            if current.get("status") != "OPEN":
+                await interaction.response.send_message("Only an open recruitment can be edited.", ephemeral=True)
+                return
+
+            title = self.title_input.value.strip()
+            description = self.description_input.value.strip()
+            if not title or len(title) > 80 or not description or len(description) > 1800:
+                await interaction.response.send_message("Enter a title (up to 80 characters) and description (up to 1,800 characters).", ephemeral=True)
+                return
+            seat_text = self.seat_limit_input.value.strip()
+            try:
+                seat_limit = int(seat_text) if seat_text else None
+            except ValueError:
+                await interaction.response.send_message("The seat limit must be a whole number from 1 to 100, or blank for unlimited.", ephemeral=True)
+                return
+            if seat_limit is not None and not 1 <= seat_limit <= 100:
+                await interaction.response.send_message("The seat limit must be from 1 to 100, or blank for unlimited.", ephemeral=True)
+                return
+            try:
+                deadline = _parse_recruitment_deadline(self.deadline_input.value)
+            except ValueError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            result = await self.bot.db.update_recruitment_details(
+                self.opening_id,
+                interaction.guild.id,
+                title,
+                description,
+                seat_limit,
+                deadline.isoformat() if deadline else None,
+            )
+            if not result.get("updated"):
+                reason = result.get("reason")
+                if reason == "capacity":
+                    message = f"The seat limit cannot be lower than the {result.get('accepted_count', 0)} people already accepted."
+                elif reason == "duplicate_title":
+                    message = "Another open recruitment in this server already uses that title."
+                elif reason == "closed":
+                    message = "This recruitment has already closed and cannot be edited."
+                else:
+                    message = "Recruitment not found in this server."
+                await interaction.followup.send(message, ephemeral=True)
+                return
+
+            updated = result["opening"]
+            try:
+                channel = self.bot.get_channel(updated["public_channel_id"])
+                if not isinstance(channel, discord.TextChannel):
+                    channel = await self.bot.fetch_channel(updated["public_channel_id"])
+                if not isinstance(channel, discord.TextChannel) or not updated.get("announcement_message_id"):
+                    raise RuntimeError("The public announcement channel or message is unavailable.")
+                message = await channel.fetch_message(updated["announcement_message_id"])
+                await message.edit(
+                    embed=_opening_embed(updated),
+                    view=ApplyView(updated["id"]),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except (discord.HTTPException, RuntimeError, TypeError, KeyError):
+                logger.exception("Recruitment %s updated but its announcement could not be refreshed", self.opening_id)
+                await interaction.followup.send(
+                    f"Opening #{self.opening_id} was updated, but I couldn't refresh its public announcement. Please check the bot's channel permissions.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.followup.send(f"Recruitment opening #{self.opening_id} was updated.", ephemeral=True)
+        except Exception:
+            logger.exception("Could not edit recruitment opening %s", self.opening_id)
+            if interaction.response.is_done():
+                await interaction.followup.send("Could not save the recruitment changes. Please retry.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Could not load this opening. Please retry.", ephemeral=True)
+
+
+async def cancel_announcement(
+    bot: commands.Bot,
+    opening: dict[str, Any],
+    reason: str | None = None,
+) -> tuple[bool, bool]:
+    channel = bot.get_channel(opening["public_channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        try:
+            channel = await bot.fetch_channel(opening["public_channel_id"])
+        except discord.HTTPException:
+            channel = None
+    if not isinstance(channel, discord.TextChannel):
+        return False, False
+
+    card_updated = False
+    if opening.get("announcement_message_id"):
+        try:
+            message = await channel.fetch_message(opening["announcement_message_id"])
+            embed = message.embeds[0] if message.embeds else discord.Embed(description=opening.get("description", ""))
+            embed.title = f"Recruitment cancelled: {opening['title']}"
+            embed.color = discord.Color.red()
+            embed.set_footer(text=f"Opening #{opening['id']} · Cancelled")
+            await message.edit(embed=embed, view=None)
+            card_updated = True
+        except discord.HTTPException:
+            logger.exception("Recruitment %s cancelled but its announcement card could not be updated", opening["id"])
+
+    notice = discord.Embed(
+        title="Recruitment cancelled",
+        description=f"Applications for **{opening['title']}** (opening #{opening['id']}) have been cancelled.",
+        color=discord.Color.red(),
+    )
+    if reason:
+        notice.add_field(name="Reason", value=reason[:1000], inline=False)
+    try:
+        await channel.send(embed=notice, allowed_mentions=discord.AllowedMentions.none())
+        return card_updated, True
+    except discord.HTTPException:
+        logger.exception("Recruitment %s was cancelled but the public notice could not be sent", opening["id"])
+        return card_updated, False
+
+
+class RecruitmentCancelView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, opening_id: int, reason: str | None) -> None:
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.opening_id = opening_id
+        self.reason = reason
+
+    @discord.ui.button(label="Confirm cancellation", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Use this action in the server.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            opening = await self.bot.db.get_recruitment(self.opening_id)
+            if not opening or not _can_manage_opening(interaction, opening):
+                await interaction.followup.send("Only the opening creator or authorized staff can cancel it.", ephemeral=True)
+                return
+            result = await self.bot.db.cancel_recruitment(self.opening_id, interaction.guild.id)
+            if not result.get("cancelled"):
+                message = "This recruitment is already closed or cancelled." if result.get("reason") == "closed" else "Opening not found in this server."
+                await interaction.followup.send(message, ephemeral=True)
+                return
+
+            card_updated, notice_sent = await cancel_announcement(self.bot, result["opening"], self.reason)
+            if notice_sent and card_updated:
+                response = f"Opening #{self.opening_id} was cancelled and its announcement was updated."
+            elif notice_sent:
+                response = f"Opening #{self.opening_id} was cancelled and a notice was sent, but I couldn't update the original announcement card."
+            else:
+                response = f"Opening #{self.opening_id} was cancelled, but I couldn't publish the public notice. Check the bot's permissions and channel."
+            await interaction.followup.send(response, ephemeral=True)
+        except Exception:
+            logger.exception("Could not cancel recruitment opening %s", self.opening_id)
+            await interaction.followup.send("Could not cancel this opening. Please retry.", ephemeral=True)
+
+    @discord.ui.button(label="Keep open", style=discord.ButtonStyle.secondary)
+    async def dismiss(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="Cancellation aborted.", embed=None, view=None)
 
 
 async def close_announcement(bot: commands.Bot, opening: dict[str, Any]) -> None:
@@ -880,11 +1126,11 @@ class RecruitmentCog(commands.Cog):
                 "questions": [],
                 "grant_role_id": grant_role.id if grant_role else None,
             })
-            embed = discord.Embed(title=f"Now accepting applications: {title.strip()}", description=description.strip(), color=discord.Color.green())
-            if grant_role:
-                embed.add_field(name="Role after acceptance", value=grant_role.mention, inline=False)
-            embed.set_footer(text=f"Opening #{opening['id']} · Apply using the button below")
-            announcement = await public_channel.send(embed=embed, view=ApplyView(opening["id"]), allowed_mentions=discord.AllowedMentions.none())
+            announcement = await public_channel.send(
+                embed=_opening_embed(opening),
+                view=ApplyView(opening["id"]),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             await self.bot.db.set_recruitment_message(opening["id"], announcement.id)
             self.bot.add_view(ApplyView(opening["id"]))
             await interaction.followup.send(f"Recruitment is open in {public_channel.mention} (opening #{opening['id']}).", ephemeral=True)
@@ -901,6 +1147,67 @@ class RecruitmentCog(commands.Cog):
                 except discord.HTTPException:
                     logger.warning("Could not disable announcement for incomplete opening")
             await interaction.followup.send("Could not open recruitment. Check the bot's channel permissions and database migration.", ephemeral=True)
+
+    @recruitment.command(name="edit", description="Edit an open recruitment opening")
+    @app_commands.describe(opening_id="Opening ID shown on the announcement")
+    async def edit_recruitment(self, interaction: discord.Interaction, opening_id: int) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Use this command in a server.", ephemeral=True)
+            return
+        try:
+            opening = await self.bot.db.get_recruitment(opening_id)
+        except Exception:
+            logger.exception("Could not load recruitment opening %s for editing", opening_id)
+            await interaction.response.send_message("Could not load this opening. Please retry.", ephemeral=True)
+            return
+        if not opening or opening.get("guild_id") != interaction.guild.id:
+            await interaction.response.send_message("Opening not found in this server.", ephemeral=True)
+            return
+        if not _can_manage_opening(interaction, opening):
+            await interaction.response.send_message("Only the opening creator or authorized staff can edit it.", ephemeral=True)
+            return
+        if opening.get("status") != "OPEN":
+            await interaction.response.send_message("Only an open recruitment can be edited.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RecruitmentEditModal(self.bot, opening))
+
+    @recruitment.command(name="cancel", description="Cancel an open recruitment and announce it publicly")
+    @app_commands.describe(
+        opening_id="Opening ID shown on the announcement",
+        reason="Optional reason included in the public cancellation notice",
+    )
+    async def cancel_recruitment_command(
+        self,
+        interaction: discord.Interaction,
+        opening_id: int,
+        reason: str | None = None,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Use this command in a server.", ephemeral=True)
+            return
+        if reason and len(reason) > 300:
+            await interaction.response.send_message("The cancellation reason must be 300 characters or fewer.", ephemeral=True)
+            return
+        try:
+            opening = await self.bot.db.get_recruitment(opening_id)
+        except Exception:
+            logger.exception("Could not load recruitment opening %s for cancellation", opening_id)
+            await interaction.response.send_message("Could not load this opening. Please retry.", ephemeral=True)
+            return
+        if not opening or opening.get("guild_id") != interaction.guild.id:
+            await interaction.response.send_message("Opening not found in this server.", ephemeral=True)
+            return
+        if not _can_manage_opening(interaction, opening):
+            await interaction.response.send_message("Only the opening creator or authorized staff can cancel it.", ephemeral=True)
+            return
+        if opening.get("status") != "OPEN":
+            await interaction.response.send_message("This recruitment is already closed or cancelled.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Cancel **{opening['title']}** (opening #{opening_id})? This stops new applications and posts a notice in {interaction.guild.get_channel(opening['public_channel_id']).mention if interaction.guild.get_channel(opening['public_channel_id']) else 'the announcement channel'}.",
+            view=RecruitmentCancelView(self.bot, opening_id, reason.strip() if reason else None),
+            ephemeral=True,
+        )
 
     @recruitment.command(name="close", description="Close an active application form")
     @app_commands.describe(opening_id="Opening ID shown in the announcement")

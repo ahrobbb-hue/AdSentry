@@ -129,6 +129,40 @@ class SupabaseDatabase:
         response = await client.table("recruitments").update({"status": "CLOSED", "closed_at": datetime.now(timezone.utc).isoformat()}).eq("id", recruitment_id).eq("guild_id", guild_id).eq("status", "OPEN").execute()
         return bool(response.data)
 
+    async def update_recruitment_details(
+        self,
+        recruitment_id: int,
+        guild_id: int,
+        title: str,
+        description: str,
+        seat_limit: int | None,
+        closes_at: str | None,
+    ) -> dict[str, Any]:
+        client = await self.get_client()
+        response = await client.rpc("update_recruitment_details", {
+            "p_recruitment_id": recruitment_id,
+            "p_guild_id": guild_id,
+            "p_title": title,
+            "p_description": description,
+            "p_seat_limit": seat_limit,
+            "p_closes_at": closes_at,
+        }).execute()
+        data = response.data
+        if isinstance(data, list):
+            data = data[0] if data else None
+        return data if isinstance(data, dict) else {"updated": False, "reason": "invalid_response"}
+
+    async def cancel_recruitment(self, recruitment_id: int, guild_id: int) -> dict[str, Any]:
+        client = await self.get_client()
+        response = await client.rpc("cancel_recruitment", {
+            "p_recruitment_id": recruitment_id,
+            "p_guild_id": guild_id,
+        }).execute()
+        data = response.data
+        if isinstance(data, list):
+            data = data[0] if data else None
+        return data if isinstance(data, dict) else {"cancelled": False, "reason": "invalid_response"}
+
     async def create_recruitment_application(self, payload: dict[str, Any]) -> dict[str, Any]:
         client = await self.get_client()
         response = await client.rpc("submit_recruitment_application", {

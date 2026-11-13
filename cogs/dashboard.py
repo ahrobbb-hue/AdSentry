@@ -14,7 +14,15 @@ from cogs.recruitment import (
     RecruitmentRoleSelectView,
     close_announcement,
 )
-from cogs.eventhub import RegisterEventView, build_event_embed
+from cogs.eventhub import (
+    EVENT_ROLE_NAMES,
+    RegisterView,
+    _event_end_datetime,
+    build_event_embed,
+    ensure_event_roles,
+    refresh_event_announcement,
+    remove_event_roles,
+)
 
 logger = logging.getLogger("AdSentry.Dashboard")
 
@@ -250,6 +258,7 @@ class EventDateTimePickerView(discord.ui.View):
         description: str,
         capacity: int,
         reminder_hours: int,
+        duration_hours: int,
     ) -> None:
         super().__init__(timeout=600)
         self.cog = cog
@@ -259,6 +268,7 @@ class EventDateTimePickerView(discord.ui.View):
         self.description = description
         self.capacity = capacity
         self.reminder_hours = reminder_hours
+        self.duration_hours = duration_hours
 
         # Use Saudi / Gulf timezone (UTC+3) as standard base
         self.tz = timezone(timedelta(hours=3))
@@ -369,13 +379,18 @@ class EventDateTimePickerView(discord.ui.View):
         local_dt = datetime(d.year, d.month, d.day, h, m, tzinfo=self.tz)
         return local_dt.astimezone(timezone.utc)
 
+    def get_end_datetime(self) -> datetime:
+        return _event_end_datetime(self.get_selected_datetime(), self.duration_hours)
+
     def render_content(self) -> str:
         dt_utc = self.get_selected_datetime()
         ts = int(dt_utc.timestamp())
+        end_ts = int(self.get_end_datetime().timestamp())
         admin_info = f" · إشعارات الإدارة: {self.admin_channel.mention}" if self.admin_channel else ""
         return (
             f"🎪 **تحديد موعد الفعالية: {self.title}**\n\n"
-            f"📅 **الموعد المختار حالياً:** <t:{ts}:F> (<t:{ts}:R>)\n"
+            f"📅 **البداية:** <t:{ts}:F> (<t:{ts}:R>)\n"
+            f"🕒 **النهاية:** <t:{end_ts}:F> · المدة `{self.duration_hours}` ساعة\n"
             f"👥 **المقاعد:** `{self.capacity}`  ·  🔔 **التذكير:** قبل `{self.reminder_hours}` ساعة\n"
             f"📢 **قناة الفعالية:** {self.event_channel.mention}{admin_info}\n\n"
             "👇 **حدد التاريخ والساعة المناسبة من القوائم أدناه، ثم اضغط على زر التأكيد:**"
@@ -428,6 +443,7 @@ class EventDateTimePickerView(discord.ui.View):
     @discord.ui.button(label="تأكيد ونشر الفعالية 🚀", style=discord.ButtonStyle.success, row=3)
     async def confirm_event(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         start_utc = self.get_selected_datetime()
+        end_utc = self.get_end_datetime()
         if start_utc <= datetime.now(timezone.utc):
             await interaction.response.send_message("❌ الموعد المحدد أصبح في الماضي؛ يرجى اختيار موعد قادم.", ephemeral=True)
             return
@@ -435,22 +451,44 @@ class EventDateTimePickerView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         client = None
         event_id: int | None = None
+        announcement: discord.Message | None = None
         try:
+            if not interaction.guild:
+                await interaction.followup.send("يجب إنشاء الفعالية داخل السيرفر.", ephemeral=True)
+                return
             client = await self.cog.bot.db.get_client()
+            roles = await ensure_event_roles(interaction.guild)
             reminder_at = (start_utc - timedelta(hours=self.reminder_hours)).isoformat() if self.reminder_hours else None
-            result = await client.table("events").insert({
-                "guild_id": interaction.guild.id,
-                "created_by": interaction.user.id,
-                "title": self.title,
-                "description": self.description,
-                "channel_id": self.event_channel.id,
-                "admin_channel_id": self.admin_channel.id if self.admin_channel else None,
-                "starts_at": start_utc.isoformat(),
-                "capacity": self.capacity,
-                "status": "OPEN",
-                "reminder_at": reminder_at,
+            response = await client.rpc("create_event_with_slot", {
+                "p_guild_id": interaction.guild.id,
+                "p_created_by": interaction.user.id,
+                "p_title": self.title,
+                "p_description": self.description,
+                "p_channel_id": self.event_channel.id,
+                "p_starts_at": start_utc.isoformat(),
+                "p_ends_at": end_utc.isoformat(),
+                "p_capacity": self.capacity,
+                "p_reminder_at": reminder_at,
+                "p_registration_type": "DIRECT",
+                "p_form_questions": [],
+                "p_prizes": None,
+                "p_admin_channel_id": self.admin_channel.id if self.admin_channel else None,
+                "p_role_ids": [role.id for role in roles],
             }).execute()
-            event = result.data[0]
+            result = response.data[0] if isinstance(response.data, list) else response.data
+            if not isinstance(result, dict):
+                raise RuntimeError("Event creation returned an invalid database response.")
+            if not result.get("created"):
+                if result.get("reason") == "limit":
+                    await interaction.followup.send(
+                        "وصلت إلى الحد الأقصى: توجد خمس فعاليات مفتوحة بالفعل. أغلق واحدة قبل إنشاء غيرها.",
+                        ephemeral=True,
+                    )
+                    return
+                raise RuntimeError(f"Event creation was rejected: {result.get('reason')}")
+            event = result.get("event")
+            if not isinstance(event, dict):
+                raise RuntimeError("The database did not return the created event.")
             event_id = int(event["id"])
             embed = build_event_embed(
                 self.title,
@@ -459,28 +497,39 @@ class EventDateTimePickerView(discord.ui.View):
                 self.capacity,
                 event_id=event_id,
                 organizer=interaction.user,
+                ends_at=end_utc,
             )
-            message = await self.event_channel.send(
+            view = RegisterView(event_id, "DIRECT")
+            announcement = await self.event_channel.send(
                 embed=embed,
-                view=RegisterEventView(event_id),
+                view=view,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-            self.cog.bot.add_view(RegisterEventView(event_id))
-            await client.table("events").update({"announcement_message_id": message.id}).eq("id", event["id"]).execute()
+            self.cog.bot.add_view(view)
+            await client.table("events").update({"announcement_message_id": announcement.id}).eq("id", event_id).execute()
             admin_note = f" · إشعارات الإدارة: {self.admin_channel.mention}" if self.admin_channel else ""
 
             await interaction.edit_original_response(
                 content=f"✅  **تم إنشاء الفعالية #{event_id} ونشرها بنجاح في {self.event_channel.mention}**{admin_note}!\n"
-                        f"📅 **الموعد:** <t:{int(start_utc.timestamp())}:F> (<t:{int(start_utc.timestamp())}:R>)",
+                        f"📅 **البداية:** <t:{int(start_utc.timestamp())}:F> (<t:{int(start_utc.timestamp())}:R>)\n"
+                        f"🕒 **النهاية:** <t:{int(end_utc.timestamp())}:F>",
                 view=None,
             )
         except Exception:
             logger.exception("Dashboard event creation failed")
             if event_id and client:
                 try:
-                    await client.table("events").update({"status": "CANCELLED"}).eq("id", event_id).execute()
+                    await client.table("events").update({
+                        "status": "CANCELLED",
+                        "closed_at": datetime.now(timezone.utc).isoformat(),
+                    }).eq("id", event_id).eq("status", "OPEN").execute()
                 except Exception:
-                    pass
+                    logger.exception("Could not release the reserved EventHub slot for event %s", event_id)
+            if announcement:
+                try:
+                    await announcement.delete()
+                except discord.HTTPException:
+                    logger.exception("Could not remove incomplete dashboard event announcement")
             await interaction.followup.send("تعذر إنشاء الفعالية. يرجى مراجعة الصلاحيات وقاعدة البيانات.", ephemeral=True)
 
     @discord.ui.button(label="إلغاء ❌", style=discord.ButtonStyle.secondary, row=3)
@@ -493,6 +542,7 @@ class EventCreateModal(discord.ui.Modal, title="إنشاء فعالية"):
     description = discord.ui.TextInput(label="الوصف", style=discord.TextStyle.paragraph, max_length=800)
     capacity = discord.ui.TextInput(label="عدد المقاعد", default="25", max_length=3)
     reminder = discord.ui.TextInput(label="التذكير قبل الموعد بالساعات (0 لتعطيله)", default="24", max_length=3)
+    duration = discord.ui.TextInput(label="مدة الفعالية بالساعات (1–168)", default="2", max_length=3)
 
     def __init__(self, cog: "DashboardCog", event_channel: discord.TextChannel, admin_channel: discord.TextChannel | None = None) -> None:
         super().__init__()
@@ -507,10 +557,11 @@ class EventCreateModal(discord.ui.Modal, title="إنشاء فعالية"):
         try:
             capacity = int(self.capacity.value.strip())
             reminder_hours = int(self.reminder.value.strip())
-            if not 1 <= capacity <= 500 or not 0 <= reminder_hours <= 168:
+            duration_hours = int(self.duration.value.strip())
+            if not 1 <= capacity <= 500 or not 0 <= reminder_hours <= 168 or not 1 <= duration_hours <= 168:
                 raise ValueError
         except ValueError:
-            await interaction.response.send_message("تحقق من أن عدد المقاعد بين (1–500) والتذكير بين (0–168) ساعة.", ephemeral=True)
+            await interaction.response.send_message("تحقق من أن عدد المقاعد بين (1–500)، والتذكير بين (0–168)، والمدة بين (1–168) ساعة.", ephemeral=True)
             return
 
         picker_view = EventDateTimePickerView(
@@ -521,6 +572,7 @@ class EventCreateModal(discord.ui.Modal, title="إنشاء فعالية"):
             description=self.description.value.strip(),
             capacity=capacity,
             reminder_hours=reminder_hours,
+            duration_hours=duration_hours,
         )
         await interaction.response.send_message(
             content=picker_view.render_content(),
@@ -650,16 +702,20 @@ class EventCloseSelectView(discord.ui.View):
         event = (await client.table("events").select("*").eq("id", event_id).eq("guild_id", interaction.guild.id).limit(1).execute()).data
         if not event or event[0]["status"] != "OPEN":
             await interaction.followup.send("الفعالية غير موجودة أو التسجيل مغلق مسبقًا.", ephemeral=True); return
-        await client.table("events").update({"status": "CLOSED", "closed_at": datetime.now(timezone.utc).isoformat()}).eq("id", event_id).eq("guild_id", interaction.guild.id).eq("status", "OPEN").execute()
-        channel = self.cog.bot.get_channel(int(event[0]["channel_id"]))
-        if isinstance(channel, discord.TextChannel) and event[0].get("announcement_message_id"):
-            try:
-                message = await channel.fetch_message(int(event[0]["announcement_message_id"]))
-                embed = message.embeds[0] if message.embeds else discord.Embed(title=event[0]["title"])
-                embed.color = discord.Color.dark_grey(); embed.set_footer(text="التسجيل مغلق")
-                await message.edit(embed=embed, view=None)
-            except discord.HTTPException: logger.exception("Could not update event announcement after close")
-        await interaction.followup.send("أُغلق التسجيل في الفعالية.", ephemeral=True)
+        closed = (
+            await client.table("events")
+            .update({"status": "CLOSED", "closed_at": datetime.now(timezone.utc).isoformat()})
+            .eq("id", event_id)
+            .eq("guild_id", interaction.guild.id)
+            .eq("status", "OPEN")
+            .execute()
+        ).data or []
+        if not closed:
+            await interaction.followup.send("الفعالية أُغلقت مسبقًا.", ephemeral=True)
+            return
+        await remove_event_roles(interaction.guild, event_id, client)
+        await refresh_event_announcement(self.cog.bot, client, event_id)
+        await interaction.followup.send("أُغلق التسجيل وسُحبت رتبة الفعالية من المشاركين.", ephemeral=True)
 
 
 class EventDashboardView(discord.ui.View):
@@ -668,8 +724,30 @@ class EventDashboardView(discord.ui.View):
 
     @discord.ui.button(label="إنشاء فعالية", emoji="✨", style=discord.ButtonStyle.success)
     async def create(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not _staff(interaction): await interaction.response.send_message("للإدارة فقط.", ephemeral=True); return
-        await interaction.response.send_message(
+        if not interaction.guild or not _staff(interaction):
+            await interaction.response.send_message("للإدارة فقط.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            client = await self.cog.bot.db.get_client()
+            open_count = (
+                await client.table("events")
+                .select("id", count="exact")
+                .eq("guild_id", interaction.guild.id)
+                .eq("status", "OPEN")
+                .execute()
+            ).count or 0
+        except Exception:
+            logger.exception("Could not check the open EventHub count for guild %s", interaction.guild.id)
+            await interaction.followup.send("تعذر التحقق من عدد الفعاليات المفتوحة. حاول مجددًا بعد فحص قاعدة البيانات.", ephemeral=True)
+            return
+        if open_count >= len(EVENT_ROLE_NAMES):
+            await interaction.followup.send(
+                "وصلت إلى الحد الأقصى: توجد خمس فعاليات مفتوحة بالفعل. أغلق واحدة قبل إنشاء غيرها.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
             "**الخطوة 1:** اختر قناة نشر الفعالية وقناة الإشعارات الإدارية (اختيارية)، ثم اضغط **التالي**.",
             view=EventChannelPickerView(self.cog),
             ephemeral=True,
@@ -1611,12 +1689,16 @@ class DashboardCog(commands.Cog):
         if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True, thinking=not edit)
         try:
             client = await self.bot.db.get_client()
-            rows = (await client.table("events").select("id,title,starts_at,capacity").eq("guild_id", interaction.guild.id).eq("status", "OPEN").order("starts_at").limit(8).execute()).data or []
+            rows = (await client.table("events").select("id,title,starts_at,ends_at,capacity").eq("guild_id", interaction.guild.id).eq("status", "OPEN").order("starts_at").limit(8).execute()).data or []
             details = []
             for event in rows:
                 count = (await client.table("event_participants").select("id", count="exact").eq("event_id", event["id"]).execute()).count or 0
                 start = datetime.fromisoformat(event["starts_at"].replace("Z", "+00:00"))
-                details.append(f"• **#{event['id']} {event['title']}** · <t:{int(start.timestamp())}:f> · {count}/{event['capacity']} مقعد")
+                end = datetime.fromisoformat(event["ends_at"].replace("Z", "+00:00"))
+                details.append(
+                    f"• **#{event['id']} {event['title']}** · <t:{int(start.timestamp())}:f>"
+                    f" إلى <t:{int(end.timestamp())}:t> · {count}/{event['capacity']} مقعد"
+                )
             description = "\n".join(details) if details else "لا توجد فعاليات مفتوحة حاليًا."
             description += "\n\nاختر إجراءً من الأزرار لإدارة الفعاليات والتسجيل والحضور."
         except Exception:

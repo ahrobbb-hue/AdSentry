@@ -11,8 +11,18 @@ from discord import app_commands
 from discord.ext import commands
 from config import Config
 from cogs.moderation import is_admin
+from cogs.eventhub import EVENT_ROLE_NAMES, ensure_event_roles
 
 logger = logging.getLogger("AdSentry.Setup")
+
+EVENT_CATEGORY_NAME = "╔〖🎪┇〢eventhub"
+EVENT_VOICE_CHANNEL_NAME = "╚〖🔊┇〢event-voice"
+
+
+def event_text_channel_name(slot: int) -> str:
+    if not 1 <= slot <= len(EVENT_ROLE_NAMES):
+        raise ValueError(f"Event channel slot must be between 1 and {len(EVENT_ROLE_NAMES)}.")
+    return f"╠〖🎪┇〢event-{slot}"
 
 
 class SetupCog(commands.Cog, name="Server Setup"):
@@ -38,6 +48,9 @@ class SetupCog(commands.Cog, name="Server Setup"):
         bot_member = guild.me
         if bot_member is None or not bot_member.guild_permissions.manage_channels:
             await interaction.followup.send("يحتاج البوت إلى صلاحية **Manage Channels** لإنشاء القنوات.", ephemeral=True)
+            return
+        if not bot_member.guild_permissions.manage_roles:
+            await interaction.followup.send("يحتاج البوت إلى صلاحيتي **Manage Channels** و**Manage Roles** لإنشاء رتب الفعاليات وتأمين قنواتها.", ephemeral=True)
             return
 
         STAFF_CATEGORY_NAME = "↳AdSentry - الإداره↲"
@@ -233,6 +246,8 @@ class SetupCog(commands.Cog, name="Server Setup"):
             stage = "إنشاء وتنسيق الفئات"
             public_cat = await get_or_create_category(PUBLIC_CATEGORY_NAME, False, ["adsentry", "عام"])
             staff_cat = await get_or_create_category(STAFF_CATEGORY_NAME, True, ["adsentry", "إدار"])
+            event_roles = await ensure_event_roles(guild)
+            event_cat = await get_or_create_category(EVENT_CATEGORY_NAME, True, ["eventhub"])
 
             # Permission setups
             admin_overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
@@ -253,6 +268,9 @@ class SetupCog(commands.Cog, name="Server Setup"):
                     panel_overwrites[role] = staff_perms
                     staff_review_overwrites[role] = staff_perms
                     staff_vacation_overwrites[role] = staff_perms
+
+            event_category_overwrites = dict(admin_overwrites)
+            await event_cat.edit(overwrites=event_category_overwrites, reason="AdSentry EventHub setup")
 
             complaints_overwrites = dict(admin_overwrites)  # Confidential for admins + bot only
             public_overwrites = {
@@ -313,6 +331,73 @@ class SetupCog(commands.Cog, name="Server Setup"):
 
                 channels[key] = channel
                 claimed_ids.add(channel.id)
+
+            event_channels: dict[int, discord.TextChannel] = {}
+            for slot, role in enumerate(event_roles, start=1):
+                name = event_text_channel_name(slot)
+                overwrites = dict(event_category_overwrites)
+                overwrites[role] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    embed_links=True,
+                    attach_files=True,
+                    add_reactions=True,
+                )
+                channel = next(
+                    (
+                        existing for existing in event_cat.text_channels
+                        if f"event-{slot}" in existing.name.casefold()
+                    ),
+                    None,
+                )
+                if channel is None:
+                    channel = await guild.create_text_channel(
+                        name,
+                        category=event_cat,
+                        overwrites=overwrites,
+                        reason="AdSentry EventHub setup",
+                    )
+                else:
+                    await channel.edit(
+                        name=name,
+                        overwrites=overwrites,
+                        reason="AdSentry EventHub setup",
+                    )
+                event_channels[slot] = channel
+
+            voice_overwrites = dict(event_category_overwrites)
+            voice_overwrites[bot_member] = discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                speak=True,
+            )
+            for role in event_roles:
+                voice_overwrites[role] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    connect=True,
+                    speak=True,
+                )
+            event_voice = next(
+                (
+                    existing for existing in event_cat.voice_channels
+                    if "event-voice" in existing.name.casefold()
+                ),
+                None,
+            )
+            if event_voice is None:
+                event_voice = await guild.create_voice_channel(
+                    EVENT_VOICE_CHANNEL_NAME,
+                    category=event_cat,
+                    overwrites=voice_overwrites,
+                    reason="AdSentry EventHub setup",
+                )
+            else:
+                await event_voice.edit(
+                    name=EVENT_VOICE_CHANNEL_NAME,
+                    overwrites=voice_overwrites,
+                    reason="AdSentry EventHub setup",
+                )
 
             stage = "حفظ قناة الإعلانات والمراجعة في قاعدة البيانات"
             await self.bot.db.set_guild_config(
@@ -389,9 +474,18 @@ class SetupCog(commands.Cog, name="Server Setup"):
             ann_tag = "♻️ تم التعرف عليها" if reused_flags.get("announcements") else "✨ جديدة"
             summary_parts.append(f"• {channels['announcements'].mention} — `إعلانات البوت العامة` ({ann_tag})")
 
+            summary_parts.append(f"\n📁 **فئة الفعاليات:** `{event_cat.name}`")
+            for slot, role in enumerate(event_roles, start=1):
+                summary_parts.append(
+                    f"• {event_channels[slot].mention} — رتبة `{role.name}` فقط"
+                )
+            summary_parts.append(
+                f"• {event_voice.mention} — قناة صوتية مشتركة لرتب Event وEvent 2–5"
+            )
+
             summary = "\n".join(summary_parts)
             missing_roles = not any(guild.get_role(role_id) for role_id in Config.STAFF_ROLE_IDS)
-            note = "\n\n⚠️ لم يتم العثور على رتب الطاقم في `STAFF_ROLE_IDS`؛ القنوات الخاصة ستكون للمدراء والبوت فقط." if missing_roles else ""
+            note = "\n\n⚠️ لم يتم العثور على رتب الطاقم في `STAFF_ROLE_IDS`؛ قنوات الإدارة ستكون للمدراء والبوت، وقنوات الفعاليات لأصحاب رتبة الفعالية الخاصة بكل قناة." if missing_roles else ""
 
             await interaction.followup.send(
                 f"✅ **اكتمل إعداد وتنسيق قنوات AdSentry بنجاح!**\n\n"
