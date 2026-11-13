@@ -16,6 +16,8 @@ from cogs.recruitment import (
 )
 from cogs.eventhub import (
     EVENT_ROLE_NAMES,
+    EventCancelModal,
+    EventEditModal,
     RegisterView,
     _event_end_datetime,
     build_event_embed,
@@ -766,6 +768,43 @@ class EventDashboardView(discord.ui.View):
         if not rows: await interaction.followup.send("لا توجد فعاليات مفتوحة.", ephemeral=True); return
         await interaction.followup.send("اختر الفعالية:", view=EventCloseSelectView(self.cog, rows), ephemeral=True)
 
+    async def _choose_event_for_action(self, interaction: discord.Interaction, action: str) -> None:
+        if not interaction.guild or not _staff(interaction):
+            await interaction.response.send_message("هذه العملية للإدارة فقط.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            client = await self.cog.bot.db.get_client()
+            rows = (
+                await client.table("events")
+                .select("*")
+                .eq("guild_id", interaction.guild.id)
+                .eq("status", "OPEN")
+                .order("starts_at")
+                .limit(5)
+                .execute()
+            ).data or []
+        except Exception:
+            logger.exception("Could not load open events for dashboard %s action", action)
+            await interaction.followup.send("تعذر تحميل الفعاليات المفتوحة.", ephemeral=True)
+            return
+        if not rows:
+            await interaction.followup.send("لا توجد فعاليات مفتوحة لإدارتها.", ephemeral=True)
+            return
+        await interaction.followup.send(
+            "اختر الفعالية:",
+            view=EventManagementSelectView(rows, action),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="تعديل فعالية", emoji="✏️", style=discord.ButtonStyle.primary, row=1)
+    async def edit_event(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._choose_event_for_action(interaction, "edit")
+
+    @discord.ui.button(label="إلغاء فعالية", emoji="❌", style=discord.ButtonStyle.danger, row=1)
+    async def cancel_event(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._choose_event_for_action(interaction, "cancel")
+
     @discord.ui.button(label="تسجيل الحضور", emoji="✔️", style=discord.ButtonStyle.secondary)
     async def attendance(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction): await interaction.response.send_message("للإدارة فقط.", ephemeral=True); return
@@ -774,6 +813,43 @@ class EventDashboardView(discord.ui.View):
     @discord.ui.button(label="الرئيسية", emoji="🏠", style=discord.ButtonStyle.secondary)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog.show_home(interaction, edit=True)
+
+
+class EventManagementSelectView(discord.ui.View):
+    def __init__(self, events: list[dict], action: str) -> None:
+        super().__init__(timeout=180)
+        self.events = {str(event["id"]): event for event in events}
+        self.action = action
+        options = [
+            discord.SelectOption(
+                label=f"#{event['id']} · {event['title']}"[:100],
+                value=str(event["id"]),
+            )
+            for event in events
+        ]
+        select = discord.ui.Select(
+            placeholder="اختر الفعالية المفتوحة",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        select.callback = self._select_event
+        self.add_item(select)
+
+    async def _select_event(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not _staff(interaction):
+            await interaction.response.send_message("هذه العملية للإدارة فقط.", ephemeral=True)
+            return
+        event = self.events.get(interaction.data["values"][0])
+        if not event:
+            await interaction.response.send_message("الفعالية غير موجودة.", ephemeral=True)
+            return
+        if self.action == "edit":
+            await interaction.response.send_modal(EventEditModal(event))
+        elif self.action == "cancel":
+            await interaction.response.send_modal(EventCancelModal(event))
+        else:
+            await interaction.response.send_message("إجراء الفعالية غير معروف.", ephemeral=True)
 
 
 async def submit_staff_case(

@@ -13,6 +13,7 @@ Staff can use `/dashboard` and open the EventHub, StaffFlow, or dedicated Shifts
 - Registration is serialized in PostgreSQL, preventing duplicates and seat-limit overruns when many members click at once. Concurrent event creation is also serialized, so the five-event limit cannot be exceeded by simultaneous staff actions.
 - The bot needs Discord's **Manage Roles** permission, and its highest role must be above the five `Event` roles.
 - `/event list` shows open events and current occupancy.
+- From `/dashboard` → **الفعاليات**, staff can choose an open event with **تعديل فعالية** or **إلغاء فعالية** buttons; these remain available even when no separate admin notification channel was configured.
 - The event creator or staff can use `/event edit event_id:<id>` or the **تعديل الفعالية** button to change the title, description, start time, duration (1–168 hours), or capacity. Enter the new start time as ISO 8601 with an offset, e.g. `2026-11-18T19:00+03:00`. Capacity cannot be reduced below the number already registered; changes update the public announcement and reset its start reminder.
 - The event creator or staff can use `/event cancel event_id:<id>` or **إلغاء الفعالية**. Cancellation removes participant roles, marks the existing announcement as cancelled, and posts a cancellation notice in the same announcement channel. The optional cancellation reason is included in that notice.
 - `/event attendance` records or corrects attendance for a registered member; staff only.
