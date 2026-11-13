@@ -99,11 +99,12 @@ BEGIN
     END IF;
 
     v_slot := NULL;
-    FOR v_slot IN 1..5 LOOP
+    FOR v_candidate IN 1..5 LOOP
         IF NOT EXISTS (
             SELECT 1 FROM public.events
-            WHERE guild_id = p_guild_id AND status = 'OPEN' AND role_slot = v_slot
+            WHERE guild_id = p_guild_id AND status = 'OPEN' AND role_slot = v_candidate
         ) THEN
+            v_slot := v_candidate;
             EXIT;
         END IF;
     END LOOP;

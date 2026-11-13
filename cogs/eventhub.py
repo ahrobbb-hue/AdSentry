@@ -68,10 +68,34 @@ def _parse_event_datetime(text: str) -> datetime:
     return value
 
 
-def _event_end_datetime(starts_at: datetime, duration_hours: int) -> datetime:
-    if not 1 <= duration_hours <= 168:
-        raise ValueError("مدة الفعالية يجب أن تكون بين ساعة و168 ساعة.")
-    return starts_at + timedelta(hours=duration_hours)
+def _parse_event_duration(text: str) -> timedelta:
+    value = text.strip().lower()
+    if re.fullmatch(r"\d+", value):
+        value += "h"
+    match = re.fullmatch(r"(\d+)\s*([mhdw])", value)
+    if not match:
+        raise ValueError("أدخل المدة مثل 30m أو 1h أو 1d أو 1w، وبحد أقصى 4 أسابيع.")
+
+    amount = int(match.group(1))
+    unit_minutes = {"m": 1, "h": 60, "d": 1440, "w": 10080}
+    duration_minutes = amount * unit_minutes[match.group(2)]
+    if not 1 <= duration_minutes <= 4 * 7 * 24 * 60:
+        raise ValueError("مدة الفعالية يجب أن تكون بين دقيقة واحدة و4 أسابيع.")
+    return timedelta(minutes=duration_minutes)
+
+
+def _format_event_duration(duration: timedelta) -> str:
+    total_minutes = int(duration.total_seconds() // 60)
+    for unit, unit_minutes in (("w", 10080), ("d", 1440), ("h", 60)):
+        if total_minutes % unit_minutes == 0:
+            return f"{total_minutes // unit_minutes}{unit}"
+    return f"{total_minutes}m"
+
+
+def _event_end_datetime(starts_at: datetime, duration: timedelta) -> datetime:
+    if duration < timedelta(minutes=1) or duration > timedelta(weeks=4):
+        raise ValueError("مدة الفعالية يجب أن تكون بين دقيقة واحدة و4 أسابيع.")
+    return starts_at + duration
 
 
 def _parse_questions(raw: Any) -> list[str]:
@@ -129,6 +153,11 @@ def _event_embed(event: dict, registered: int = 0, waitlist: int = 0) -> discord
         end = None
     if end:
         embed.add_field(name="🕒  نهاية الفعالية", value=f"<t:{int(end.timestamp())}:F>", inline=True)
+    registration_open = status == "OPEN" and event.get("registration_open", True)
+    registration_state = "مفتوح" if registration_open else "مغلق"
+    if status == "OPEN" and not registration_open:
+        registration_state += " — الفعالية مستمرة"
+    embed.add_field(name="📝  التسجيل", value=registration_state, inline=True)
     cap = event.get("capacity", 0)
     spots_left = max(0, cap - registered)
     bar = _seats_bar(registered, cap)
@@ -209,6 +238,8 @@ def _admin_embed(event: dict, registered: int = 0, waitlist: int = 0, creator: s
     if raw_end:
         end = datetime.fromisoformat(raw_end.replace("Z", "+00:00")) if isinstance(raw_end, str) else raw_end
         embed.add_field(name="🕒  النهاية", value=f"<t:{int(end.timestamp())}:F>", inline=True)
+    if event.get("registration_open") is False:
+        embed.add_field(name="📝  حالة التسجيل", value="مغلق — الفعالية مستمرة", inline=True)
     embed.add_field(name="🎟️  المسجلون", value=f"{registered}/{event['capacity']}", inline=True)
     embed.add_field(name="⏳  انتظار", value=str(waitlist), inline=True)
     embed.add_field(name="📋  التسجيل", value="نموذج مخصص" if event.get("registration_type") == "FORM" else "فوري", inline=True)
@@ -438,7 +469,11 @@ async def _refresh_embed(bot: commands.Bot, event_id: int) -> None:
         if isinstance(ch, discord.TextChannel) and ev.get("announcement_message_id"):
             try:
                 msg = await ch.fetch_message(int(ev["announcement_message_id"]))
-                view = RegisterView(event_id, ev.get("registration_type", "DIRECT")) if ev["status"] == "OPEN" else None
+                view = RegisterView(
+                    event_id,
+                    ev.get("registration_type", "DIRECT"),
+                    ev.get("registration_open", True),
+                ) if ev["status"] == "OPEN" else None
                 await msg.edit(embed=_event_embed(ev, registered, waitlist), view=view)
             except discord.NotFound:
                 pass
@@ -461,13 +496,19 @@ async def _refresh_embed(bot: commands.Bot, event_id: int) -> None:
 class RegisterView(discord.ui.View):
     """Persistent public-announcement view: register + cancel buttons."""
 
-    def __init__(self, event_id: int, reg_type: str = "DIRECT") -> None:
+    def __init__(
+        self,
+        event_id: int,
+        reg_type: str = "DIRECT",
+        registration_open: bool = True,
+    ) -> None:
         super().__init__(timeout=None)
         self.event_id = event_id
         label = "📝  أدخل معلوماتك للتسجيل" if reg_type == "FORM" else "🎟️  سجّل في الفعالية"
         reg = discord.ui.Button(
             label=label, style=discord.ButtonStyle.success,
             custom_id=f"eh:reg:{event_id}",
+            disabled=not registration_open,
         )
         reg.callback = self._on_register  # type: ignore[method-assign]
         self.add_item(reg)
@@ -488,6 +529,11 @@ class RegisterView(discord.ui.View):
         ev = ev[0]
         if ev["status"] != "OPEN":
             return await interaction.response.send_message("🔒  التسجيل مغلق.", ephemeral=True)
+        if not ev.get("registration_open", True):
+            return await interaction.response.send_message(
+                "🔒  أوقف المنظم التسجيلات الجديدة لهذه الفعالية.",
+                ephemeral=True,
+            )
         if ev.get("registration_type") == "FORM":
             qs = _parse_questions(ev.get("form_questions") or [])
             return await interaction.response.send_modal(FormModal(self.event_id, qs[:4]))
@@ -565,6 +611,7 @@ class _ConfirmView(discord.ui.View):
             "duplicate":  "ℹ️  أنت مسجل مسبقًا في هذه الفعالية.",
             "full":       "❌  اكتملت المقاعد وقائمة الانتظار مغلقة.",
             "closed":     "🔒  التسجيل مغلق.",
+            "registration_closed": "🔒  أوقف المنظم التسجيلات الجديدة لهذه الفعالية.",
             "suspended":  "🚫  أنت موقوف مؤقتاً عن الفعاليات.",
         }
         await interaction.edit_original_response(content=msgs.get(result, "تعذر إتمام التسجيل."), embed=None, view=None)
@@ -629,6 +676,7 @@ class FormModal(discord.ui.Modal):
             "suspended":  "🚫  أنت موقوف مؤقتاً عن الفعاليات.",
             "duplicate":  "ℹ️  طلبك قيد المراجعة أو أنت مسجل مسبقاً.",
             "closed":     "🔒  التسجيل مغلق.",
+            "registration_closed": "🔒  أوقف المنظم التسجيلات الجديدة لهذه الفعالية.",
         }
         await interaction.followup.send(msgs.get(result, "تعذر إرسال النموذج."), ephemeral=True)
 
@@ -719,12 +767,12 @@ class EventEditModal(discord.ui.Modal, title="تعديل الفعالية"):
             min_length=16,
             max_length=40,
         )
-        duration_hours = max(1, min(168, int((ends_at - starts_at).total_seconds() // 3600)))
+        duration = ends_at - starts_at
         self.duration_input = discord.ui.TextInput(
-            label="مدة الفعالية (1–168 ساعة)",
-            default=str(duration_hours),
+            label="المدة (مثل 30m أو 1h أو 1d أو 1w)",
+            default=_format_event_duration(duration),
             min_length=1,
-            max_length=3,
+            max_length=5,
         )
         for item in (self.title_input, self.description_input, self.capacity_input, self.starts_at_input, self.duration_input):
             self.add_item(item)
@@ -741,8 +789,8 @@ class EventEditModal(discord.ui.Modal, title="تعديل الفعالية"):
             if not 1 <= capacity <= 500:
                 raise ValueError
             starts_at = _parse_event_datetime(self.starts_at_input.value)
-            duration_hours = int(self.duration_input.value.strip())
-            ends_at = _event_end_datetime(starts_at, duration_hours)
+            duration = _parse_event_duration(self.duration_input.value)
+            ends_at = _event_end_datetime(starts_at, duration)
         except ValueError as exc:
             message = str(exc) or "عدد المقاعد يجب أن يكون رقمًا بين 1 و500."
             return await interaction.response.send_message(message, ephemeral=True)
@@ -934,16 +982,18 @@ class AdminView(discord.ui.View):
             return await interaction.response.send_message("للإدارة فقط.", ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
         client = await interaction.client.db.get_client()  # type: ignore[attr-defined]
-        now = datetime.now(timezone.utc).isoformat()
         res = (
-            await client.table("events").update({"status": "CLOSED", "closed_at": now})
-            .eq("id", self.event_id).eq("status", "OPEN").execute()
+            await client.table("events").update({"registration_open": False})
+            .eq("id", self.event_id).eq("status", "OPEN")
+            .eq("registration_open", True).execute()
         ).data
         if not res:
-            return await interaction.followup.send("الفعالية مغلقة مسبقاً.", ephemeral=True)
-        await _strip_role_all(interaction.guild, self.event_id, client)  # type: ignore[arg-type]
+            return await interaction.followup.send("التسجيل مغلق مسبقاً أو انتهت الفعالية.", ephemeral=True)
         await _refresh_embed(interaction.client, self.event_id)  # type: ignore[arg-type]
-        await interaction.followup.send("🔒  تم إغلاق التسجيل وسحب رتبة الفعالية من جميع المشاركين.", ephemeral=True)
+        await interaction.followup.send(
+            "🔒  تم إيقاف التسجيلات الجديدة فقط. الفعالية ما زالت مفتوحة، وستبقى رتب المشاركين حتى موعد انتهائها.",
+            ephemeral=True,
+        )
 
     async def _remind(self, interaction: discord.Interaction) -> None:
         if not self._ok(interaction):
@@ -1220,7 +1270,7 @@ class EventHubTimePickerView(discord.ui.View):
         reg_type: str,
         questions: list[str],
         prizes: str | None,
-        duration_hours: int,
+        duration: timedelta,
     ) -> None:
         super().__init__(timeout=600)
         self.announce_channel = announce_channel
@@ -1231,7 +1281,7 @@ class EventHubTimePickerView(discord.ui.View):
         self.reg_type = reg_type
         self.questions = questions
         self.prizes = prizes
-        self.duration_hours = duration_hours
+        self.duration = duration
 
         self.tz = timezone(timedelta(hours=3))
         now_local = datetime.now(self.tz)
@@ -1330,7 +1380,7 @@ class EventHubTimePickerView(discord.ui.View):
         return local_dt.astimezone(timezone.utc)
 
     def get_end_datetime(self) -> datetime:
-        return _event_end_datetime(self.get_selected_datetime(), self.duration_hours)
+        return _event_end_datetime(self.get_selected_datetime(), self.duration)
 
     def render_content(self) -> str:
         dt_utc = self.get_selected_datetime()
@@ -1340,7 +1390,7 @@ class EventHubTimePickerView(discord.ui.View):
         return (
             f"🎪 **تحديد موعد الفعالية: {self.title}**\n\n"
             f"📅 **البداية:** <t:{ts}:F> (<t:{ts}:R>)\n"
-            f"🕒 **النهاية:** <t:{end_ts}:F> · المدة `{self.duration_hours}` ساعة\n"
+            f"🕒 **النهاية:** <t:{end_ts}:F> · المدة `{_format_event_duration(self.duration)}`\n"
             f"👥 **المقاعد:** `{self.capacity}`  ·  📢 **القناة:** {self.announce_channel.mention}{admin_info}\n\n"
             "👇 **حدد التاريخ والساعة المناسبة من القوائم أدناه، ثم اضغط على زر التأكيد:**"
         )
@@ -1527,10 +1577,10 @@ class EventCreateModal(discord.ui.Modal, title="🎪  إنشاء فعالية ج
     f_desc     = discord.ui.TextInput(label="الوصف", style=discord.TextStyle.paragraph, max_length=1500, placeholder="تفاصيل الفعالية...")
     f_capacity = discord.ui.TextInput(label="عدد المقاعد", max_length=4, default="25", placeholder="25")
     f_duration = discord.ui.TextInput(
-        label="مدة الفعالية بالساعات (1–168)",
-        max_length=3,
-        default="2",
-        placeholder="2",
+        label="المدة (مثل 30m أو 1h أو 1d أو 1w)",
+        max_length=5,
+        default="2h",
+        placeholder="مثال: 30m أو 1d",
     )
     f_extras   = discord.ui.TextInput(
         label="إضافات — سطر الجوائز: ... ثم أسئلة النموذج",
@@ -1551,11 +1601,9 @@ class EventCreateModal(discord.ui.Modal, title="🎪  إنشاء فعالية ج
         except ValueError:
             return await interaction.response.send_message("❌  عدد المقاعد يجب أن يكون رقماً بين 1 و500.", ephemeral=True)
         try:
-            duration_hours = int(self.f_duration.value.strip())
-            if not 1 <= duration_hours <= 168:
-                raise ValueError
-        except ValueError:
-            return await interaction.response.send_message("❌  مدة الفعالية يجب أن تكون بين ساعة و168 ساعة.", ephemeral=True)
+            duration = _parse_event_duration(self.f_duration.value)
+        except ValueError as exc:
+            return await interaction.response.send_message(f"❌  {exc}", ephemeral=True)
 
         prizes: str | None = None
         questions: list[str] = []
@@ -1580,7 +1628,7 @@ class EventCreateModal(discord.ui.Modal, title="🎪  إنشاء فعالية ج
             reg_type=reg_type,
             questions=questions,
             prizes=prizes,
-            duration_hours=duration_hours,
+            duration=duration,
         )
         await interaction.response.send_message(
             content=picker.render_content(),
@@ -1810,6 +1858,7 @@ class RegisterEventView(discord.ui.View):
                 "full": "❌  اكتملت المقاعد.",
                 "duplicate": "ℹ️  أنت مسجل بالفعل في هذه الفعالية.",
                 "closed": "🔒  التسجيل مغلق أو انتهت الفعالية.",
+                "registration_closed": "🔒  أوقف المنظم التسجيلات الجديدة لهذه الفعالية.",
                 "not_found": "⚠️  الفعالية غير موجودة.",
             }
             await interaction.response.send_message(
@@ -1864,7 +1913,7 @@ async def _refresh_event_announcement(
         pass
     try:
         event_row = (await client.table("events").select(  # type: ignore[attr-defined]
-            "title,description,starts_at,ends_at,capacity,channel_id,announcement_message_id,status,created_by,registration_type"
+            "title,description,starts_at,ends_at,capacity,channel_id,announcement_message_id,status,created_by,registration_type,registration_open"
         ).eq("id", event_id).limit(1).execute()).data
         if not event_row:
             return
@@ -1890,7 +1939,11 @@ async def _refresh_event_announcement(
             ),
         )
         message = await channel.fetch_message(int(ev["announcement_message_id"]))
-        view = RegisterView(event_id, ev.get("registration_type", "DIRECT")) if ev.get("status") == "OPEN" else None
+        view = RegisterView(
+            event_id,
+            ev.get("registration_type", "DIRECT"),
+            ev.get("registration_open", True),
+        ) if ev.get("status") == "OPEN" else None
         await message.edit(embed=embed, view=view)
     except Exception:
         logger.warning("Could not refresh event announcement embed for event %s", event_id)
@@ -1915,10 +1968,14 @@ class EventHub(commands.GroupCog, group_name="event"):
         self.reminder_sweeper.start()
         try:
             client = await self.bot.db.get_client()
-            rows = (await client.table("events").select("id,registration_type").eq("status", "OPEN").execute()).data or []
+            rows = (await client.table("events").select("id,registration_type,registration_open").eq("status", "OPEN").execute()).data or []
             for r in rows:
                 event_id = int(r["id"])
-                self.bot.add_view(RegisterView(event_id, r.get("registration_type", "DIRECT")))
+                self.bot.add_view(RegisterView(
+                    event_id,
+                    r.get("registration_type", "DIRECT"),
+                    r.get("registration_open", True),
+                ))
                 self.bot.add_view(RegisterEventView(event_id))
                 self.bot.add_view(AdminView(int(r["id"])))
         except Exception:
@@ -2154,28 +2211,22 @@ class EventHub(commands.GroupCog, group_name="event"):
     async def close(self, interaction: discord.Interaction, event_id: int) -> None:
         if not interaction.guild or not is_staff(interaction.user):
             await interaction.response.send_message("هذا الأمر مخصص للإدارة.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=True, thinking=True)
         client = await self.bot.db.get_client()
-        now = datetime.now(timezone.utc).isoformat()
         res = await client.table("events").update(
-            {"status": "CLOSED", "closed_at": now}
-        ).eq("id", event_id).eq("guild_id", interaction.guild.id).eq("status", "OPEN").execute()
+            {"registration_open": False}
+        ).eq("id", event_id).eq("guild_id", interaction.guild.id).eq("status", "OPEN").eq(
+            "registration_open", True
+        ).execute()
         if not res.data:
-            await interaction.response.send_message("⚠️  الفعالية غير موجودة أو التسجيل مغلق مسبقًا.", ephemeral=True)
+            await interaction.followup.send("⚠️  الفعالية غير موجودة أو التسجيل مغلق مسبقًا.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
         ev = res.data[0]
-        reg_count = (await client.table("event_participants").select(
-            "id", count="exact"
-        ).eq("event_id", event_id).execute()).count or 0
-        await _strip_role_all(interaction.guild, event_id, client)
         await _refresh_event_announcement(self.bot, client, event_id)
-        if ev.get("admin_channel_id"):
-            await send_admin_event_notification(
-                self.bot, int(ev["admin_channel_id"]),
-                event_id=event_id, event_title=ev["title"],
-                kind="event_closed", registered=reg_count, capacity=ev["capacity"],
-            )
-        await interaction.followup.send("🔒  تم إغلاق التسجيل في الفعالية.", ephemeral=True)
+        await interaction.followup.send(
+            f"🔒  تم إيقاف التسجيلات الجديدة في **{ev['title']}** فقط. الفعالية ما زالت مفتوحة.",
+            ephemeral=True,
+        )
 
     @app_commands.command(name="list", description="عرض الفعاليات المفتوحة")
     async def list_events(self, interaction: discord.Interaction) -> None:
@@ -2184,7 +2235,7 @@ class EventHub(commands.GroupCog, group_name="event"):
         await interaction.response.defer(ephemeral=True, thinking=True)
         client = await self.bot.db.get_client()
         rows = (
-            await client.table("events").select("id,title,starts_at,capacity")
+            await client.table("events").select("id,title,starts_at,capacity,registration_open")
             .eq("guild_id", interaction.guild.id).eq("status", "OPEN")
             .order("starts_at").limit(10).execute()
         ).data or []
@@ -2200,7 +2251,10 @@ class EventHub(commands.GroupCog, group_name="event"):
             bar = _seats_bar(count, ev["capacity"])
             embed.add_field(
                 name=f"#{ev['id']}  ·  {ev['title']}",
-                value=f"<t:{ts}:F>\n`{count}/{ev['capacity']}` {bar}",
+                value=(
+                    f"<t:{ts}:F>\n`{count}/{ev['capacity']}` {bar}"
+                    + ("\n🔒 التسجيل مغلق" if not ev.get("registration_open", True) else "")
+                ),
                 inline=False,
             )
         embed.set_footer(text="AdSentry EventHub")

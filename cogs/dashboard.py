@@ -20,10 +20,11 @@ from cogs.eventhub import (
     EventEditModal,
     RegisterView,
     _event_end_datetime,
+    _format_event_duration,
+    _parse_event_duration,
     build_event_embed,
     ensure_event_roles,
     refresh_event_announcement,
-    remove_event_roles,
 )
 
 logger = logging.getLogger("AdSentry.Dashboard")
@@ -260,7 +261,7 @@ class EventDateTimePickerView(discord.ui.View):
         description: str,
         capacity: int,
         reminder_hours: int,
-        duration_hours: int,
+        duration: timedelta,
     ) -> None:
         super().__init__(timeout=600)
         self.cog = cog
@@ -270,7 +271,7 @@ class EventDateTimePickerView(discord.ui.View):
         self.description = description
         self.capacity = capacity
         self.reminder_hours = reminder_hours
-        self.duration_hours = duration_hours
+        self.duration = duration
 
         # Use Saudi / Gulf timezone (UTC+3) as standard base
         self.tz = timezone(timedelta(hours=3))
@@ -382,7 +383,7 @@ class EventDateTimePickerView(discord.ui.View):
         return local_dt.astimezone(timezone.utc)
 
     def get_end_datetime(self) -> datetime:
-        return _event_end_datetime(self.get_selected_datetime(), self.duration_hours)
+        return _event_end_datetime(self.get_selected_datetime(), self.duration)
 
     def render_content(self) -> str:
         dt_utc = self.get_selected_datetime()
@@ -392,7 +393,7 @@ class EventDateTimePickerView(discord.ui.View):
         return (
             f"🎪 **تحديد موعد الفعالية: {self.title}**\n\n"
             f"📅 **البداية:** <t:{ts}:F> (<t:{ts}:R>)\n"
-            f"🕒 **النهاية:** <t:{end_ts}:F> · المدة `{self.duration_hours}` ساعة\n"
+            f"🕒 **النهاية:** <t:{end_ts}:F> · المدة `{_format_event_duration(self.duration)}`\n"
             f"👥 **المقاعد:** `{self.capacity}`  ·  🔔 **التذكير:** قبل `{self.reminder_hours}` ساعة\n"
             f"📢 **قناة الفعالية:** {self.event_channel.mention}{admin_info}\n\n"
             "👇 **حدد التاريخ والساعة المناسبة من القوائم أدناه، ثم اضغط على زر التأكيد:**"
@@ -544,7 +545,11 @@ class EventCreateModal(discord.ui.Modal, title="إنشاء فعالية"):
     description = discord.ui.TextInput(label="الوصف", style=discord.TextStyle.paragraph, max_length=800)
     capacity = discord.ui.TextInput(label="عدد المقاعد", default="25", max_length=3)
     reminder = discord.ui.TextInput(label="التذكير قبل الموعد بالساعات (0 لتعطيله)", default="24", max_length=3)
-    duration = discord.ui.TextInput(label="مدة الفعالية بالساعات (1–168)", default="2", max_length=3)
+    duration = discord.ui.TextInput(
+        label="المدة (مثل 30m أو 1h أو 1d أو 1w)",
+        default="2h",
+        max_length=5,
+    )
 
     def __init__(self, cog: "DashboardCog", event_channel: discord.TextChannel, admin_channel: discord.TextChannel | None = None) -> None:
         super().__init__()
@@ -559,11 +564,14 @@ class EventCreateModal(discord.ui.Modal, title="إنشاء فعالية"):
         try:
             capacity = int(self.capacity.value.strip())
             reminder_hours = int(self.reminder.value.strip())
-            duration_hours = int(self.duration.value.strip())
-            if not 1 <= capacity <= 500 or not 0 <= reminder_hours <= 168 or not 1 <= duration_hours <= 168:
+            duration = _parse_event_duration(self.duration.value)
+            if not 1 <= capacity <= 500 or not 0 <= reminder_hours <= 168:
                 raise ValueError
-        except ValueError:
-            await interaction.response.send_message("تحقق من أن عدد المقاعد بين (1–500)، والتذكير بين (0–168)، والمدة بين (1–168) ساعة.", ephemeral=True)
+        except ValueError as exc:
+            await interaction.response.send_message(
+                f"تحقق من عدد المقاعد (1–500) والتذكير (0–168 ساعة). {exc}",
+                ephemeral=True,
+            )
             return
 
         picker_view = EventDateTimePickerView(
@@ -574,7 +582,7 @@ class EventCreateModal(discord.ui.Modal, title="إنشاء فعالية"):
             description=self.description.value.strip(),
             capacity=capacity,
             reminder_hours=reminder_hours,
-            duration_hours=duration_hours,
+            duration=duration,
         )
         await interaction.response.send_message(
             content=picker_view.render_content(),
@@ -702,22 +710,29 @@ class EventCloseSelectView(discord.ui.View):
         client = await self.cog.bot.db.get_client()
         event_id = int(interaction.data["values"][0])
         event = (await client.table("events").select("*").eq("id", event_id).eq("guild_id", interaction.guild.id).limit(1).execute()).data
-        if not event or event[0]["status"] != "OPEN":
+        if (
+            not event
+            or event[0]["status"] != "OPEN"
+            or not event[0].get("registration_open", True)
+        ):
             await interaction.followup.send("الفعالية غير موجودة أو التسجيل مغلق مسبقًا.", ephemeral=True); return
         closed = (
             await client.table("events")
-            .update({"status": "CLOSED", "closed_at": datetime.now(timezone.utc).isoformat()})
+            .update({"registration_open": False})
             .eq("id", event_id)
             .eq("guild_id", interaction.guild.id)
             .eq("status", "OPEN")
+            .eq("registration_open", True)
             .execute()
         ).data or []
         if not closed:
             await interaction.followup.send("الفعالية أُغلقت مسبقًا.", ephemeral=True)
             return
-        await remove_event_roles(interaction.guild, event_id, client)
         await refresh_event_announcement(self.cog.bot, client, event_id)
-        await interaction.followup.send("أُغلق التسجيل وسُحبت رتبة الفعالية من المشاركين.", ephemeral=True)
+        await interaction.followup.send(
+            "تم إيقاف التسجيلات الجديدة فقط. الفعالية ما زالت مفتوحة، وستبقى رتب المشاركين حتى موعد انتهائها.",
+            ephemeral=True,
+        )
 
 
 class EventDashboardView(discord.ui.View):
@@ -764,7 +779,11 @@ class EventDashboardView(discord.ui.View):
         if not interaction.guild or not _staff(interaction): await interaction.response.send_message("للإدارة فقط.", ephemeral=True); return
         await interaction.response.defer(ephemeral=True, thinking=True)
         client = await self.cog.bot.db.get_client()
-        rows = (await client.table("events").select("id,title").eq("guild_id", interaction.guild.id).eq("status", "OPEN").order("starts_at").limit(25).execute()).data or []
+        rows = (
+            await client.table("events").select("id,title").eq("guild_id", interaction.guild.id)
+            .eq("status", "OPEN").eq("registration_open", True)
+            .order("starts_at").limit(25).execute()
+        ).data or []
         if not rows: await interaction.followup.send("لا توجد فعاليات مفتوحة.", ephemeral=True); return
         await interaction.followup.send("اختر الفعالية:", view=EventCloseSelectView(self.cog, rows), ephemeral=True)
 

@@ -1,5 +1,6 @@
 -- Add explicit end times so participant roles can be removed when events finish.
--- Run after eventhub_contest_slots_migration.sql.
+-- Run after eventhub_contest_slots_migration.sql. This migration is safe to rerun
+-- when updating the allowed duration range.
 
 ALTER TABLE public.events
     ADD COLUMN IF NOT EXISTS ends_at TIMESTAMPTZ;
@@ -52,8 +53,8 @@ DECLARE
     v_event public.events%ROWTYPE;
 BEGIN
     IF p_starts_at IS NULL OR p_starts_at <= NOW()
-       OR p_ends_at IS NULL OR p_ends_at <= p_starts_at
-       OR p_ends_at > p_starts_at + INTERVAL '168 hours' THEN
+       OR p_ends_at IS NULL OR p_ends_at < p_starts_at + INTERVAL '1 minute'
+       OR p_ends_at > p_starts_at + INTERVAL '28 days' THEN
         RAISE EXCEPTION 'Event start and end times are invalid';
     END IF;
     IF p_capacity NOT BETWEEN 1 AND 500 THEN
@@ -92,11 +93,12 @@ BEGIN
     END IF;
 
     v_slot := NULL;
-    FOR v_slot IN 1..5 LOOP
+    FOR v_candidate IN 1..5 LOOP
         IF NOT EXISTS (
             SELECT 1 FROM public.events
-            WHERE guild_id = p_guild_id AND status = 'OPEN' AND role_slot = v_slot
+            WHERE guild_id = p_guild_id AND status = 'OPEN' AND role_slot = v_candidate
         ) THEN
+            v_slot := v_candidate;
             EXIT;
         END IF;
     END LOOP;
@@ -170,8 +172,8 @@ BEGIN
        OR p_description IS NULL OR char_length(btrim(p_description)) NOT BETWEEN 1 AND 1800
        OR p_capacity NOT BETWEEN 1 AND 500
        OR p_starts_at IS NULL OR p_starts_at <= NOW()
-       OR p_ends_at IS NULL OR p_ends_at <= p_starts_at
-       OR p_ends_at > p_starts_at + INTERVAL '168 hours' THEN
+       OR p_ends_at IS NULL OR p_ends_at < p_starts_at + INTERVAL '1 minute'
+       OR p_ends_at > p_starts_at + INTERVAL '28 days' THEN
         RAISE EXCEPTION 'Invalid event title, description, capacity or schedule';
     END IF;
 
