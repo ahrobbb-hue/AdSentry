@@ -5,9 +5,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import discord
 
 import cogs.eventhub as eventhub
-from cogs.dashboard import EventDashboardView, _get_raffle_ready_events
+from cogs.dashboard import EventDashboardView, RaffleInitialEntrantsView, _get_raffle_ready_events
 from cogs.eventhub import (
     EventHub,
     _fetch_drand_beacon,
@@ -91,6 +92,8 @@ def test_raffle_migration_freezes_entries_and_restricts_draw_rpc() -> None:
     assert "record_event_raffle_result" in migration
     assert "status = 'CLOSED'" in migration
     assert "registration_open = FALSE" in migration
+    assert "create_event_raffle_draft" in migration
+    assert "set_event_raffle_channel" in migration
     assert "set_event_raffle_spin_message" in migration
     assert "verify_event_raffle_claim" in migration
     assert "TO service_role" in migration
@@ -199,6 +202,13 @@ def test_event_dashboard_buttons_are_grouped_by_workflow() -> None:
         1: ["تعديل فعالية", "إلغاء فعالية", "تسجيل الحضور", "الرئيسية"],
         2: ["إعداد السحب", "إدراج المؤهلين"],
     }
+
+
+def test_initial_entrant_entry_does_not_request_a_channel() -> None:
+    view = RaffleInitialEntrantsView(None, event_id=18)
+
+    assert any(item.label == "حفظ المؤهلين" for item in view.children)
+    assert not any(isinstance(item, discord.ui.ChannelSelect) for item in view.children)
 
 
 def test_drand_beacon_requires_randomness_to_match_signature(monkeypatch) -> None:

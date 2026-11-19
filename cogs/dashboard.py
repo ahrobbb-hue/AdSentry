@@ -948,6 +948,23 @@ class EventDashboardView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             client = await self.cog.bot.db.get_client()
+            open_raffles = (
+                await client.table("event_raffles")
+                .select("id,title,event_id,channel_id")
+                .eq("guild_id", interaction.guild.id)
+                .eq("status", "OPEN")
+                .not_.is_("event_id", "null")
+                .order("created_at", desc=True)
+                .limit(25)
+                .execute()
+            ).data or []
+            if open_raffles:
+                await interaction.followup.send(
+                    "اختر السحب الذي تريد تحديد أو تغيير قناة نشره:",
+                    view=RaffleSetupSelectView(self.cog, open_raffles),
+                    ephemeral=True,
+                )
+                return
             rows = await _get_raffle_ready_events(client, interaction.guild.id)
         except Exception:
             logger.exception("Could not load ended or registration-closed events for raffle setup")
@@ -1004,7 +1021,7 @@ class EventDashboardView(discord.ui.View):
                 )
                 return
             await interaction.followup.send(
-                "اختر الفعالية، ثم أدرج الأعضاء الذين تحققت الإدارة من أهليتهم؛ بعد ذلك تختار قناة السحب.",
+                "اختر الفعالية ثم أدرج المؤهلين. لن يُطلب اختيار القناة في هذه الخطوة؛ اخترها لاحقًا من **إعداد السحب**.",
                 view=RaffleReadyEventSelectView(self.cog, ready_events),
                 ephemeral=True,
             )
@@ -1043,7 +1060,7 @@ class RaffleReadyEventSelectView(discord.ui.View):
         if not event:
             return await interaction.response.send_message("الفعالية غير موجودة.", ephemeral=True)
         await interaction.response.send_message(
-            f"اختر المؤهلين لفعالية **#{event['id']} · {event['title']}**، ثم تابع لاختيار قناة السحب:",
+            f"اختر المؤهلين لفعالية **#{event['id']} · {event['title']}**، ثم احفظهم. لن نطلب القناة هنا:",
             view=RaffleInitialEntrantsView(self.cog, int(event["id"])),
             ephemeral=True,
         )
@@ -1073,20 +1090,23 @@ class RaffleInitialEntrantsView(discord.ui.View):
         )
         await interaction.response.edit_message(
             content=(
-                f"تم تحديد `{eligible_count}` مؤهلًا. اضغط **التالي: اختيار قناة السحب** للمتابعة."
+                f"تم تحديد `{eligible_count}` مؤهلًا. اضغط **حفظ المؤهلين** لتسجيلهم دون اختيار قناة."
             ),
             view=self,
         )
 
     @discord.ui.button(
-        label="التالي: اختيار قناة السحب",
+        label="حفظ المؤهلين",
         emoji="➡️",
         style=discord.ButtonStyle.success,
         row=1,
     )
-    async def continue_to_channel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def save_entrants(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild or not _staff(interaction):
             return await interaction.response.send_message("هذه العملية للإدارة فقط.", ephemeral=True)
+        eventhub = self.cog.bot.get_cog("EventHub")
+        if eventhub is None:
+            return await interaction.response.send_message("نظام الفعاليات غير جاهز حاليًا.", ephemeral=True)
         entrants = [
             {"user_id": member.id, "user_name": member.display_name}
             for member in self.select.values
@@ -1097,11 +1117,91 @@ class RaffleInitialEntrantsView(discord.ui.View):
                 "اختر عضوًا واحدًا على الأقل؛ لا يمكن إدراج حسابات البوتات.",
                 ephemeral=True,
             )
-        await interaction.response.edit_message(
-            content=(
-                f"تم تحديد `{len(entrants)}` مؤهلًا. اختر القناة العامة التي ستُنشر فيها القائمة والعجلة:"
-            ),
-            view=RaffleChannelPickerView(self.cog, self.event_id, entrants),
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            raffle = await self.cog.bot.db.create_event_raffle_draft(
+                guild_id=interaction.guild.id,
+                created_by=interaction.user.id,
+                event_id=self.event_id,
+            )
+            added_count = 0
+            for entrant in entrants:
+                try:
+                    await self.cog.bot.db.manage_event_raffle_entry(
+                        raffle_id=int(raffle["id"]),
+                        guild_id=interaction.guild.id,
+                        actor_id=interaction.user.id,
+                        user_id=entrant["user_id"],
+                        user_name=entrant["user_name"],
+                        action="ADD",
+                    )
+                    added_count += 1
+                except Exception:
+                    logger.exception(
+                        "Could not save preselected entrant %s to raffle draft %s",
+                        entrant["user_id"],
+                        raffle["id"],
+                    )
+        except Exception:
+            logger.exception("Could not save initial entrants for event %s raffle", self.event_id)
+            return await interaction.followup.send(
+                "تعذر حفظ المؤهلين. قد يكون للفعالية سحب موجود بالفعل؛ افتح **إدراج المؤهلين** واختر السحب الموجود.",
+                ephemeral=True,
+            )
+        missing_count = len(entrants) - added_count
+        message = (
+            f"✅ تم حفظ `{added_count}` مؤهلًا في مسودة السحب `#{raffle['id']}` دون طلب قناة."
+            "\nاضغط **إعداد السحب** لاحقًا لاختيار قناة النشر والعجلة."
+        )
+        if missing_count:
+            message += f"\nتعذر حفظ `{missing_count}` عضوًا؛ أعد اختيارهم من القائمة أدناه."
+        await interaction.followup.send(
+            message,
+            view=RaffleEntrantAddView(eventhub, int(raffle["id"])),
+            ephemeral=True,
+        )
+
+
+class RaffleSetupSelectView(discord.ui.View):
+    def __init__(self, cog: "DashboardCog", raffles: list[dict]) -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.raffles = {str(raffle["id"]): raffle for raffle in raffles}
+        select = discord.ui.Select(
+            placeholder="اختر السحب لإعداد قناته",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=f"#{raffle['id']} · {raffle['title']}"[:100],
+                    value=str(raffle["id"]),
+                    description=(
+                        "القناة غير محددة"
+                        if not raffle.get("channel_id")
+                        else f"القناة الحالية: #{raffle['channel_id']}"
+                    )[:100],
+                )
+                for raffle in raffles
+            ],
+        )
+        select.callback = self.select_raffle
+        self.add_item(select)
+
+    async def select_raffle(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not _staff(interaction):
+            return await interaction.response.send_message("هذه العملية للإدارة فقط.", ephemeral=True)
+        raffle = self.raffles.get(interaction.data["values"][0])
+        if not raffle:
+            return await interaction.response.send_message("السحب غير موجود.", ephemeral=True)
+        current_channel = (
+            f"القناة الحالية <#{raffle['channel_id']}>؛ اختر قناة أخرى لتغييرها."
+            if raffle.get("channel_id")
+            else "لم تُحدد قناة لهذا السحب بعد."
+        )
+        await interaction.response.send_message(
+            f"{current_channel} اختر قناة النشر والعجلة:",
+            view=RaffleChannelPickerView(self.cog, raffle_id=int(raffle["id"])),
+            ephemeral=True,
         )
 
 
@@ -1139,13 +1239,13 @@ class RaffleChannelPickerView(discord.ui.View):
     def __init__(
         self,
         cog: "DashboardCog",
-        event_id: int,
-        entrants: list[dict] | None = None,
+        event_id: int | None = None,
+        raffle_id: int | None = None,
     ) -> None:
         super().__init__(timeout=180)
         self.cog = cog
         self.event_id = event_id
-        self.entrants = entrants or []
+        self.raffle_id = raffle_id
         select = discord.ui.ChannelSelect(
             placeholder="اختر قناة عامة للسحب",
             min_values=1,
@@ -1175,53 +1275,47 @@ class RaffleChannelPickerView(discord.ui.View):
         eventhub = self.cog.bot.get_cog("EventHub")
         if eventhub is None:
             return await interaction.followup.send("نظام الفعاليات غير جاهز حاليًا.", ephemeral=True)
-        try:
-            raffle = await create_raffle_from_closed_event(
-                self.cog.bot,
-                interaction.guild,
-                interaction.user,
-                self.event_id,
-                channel,
+        bot_member = interaction.guild.me
+        if bot_member is None:
+            return await interaction.followup.send("تعذر التحقق من صلاحيات البوت.", ephemeral=True)
+        permissions = channel.permissions_for(bot_member)
+        if not permissions.send_messages or not permissions.embed_links or not permissions.attach_files:
+            return await interaction.followup.send(
+                "يحتاج البوت صلاحيات إرسال الرسائل والـEmbeds والمرفقات في القناة المختارة.",
+                ephemeral=True,
             )
+        try:
+            if self.raffle_id is not None:
+                raffle = await self.cog.bot.db.set_event_raffle_channel(
+                    self.raffle_id,
+                    interaction.guild.id,
+                    interaction.user.id,
+                    channel.id,
+                )
+            elif self.event_id is not None:
+                raffle = await create_raffle_from_closed_event(
+                    self.cog.bot,
+                    interaction.guild,
+                    interaction.user,
+                    self.event_id,
+                    channel,
+                )
+            else:
+                raise RuntimeError("The raffle setup view has no raffle or event ID.")
         except Exception:
-            logger.exception("Could not create raffle for closed event %s", self.event_id)
+            logger.exception(
+                "Could not configure raffle %s for event %s",
+                self.raffle_id,
+                self.event_id,
+            )
             await interaction.followup.send(
-                "تعذر إنشاء السحب. تأكد أن التسجيل مغلق أو أن الفعالية انتهت، وأنها غير مرتبطة بسحب سابق، "
-                "وأن للبوت صلاحيات الإرسال والـEmbeds والمرفقات في القناة.",
+                "تعذر إعداد السحب. تحقق من الفعالية أو السحب المختار ومن صلاحيات البوت في القناة.",
                 ephemeral=True,
             )
             return
-        added_count = 0
-        skipped_count = 0
-        for entrant in self.entrants:
-            try:
-                await self.cog.bot.db.manage_event_raffle_entry(
-                    raffle_id=int(raffle["id"]),
-                    guild_id=interaction.guild.id,
-                    actor_id=interaction.user.id,
-                    user_id=int(entrant["user_id"]),
-                    user_name=str(entrant["user_name"]),
-                    action="ADD",
-                )
-                added_count += 1
-            except Exception:
-                skipped_count += 1
-                logger.exception(
-                    "Could not add preselected entrant %s to raffle %s",
-                    entrant["user_id"],
-                    raffle["id"],
-                )
-        announcement_note = "" if raffle.get("_announcement_sent") else (
-            "\n⚠️ أُنشئ السحب لكن تعذر نشر إعلان التهيئة؛ سيظل بإمكانك تثبيت القائمة والعجلة."
-        )
-        entrants_note = (
-            f"\nأُدرج `{added_count}` مؤهلًا."
-            if not skipped_count else
-            f"\nأُدرج `{added_count}` من أصل `{len(self.entrants)}`؛ يمكنك إعادة المحاولة للبقية من اللوحة."
-        )
         await interaction.followup.send(
-            f"✅ أُعد السحب `#{raffle['id']}` في {channel.mention}.{announcement_note}\n"
-            f"{entrants_note}\nيمكنك إضافة دفعات أخرى عبر زر **إدراج المؤهلين**:",
+            f"✅ تم إعداد قناة السحب `#{raffle['id']}` في {channel.mention}.\n"
+            "يمكنك الآن إدراج المؤهلين أو تثبيت القائمة بعد اكتمالها:",
             view=RaffleEntrantAddView(eventhub, int(raffle["id"])),
             ephemeral=True,
         )

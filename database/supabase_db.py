@@ -118,6 +118,20 @@ class SupabaseDatabase:
             "p_event_id": event_id,
         })
 
+    async def create_event_raffle_draft(
+        self,
+        guild_id: int,
+        created_by: int,
+        event_id: int,
+        winner_count: int = 1,
+    ) -> dict[str, Any]:
+        return await self._event_raffle_rpc("create_event_raffle_draft", {
+            "p_guild_id": guild_id,
+            "p_created_by": created_by,
+            "p_event_id": event_id,
+            "p_winner_count": winner_count,
+        })
+
     async def get_event_raffle(self, raffle_id: int, guild_id: int) -> dict[str, Any] | None:
         client = await self.get_client()
         response = (
@@ -231,6 +245,20 @@ class SupabaseDatabase:
             "p_message_id": message_id,
         }).execute()
         return bool(response.data)
+
+    async def set_event_raffle_channel(
+        self,
+        raffle_id: int,
+        guild_id: int,
+        actor_id: int,
+        channel_id: int,
+    ) -> dict[str, Any]:
+        return await self._event_raffle_rpc("set_event_raffle_channel", {
+            "p_raffle_id": raffle_id,
+            "p_guild_id": guild_id,
+            "p_actor_id": actor_id,
+            "p_channel_id": channel_id,
+        })
 
     async def set_event_raffle_spin_message(
         self,

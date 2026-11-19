@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS public.event_raffles (
     guild_id BIGINT NOT NULL,
     event_id BIGINT REFERENCES public.events(id) ON DELETE SET NULL,
     title TEXT NOT NULL CHECK (char_length(title) BETWEEN 1 AND 100),
-    channel_id BIGINT NOT NULL,
+    channel_id BIGINT,
     created_by BIGINT NOT NULL,
     winner_count INTEGER NOT NULL DEFAULT 1 CHECK (winner_count BETWEEN 1 AND 20),
     status TEXT NOT NULL DEFAULT 'OPEN'
@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS public.event_raffles (
 );
 ALTER TABLE public.event_raffles ADD COLUMN IF NOT EXISTS event_id BIGINT REFERENCES public.events(id) ON DELETE SET NULL;
 ALTER TABLE public.event_raffles ADD COLUMN IF NOT EXISTS spin_message_id BIGINT;
+ALTER TABLE public.event_raffles ALTER COLUMN channel_id DROP NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_event_raffles_event
     ON public.event_raffles(event_id)
     WHERE event_id IS NOT NULL AND status <> 'CANCELLED';
@@ -123,6 +124,9 @@ BEGIN
        OR p_winner_count NOT BETWEEN 1 AND 20 THEN
         RAISE EXCEPTION 'Invalid raffle title or winner count';
     END IF;
+    IF p_channel_id IS NULL THEN
+        RAISE EXCEPTION 'A raffle channel is required';
+    END IF;
 
     IF p_event_id IS NOT NULL THEN
         SELECT * INTO v_event FROM public.events
@@ -151,6 +155,51 @@ BEGIN
     VALUES (v_raffle.id, p_guild_id, p_created_by, 'CREATED',
         jsonb_build_object('title', v_raffle.title, 'channel_id', p_channel_id,
                            'winner_count', p_winner_count));
+    RETURN to_jsonb(v_raffle);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.create_event_raffle_draft(
+    p_guild_id BIGINT,
+    p_created_by BIGINT,
+    p_event_id BIGINT,
+    p_winner_count INTEGER DEFAULT 1
+) RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_event public.events%ROWTYPE;
+    v_raffle public.event_raffles%ROWTYPE;
+BEGIN
+    IF p_winner_count NOT BETWEEN 1 AND 20 THEN
+        RAISE EXCEPTION 'Invalid raffle winner count';
+    END IF;
+
+    SELECT * INTO v_event FROM public.events
+    WHERE id = p_event_id
+      AND guild_id = p_guild_id
+      AND (
+          status = 'CLOSED'
+          OR (status = 'OPEN' AND registration_open = FALSE)
+      )
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Raffles require an ended event or closed registration in this server';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM public.event_raffles
+        WHERE event_id = p_event_id AND status <> 'CANCELLED'
+    ) THEN
+        RAISE EXCEPTION 'This event already has a raffle';
+    END IF;
+
+    INSERT INTO public.event_raffles(guild_id, event_id, title, created_by, winner_count)
+    VALUES (p_guild_id, p_event_id, left(v_event.title, 100), p_created_by, p_winner_count)
+    RETURNING * INTO v_raffle;
+
+    INSERT INTO public.event_raffle_audit(raffle_id, guild_id, actor_id, action, details)
+    VALUES (v_raffle.id, p_guild_id, p_created_by, 'DRAFT_CREATED',
+        jsonb_build_object('event_id', p_event_id, 'winner_count', p_winner_count));
     RETURN to_jsonb(v_raffle);
 END;
 $$;
@@ -233,6 +282,10 @@ BEGIN
     WHERE id = p_raffle_id AND guild_id = p_guild_id
     FOR UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'Raffle not found in this server'; END IF;
+
+    IF v_raffle.channel_id IS NULL THEN
+        RAISE EXCEPTION 'Configure a raffle channel before locking the entrant list';
+    END IF;
 
     IF v_raffle.status = 'OPEN' THEN
         SELECT COALESCE(
@@ -448,6 +501,42 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION public.set_event_raffle_channel(
+    p_raffle_id BIGINT,
+    p_guild_id BIGINT,
+    p_actor_id BIGINT,
+    p_channel_id BIGINT
+) RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_raffle public.event_raffles%ROWTYPE;
+BEGIN
+    IF p_channel_id IS NULL THEN
+        RAISE EXCEPTION 'A raffle channel is required';
+    END IF;
+    SELECT * INTO v_raffle
+    FROM public.event_raffles
+    WHERE id = p_raffle_id AND guild_id = p_guild_id
+    FOR UPDATE;
+    IF NOT FOUND OR v_raffle.status <> 'OPEN' OR v_raffle.event_id IS NULL THEN
+        RAISE EXCEPTION 'Only an open event raffle can be configured';
+    END IF;
+
+    IF v_raffle.channel_id IS DISTINCT FROM p_channel_id THEN
+        UPDATE public.event_raffles
+        SET channel_id = p_channel_id
+        WHERE id = p_raffle_id
+        RETURNING * INTO v_raffle;
+
+        INSERT INTO public.event_raffle_audit(raffle_id, guild_id, actor_id, action, details)
+        VALUES (p_raffle_id, p_guild_id, p_actor_id, 'CHANNEL_CONFIGURED',
+            jsonb_build_object('channel_id', p_channel_id));
+    END IF;
+    RETURN to_jsonb(v_raffle);
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION public.set_event_raffle_result_message(
     p_raffle_id BIGINT,
     p_guild_id BIGINT,
@@ -571,24 +660,28 @@ GRANT USAGE, SELECT ON SEQUENCE public.event_raffles_id_seq,
     public.event_raffle_claims_id_seq TO service_role;
 
 REVOKE ALL ON FUNCTION public.create_event_raffle(BIGINT, BIGINT, TEXT, BIGINT, INTEGER, BIGINT) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.create_event_raffle_draft(BIGINT, BIGINT, BIGINT, INTEGER) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.manage_event_raffle_entry(BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.lock_event_raffle(BIGINT, BIGINT, BIGINT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.prepare_event_raffle_beacon(BIGINT, BIGINT, BIGINT, TEXT, TEXT, BIGINT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.record_event_raffle_result(BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, BIGINT, TEXT, TEXT, JSONB) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.cancel_event_raffle(BIGINT, BIGINT, BIGINT, TEXT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.set_event_raffle_lock_message(BIGINT, BIGINT, BIGINT) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.set_event_raffle_channel(BIGINT, BIGINT, BIGINT, BIGINT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.set_event_raffle_result_message(BIGINT, BIGINT, BIGINT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.set_event_raffle_spin_message(BIGINT, BIGINT, BIGINT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.issue_event_raffle_claim(BIGINT, BIGINT, BIGINT, BIGINT, TEXT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.verify_event_raffle_claim(BIGINT, BIGINT, BIGINT, BIGINT, TEXT) FROM PUBLIC, anon, authenticated;
 
 GRANT EXECUTE ON FUNCTION public.create_event_raffle(BIGINT, BIGINT, TEXT, BIGINT, INTEGER, BIGINT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.create_event_raffle_draft(BIGINT, BIGINT, BIGINT, INTEGER) TO service_role;
 GRANT EXECUTE ON FUNCTION public.manage_event_raffle_entry(BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT, TEXT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.lock_event_raffle(BIGINT, BIGINT, BIGINT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.prepare_event_raffle_beacon(BIGINT, BIGINT, BIGINT, TEXT, TEXT, BIGINT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.record_event_raffle_result(BIGINT, BIGINT, BIGINT, JSONB, TEXT, TEXT, BIGINT, TEXT, TEXT, JSONB) TO service_role;
 GRANT EXECUTE ON FUNCTION public.cancel_event_raffle(BIGINT, BIGINT, BIGINT, TEXT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.set_event_raffle_lock_message(BIGINT, BIGINT, BIGINT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.set_event_raffle_channel(BIGINT, BIGINT, BIGINT, BIGINT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.set_event_raffle_result_message(BIGINT, BIGINT, BIGINT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.set_event_raffle_spin_message(BIGINT, BIGINT, BIGINT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.issue_event_raffle_claim(BIGINT, BIGINT, BIGINT, BIGINT, TEXT) TO service_role;

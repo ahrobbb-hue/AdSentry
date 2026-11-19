@@ -2976,6 +2976,17 @@ class EventHub(commands.GroupCog, group_name="event"):
             return await interaction.response.send_message("هذا الأمر مخصص للإدارة.", ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
+            existing_raffle = await self.bot.db.get_event_raffle(
+                raffle_id,
+                interaction.guild.id,
+            )
+            if not existing_raffle:
+                return await interaction.followup.send("لم يتم العثور على هذا السحب.", ephemeral=True)
+            if not existing_raffle.get("channel_id"):
+                return await interaction.followup.send(
+                    "اختر قناة السحب أولًا من زر **إعداد السحب** في لوحة الفعاليات.",
+                    ephemeral=True,
+                )
             raffle = await self.bot.db.lock_event_raffle(
                 raffle_id,
                 interaction.guild.id,
@@ -3667,25 +3678,26 @@ class EventHub(commands.GroupCog, group_name="event"):
                 "لا يمكن إلغاء هذا السحب؛ الإلغاء مسموح فقط قبل تثبيت القائمة.",
                 ephemeral=True,
             )
-        try:
-            channel = self.bot.get_channel(int(raffle["channel_id"]))
-            if not isinstance(channel, discord.TextChannel):
-                channel = await self.bot.fetch_channel(int(raffle["channel_id"]))
-            if isinstance(channel, discord.TextChannel):
-                await channel.send(
-                    embed=discord.Embed(
-                        title=f"🚫 تم إلغاء السحب #{raffle_id} · {raffle['title']}",
-                        description=f"بواسطة {interaction.user.mention}\nالسبب: {reason[:300]}",
-                        color=discord.Color.red(),
-                    ),
-                    allowed_mentions=discord.AllowedMentions.none(),
+        if raffle.get("channel_id"):
+            try:
+                channel = self.bot.get_channel(int(raffle["channel_id"]))
+                if not isinstance(channel, discord.TextChannel):
+                    channel = await self.bot.fetch_channel(int(raffle["channel_id"]))
+                if isinstance(channel, discord.TextChannel):
+                    await channel.send(
+                        embed=discord.Embed(
+                            title=f"🚫 تم إلغاء السحب #{raffle_id} · {raffle['title']}",
+                            description=f"بواسطة {interaction.user.mention}\nالسبب: {reason[:300]}",
+                            color=discord.Color.red(),
+                        ),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+            except discord.HTTPException:
+                logger.exception("Raffle %s was cancelled but its announcement could not be posted", raffle_id)
+                return await interaction.followup.send(
+                    f"تم إلغاء السحب `#{raffle_id}` وتسجيل الإجراء، لكن تعذر نشر إشعار الإلغاء.",
+                    ephemeral=True,
                 )
-        except discord.HTTPException:
-            logger.exception("Raffle %s was cancelled but its announcement could not be posted", raffle_id)
-            return await interaction.followup.send(
-                f"تم إلغاء السحب `#{raffle_id}` وتسجيل الإجراء، لكن تعذر نشر إشعار الإلغاء.",
-                ephemeral=True,
-            )
         await interaction.followup.send(
             f"تم إلغاء السحب `#{raffle_id}` وتسجيل السبب.",
             ephemeral=True,
