@@ -149,13 +149,11 @@ def _raffle_wheel_image(entrants: list[dict[str, Any]], pointer_index: int = 0) 
 
 
 def _can_spin_raffle(interaction: discord.Interaction, raffle: dict[str, Any]) -> bool:
-    return bool(
-        interaction.guild
-        and is_staff(interaction.user)
-        and (
-            is_admin(interaction.user)
-            or interaction.user.id == int(raffle["created_by"])
-        )
+    if not interaction.guild:
+        return False
+    return is_admin(interaction.user) or (
+        is_staff(interaction.user)
+        and interaction.user.id == int(raffle["created_by"])
     )
 
 
@@ -165,7 +163,7 @@ class RaffleSpinView(discord.ui.View):
         self.cog = cog
         self.raffle_id = raffle_id
         button = discord.ui.Button(
-            label="تدوير الدولاب",
+            label="لف الدولاب",
             emoji="🎡",
             style=discord.ButtonStyle.success,
             custom_id=f"adsentry:raffle:spin:{raffle_id}",
@@ -2988,6 +2986,16 @@ class EventHub(commands.GroupCog, group_name="event"):
         if not interaction.guild or not is_staff(interaction.user):
             return await interaction.response.send_message("هذا الأمر مخصص للإدارة.", ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
+
+        await self.lock_and_publish_raffle(interaction, raffle_id)
+
+    async def lock_and_publish_raffle(
+        self,
+        interaction: discord.Interaction,
+        raffle_id: int,
+        *,
+        setup_completed: bool = False,
+    ) -> None:
         try:
             existing_raffle = await self.bot.db.get_event_raffle(
                 raffle_id,
@@ -3035,8 +3043,8 @@ class EventHub(commands.GroupCog, group_name="event"):
                 if not raffle.get("spin_message_id"):
                     await self._publish_raffle_wheel(raffle, channel)
                 return await interaction.followup.send(
-                    f"🔒 القائمة مثبتة ومنشورة في {channel.mention}، والعجلة جاهزة للتدوير. "
-                    f"موعد العشوائية العام: drand round `{raffle['beacon_target_round']}`.",
+                    f"🔒 القائمة مثبتة والعجلة منشورة في {channel.mention}. "
+                    f"يعمل زر التدوير بعد صدور drand round `{raffle['beacon_target_round']}`.",
                     ephemeral=True,
                 )
 
@@ -3099,16 +3107,24 @@ class EventHub(commands.GroupCog, group_name="event"):
             raffle["lock_message_id"] = message.id
             await self._publish_raffle_wheel(raffle, channel)
             await interaction.followup.send(
-                f"✅ تم تثبيت القائمة ونشرها في {channel.mention}، والعجلة جاهزة.\n"
-                f"يستطيع المالك أو المدير أو منشئ السحب الإداري الضغط على زر التدوير بعد صدور drand round "
+                f"✅ تم تثبيت القائمة ونشر العجلة في {channel.mention}.\n"
+                f"يمكن لمالك السيرفر أو من لديه Administrator أو <@{raffle['created_by']}> تدويرها "
+                f"بعد صدور drand round "
                 f"`{raffle['beacon_target_round']}`.",
                 ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception:
             logger.exception("Could not lock or publish entrant manifest for raffle %s", raffle_id)
+            error_message = (
+                "تم حفظ القناة، لكن تعذر نشر إثبات القائمة والعجلة. "
+                "لم يُنفذ أي سحب؛ أعد المحاولة باستخدام `/event raffle lock`."
+                if setup_completed
+                else "تعذر تثبيت القائمة أو نشر إثباتها. لم يُنفذ أي سحب؛ "
+                "يمكن إعادة `/event raffle lock` وسيحافظ على القائمة المقفلة نفسها."
+            )
             await interaction.followup.send(
-                "تعذر تثبيت القائمة أو نشر إثباتها. لم يُنفذ أي سحب؛ "
-                "يمكن إعادة `/event raffle lock` وسيحافظ على القائمة المقفلة نفسها.",
+                error_message,
                 ephemeral=True,
             )
 
@@ -3129,8 +3145,9 @@ class EventHub(commands.GroupCog, group_name="event"):
             description=(
                 f"المؤهلون: `{len(entrants)}` · الفائزون: `{raffle['winner_count']}`\n"
                 f"قائمة المشاركين مثبتة ببصمة `{raffle['entrants_hash']}`.\n"
-                "اضغط زر التدوير بعد وقت العشوائية المحدد. العجلة عرض مرئي فقط؛ "
-                "النتيجة تُحسم من جولة drand المحفوظة ولا يمكن إعادة السحب."
+                f"سيقوم <@{raffle['created_by']}> أو مالك السيرفر أو Administrator بتدويرها "
+                "في الوقت الذي يقرره بعد صدور جولة العشوائية المحددة.\n"
+                "العجلة عرض مرئي فقط؛ النتيجة تُحسم من جولة drand المحفوظة ولا يمكن إعادة السحب."
             ),
             color=discord.Color.blurple(),
         )
@@ -3313,7 +3330,7 @@ class EventHub(commands.GroupCog, group_name="event"):
                     return await interaction.followup.send("لم يتم العثور على هذا السحب.", ephemeral=True)
                 if not _can_spin_raffle(interaction, raffle):
                     return await interaction.followup.send(
-                        "التدوير متاح لمالك السيرفر أو مديره أو منشئ السحب إذا كان من الطاقم الإداري.",
+                        "التدوير متاح لمالك السيرفر أو لمن لديه Administrator أو المشرف الذي أعد هذا السحب فقط.",
                         ephemeral=True,
                     )
 

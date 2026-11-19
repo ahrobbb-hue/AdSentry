@@ -1183,10 +1183,13 @@ class RaffleChannelPickerView(discord.ui.View):
                 "يحتاج البوت صلاحيات إرسال الرسائل والـEmbeds والمرفقات في القناة المختارة.",
                 ephemeral=True,
             )
+        eventhub = self.cog.bot.get_cog("EventHub")
+        if eventhub is None:
+            return await interaction.followup.send("نظام الفعاليات غير جاهز حاليًا.", ephemeral=True)
         try:
             if self.raffle_id is None:
                 raise RuntimeError("The raffle setup view has no raffle ID.")
-            raffle = await self.cog.bot.db.set_event_raffle_channel(
+            await self.cog.bot.db.set_event_raffle_channel(
                 self.raffle_id,
                 interaction.guild.id,
                 interaction.user.id,
@@ -1199,11 +1202,10 @@ class RaffleChannelPickerView(discord.ui.View):
                 ephemeral=True,
             )
             return
-        await interaction.followup.send(
-            f"✅ اكتمل إعداد السحب `#{raffle['id']}`.\n"
-            f"قناة نشر قائمة المؤهلين والعجلة والنتيجة: {channel.mention}\n"
-            "بعد مراجعة القائمة، ثبّتها باستخدام `/event raffle lock`.",
-            ephemeral=True,
+        await eventhub.lock_and_publish_raffle(
+            interaction,
+            self.raffle_id,
+            setup_completed=True,
         )
 
 

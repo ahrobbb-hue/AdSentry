@@ -541,15 +541,17 @@ BEGIN
         RAISE EXCEPTION 'Only an open event raffle can be configured';
     END IF;
 
-    IF v_raffle.channel_id IS DISTINCT FROM p_channel_id THEN
+    IF v_raffle.channel_id IS DISTINCT FROM p_channel_id
+       OR v_raffle.created_by IS DISTINCT FROM p_actor_id THEN
         UPDATE public.event_raffles
-        SET channel_id = p_channel_id
+        SET channel_id = p_channel_id,
+            created_by = p_actor_id
         WHERE id = p_raffle_id
         RETURNING * INTO v_raffle;
 
         INSERT INTO public.event_raffle_audit(raffle_id, guild_id, actor_id, action, details)
         VALUES (p_raffle_id, p_guild_id, p_actor_id, 'CHANNEL_CONFIGURED',
-            jsonb_build_object('channel_id', p_channel_id));
+            jsonb_build_object('channel_id', p_channel_id, 'spin_authorized_admin_id', p_actor_id));
     END IF;
     RETURN to_jsonb(v_raffle);
 END;

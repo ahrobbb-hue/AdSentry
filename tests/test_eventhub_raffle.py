@@ -17,6 +17,7 @@ from cogs.eventhub import (
     _raffle_wheel_image,
     _raffle_target_round,
     _select_raffle_winners,
+    _can_spin_raffle,
 )
 
 
@@ -96,6 +97,8 @@ def test_raffle_migration_freezes_entries_and_restricts_draw_rpc() -> None:
     assert "'already_present', TRUE" in migration
     assert "Could not add member to this raffle" in migration
     assert "set_event_raffle_channel" in migration
+    assert "SET channel_id = p_channel_id," in migration
+    assert "created_by = p_actor_id" in migration
     assert "set_event_raffle_spin_message" in migration
     assert "verify_event_raffle_claim" in migration
     assert "TO service_role" in migration
@@ -130,6 +133,28 @@ def test_raffle_wheel_renders_a_png_for_the_locked_entrants() -> None:
 def test_raffle_wheel_rejects_an_empty_entrant_list() -> None:
     with pytest.raises(ValueError):
         _raffle_wheel_image([])
+
+
+def test_raffle_spin_is_limited_to_owner_admin_or_setup_staff(monkeypatch) -> None:
+    owner_id = 1
+    admin_id = 3
+    creator_id = 2
+    other_staff_id = 4
+    monkeypatch.setattr(eventhub, "is_admin", lambda user: user.id in {owner_id, admin_id})
+    monkeypatch.setattr(eventhub, "is_staff", lambda user: user.id in {creator_id, other_staff_id})
+    guild = SimpleNamespace(owner_id=owner_id)
+    raffle = {"created_by": creator_id}
+
+    def interaction_for(user_id: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            guild=guild,
+            user=SimpleNamespace(id=user_id),
+        )
+
+    assert _can_spin_raffle(interaction_for(owner_id), raffle)
+    assert _can_spin_raffle(interaction_for(admin_id), raffle)
+    assert _can_spin_raffle(interaction_for(creator_id), raffle)
+    assert not _can_spin_raffle(interaction_for(other_staff_id), raffle)
 
 
 @pytest.mark.parametrize(
