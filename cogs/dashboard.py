@@ -811,7 +811,7 @@ class EventDashboardView(discord.ui.View):
     def __init__(self, cog: "DashboardCog") -> None:
         super().__init__(timeout=300); self.cog = cog
 
-    @discord.ui.button(label="إنشاء فعالية", emoji="✨", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="إنشاء فعالية", emoji="✨", style=discord.ButtonStyle.success, row=0)
     async def create(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild or not _staff(interaction):
             await interaction.response.send_message("للإدارة فقط.", ephemeral=True)
@@ -842,11 +842,11 @@ class EventDashboardView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="قائمة الفعاليات", emoji="📋", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="قائمة الفعاليات", emoji="📋", style=discord.ButtonStyle.primary, row=0)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog.show_events(interaction, edit=True)
 
-    @discord.ui.button(label="إغلاق تسجيل", emoji="🔒", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="إغلاق التسجيل", emoji="🔒", style=discord.ButtonStyle.secondary, row=0)
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild or not _staff(interaction): await interaction.response.send_message("للإدارة فقط.", ephemeral=True); return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -856,7 +856,12 @@ class EventDashboardView(discord.ui.View):
             .eq("status", "OPEN").eq("registration_open", True)
             .order("starts_at").limit(25).execute()
         ).data or []
-        if not rows: await interaction.followup.send("لا توجد فعاليات مفتوحة.", ephemeral=True); return
+        if not rows:
+            await interaction.followup.send(
+                "لا توجد فعالية مفتوحة والتسجيل فيها مفعّل لإغلاقه.",
+                ephemeral=True,
+            )
+            return
         await interaction.followup.send("اختر الفعالية:", view=EventCloseSelectView(self.cog, rows), ephemeral=True)
 
     async def _choose_event_for_action(self, interaction: discord.Interaction, action: str) -> None:
@@ -896,16 +901,16 @@ class EventDashboardView(discord.ui.View):
     async def cancel_event(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._choose_event_for_action(interaction, "cancel")
 
-    @discord.ui.button(label="تسجيل الحضور", emoji="✔️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="تسجيل الحضور", emoji="✔️", style=discord.ButtonStyle.secondary, row=1)
     async def attendance(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not _staff(interaction): await interaction.response.send_message("للإدارة فقط.", ephemeral=True); return
         await interaction.response.send_modal(EventAttendanceModal(self.cog))
 
-    @discord.ui.button(label="الرئيسية", emoji="🏠", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="الرئيسية", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog.show_home(interaction, edit=True)
 
-    @discord.ui.button(label="إعداد سحب لفعالية مغلقة", emoji="🎡", style=discord.ButtonStyle.success, row=2)
+    @discord.ui.button(label="إعداد السحب", emoji="🎡", style=discord.ButtonStyle.success, row=2)
     async def create_raffle(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild or not _staff(interaction):
             await interaction.response.send_message("هذه العملية للإدارة فقط.", ephemeral=True)
@@ -964,7 +969,10 @@ class EventDashboardView(discord.ui.View):
             )
             return
         if not rows:
-            await interaction.followup.send("لا توجد سحوبات مفتوحة لفعاليات مغلقة.", ephemeral=True)
+            await interaction.followup.send(
+                "لا يوجد سحب مفتوح لإدراج المؤهلين. اضغط **إعداد السحب** أولًا واختر فعالية مغلقة.",
+                ephemeral=True,
+            )
             return
         await interaction.followup.send(
             "اختر السحب ثم حدد الأعضاء المؤهلين:",

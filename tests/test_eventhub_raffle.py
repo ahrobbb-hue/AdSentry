@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import cogs.eventhub as eventhub
+from cogs.dashboard import EventDashboardView
 from cogs.eventhub import (
     EventHub,
     _fetch_drand_beacon,
@@ -121,6 +122,20 @@ def test_raffle_wheel_renders_a_png_for_the_locked_entrants() -> None:
 def test_raffle_wheel_rejects_an_empty_entrant_list() -> None:
     with pytest.raises(ValueError):
         _raffle_wheel_image([])
+
+
+def test_event_dashboard_buttons_are_grouped_by_workflow() -> None:
+    view = EventDashboardView(None)
+    buttons_by_row = {
+        row: [item.label for item in view.children if item.row == row]
+        for row in range(3)
+    }
+
+    assert buttons_by_row == {
+        0: ["إنشاء فعالية", "قائمة الفعاليات", "إغلاق التسجيل"],
+        1: ["تعديل فعالية", "إلغاء فعالية", "تسجيل الحضور", "الرئيسية"],
+        2: ["إعداد السحب", "إدراج المؤهلين"],
+    }
 
 
 def test_drand_beacon_requires_randomness_to_match_signature(monkeypatch) -> None:
