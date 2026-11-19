@@ -3612,10 +3612,12 @@ class EventHub(commands.GroupCog, group_name="event"):
                     "تعذر التحقق من مصدر العشوائية. لم يتم تنفيذ السحب؛ أعد المحاولة لاحقًا.",
                     ephemeral=True,
                 )
-            except Exception:
+            except Exception as error:
                 logger.exception("Could not draw or publish raffle %s", raffle_id)
                 await interaction.followup.send(
-                    "تعذر إكمال السحب أو نشره. إذا حُفظت النتيجة، فإن إعادة الإجراء تنشر النتيجة نفسها ولا تعيد السحب.",
+                    "تعذر إكمال السحب أو نشره. "
+                    f"نوع الخطأ: `{type(error).__name__}`. "
+                    "إذا حُفظت النتيجة، فإن إعادة الإجراء تنشر النتيجة نفسها ولا تعيد السحب.",
                     ephemeral=True,
                 )
 
