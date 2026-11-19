@@ -1159,13 +1159,22 @@ class RaffleChannelPickerView(discord.ui.View):
     async def select_channel(self, interaction: discord.Interaction) -> None:
         if not interaction.guild or not _staff(interaction):
             return await interaction.response.send_message("هذه العملية للإدارة فقط.", ephemeral=True)
-        channel = self.select.values[0]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        selected_channel = self.select.values[0]
+        if selected_channel.type != discord.ChannelType.text:
+            return await interaction.followup.send("اختر قناة نصية من هذا السيرفر.", ephemeral=True)
+        channel = interaction.guild.get_channel(int(selected_channel.id))
+        if channel is None:
+            try:
+                channel = await interaction.guild.fetch_channel(int(selected_channel.id))
+            except discord.HTTPException:
+                logger.exception("Could not resolve selected raffle channel %s", selected_channel.id)
+                return await interaction.followup.send("تعذر العثور على القناة النصية المختارة.", ephemeral=True)
         if not isinstance(channel, discord.TextChannel):
-            return await interaction.response.send_message("اختر قناة نصية من هذا السيرفر.", ephemeral=True)
+            return await interaction.followup.send("اختر قناة نصية من هذا السيرفر.", ephemeral=True)
         eventhub = self.cog.bot.get_cog("EventHub")
         if eventhub is None:
-            return await interaction.response.send_message("نظام الفعاليات غير جاهز حاليًا.", ephemeral=True)
-        await interaction.response.defer(ephemeral=True, thinking=True)
+            return await interaction.followup.send("نظام الفعاليات غير جاهز حاليًا.", ephemeral=True)
         try:
             raffle = await create_raffle_from_closed_event(
                 self.cog.bot,
