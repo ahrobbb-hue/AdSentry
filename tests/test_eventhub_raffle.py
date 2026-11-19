@@ -515,3 +515,50 @@ def test_drand_fetch_uses_another_mirror_when_primary_fails(monkeypatch) -> None
         "https://primary.example/info",
         "https://mirror.example/info",
     ]
+
+
+def test_drand_fetch_reports_status_for_every_unavailable_mirror(monkeypatch) -> None:
+    class FakeResponse:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def raise_for_status(self) -> None:
+            raise eventhub.aiohttp.ClientResponseError(
+                request_info=SimpleNamespace(real_url=self.url),
+                history=(),
+                status=503,
+                message="Service unavailable",
+            )
+
+    class FakeSession:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def get(self, url: str) -> FakeResponse:
+            return FakeResponse(url)
+
+    monkeypatch.setattr(eventhub, "DRAND_API_BASES", (
+        "https://primary.example",
+        "https://mirror.example",
+    ))
+    monkeypatch.setattr(eventhub.aiohttp, "ClientSession", FakeSession)
+
+    with pytest.raises(eventhub.DrandUnavailableError) as error:
+        asyncio.run(eventhub._fetch_drand_json("/info"))
+
+    assert error.value.failures == (
+        "primary.example: HTTP 503",
+        "mirror.example: HTTP 503",
+    )

@@ -37,6 +37,13 @@ DRAND_DOMAIN = b"AdSentry-EventHub-Raffle-v1"
 WHEEL_COLORS = ("#5865F2", "#EB459E", "#57F287", "#FEE75C", "#ED4245", "#9B59B6")
 
 
+class DrandUnavailableError(aiohttp.ClientError):
+    def __init__(self, path: str, failures: list[str]) -> None:
+        super().__init__("All configured drand mirrors failed.")
+        self.path = path
+        self.failures = tuple(failures)
+
+
 def _raffle_entrants_hash(entrants: list[dict[str, Any]]) -> str:
     canonical = [
         {
@@ -370,6 +377,7 @@ def _select_raffle_winners(
 async def _fetch_drand_json(path: str) -> dict[str, Any]:
     timeout = aiohttp.ClientTimeout(total=8)
     errors: list[Exception] = []
+    failure_details: list[str] = []
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for base_url in DRAND_API_BASES:
             try:
@@ -381,6 +389,15 @@ async def _fetch_drand_json(path: str) -> dict[str, Any]:
                 return payload
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
                 errors.append(error)
+                if isinstance(error, aiohttp.ClientResponseError):
+                    reason = f"HTTP {error.status}"
+                elif isinstance(error, asyncio.TimeoutError):
+                    reason = "timeout"
+                elif isinstance(error, aiohttp.ClientError):
+                    reason = "connection failure"
+                else:
+                    reason = "invalid response"
+                failure_details.append(f"{base_url.split('//', 1)[-1]}: {reason}")
                 logger.warning("drand endpoint %s failed for %s: %s", base_url, path, error)
 
     if errors:
@@ -390,7 +407,7 @@ async def _fetch_drand_json(path: str) -> dict[str, Any]:
             if not (isinstance(error, aiohttp.ClientResponseError) and error.status == 404)
         ]
         if unavailable_errors:
-            raise unavailable_errors[-1]
+            raise DrandUnavailableError(path, failure_details) from unavailable_errors[-1]
         raise errors[0]
     raise RuntimeError("No drand endpoints are configured.")
 
@@ -3564,6 +3581,19 @@ class EventHub(commands.GroupCog, group_name="event"):
                     delivery_status += " حُفظت النتيجة لكن تعذر تحديث رسالة العجلة؛ أعد تنفيذ الإجراء لعرض النتيجة نفسها."
                 if delivery_status:
                     await interaction.followup.send(delivery_status, ephemeral=True)
+            except DrandUnavailableError as error:
+                details = "، ".join(error.failures)
+                stage = "إعدادات المصدر" if error.path == "/info" else "جلب الجولة المثبتة"
+                logger.error(
+                    "drand request %s failed across all mirrors: %s",
+                    error.path,
+                    details,
+                )
+                await interaction.followup.send(
+                    f"تعذر الاتصال بمرايا drand أثناء {stage}. لم يتم تنفيذ السحب. "
+                    f"التشخيص الخاص: `{details}`",
+                    ephemeral=True,
+                )
             except aiohttp.ClientResponseError as error:
                 if error.status == 404:
                     await interaction.followup.send(
