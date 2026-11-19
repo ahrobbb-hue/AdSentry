@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -38,6 +39,19 @@ def _staff(interaction: discord.Interaction) -> bool:
 
 def _admin(interaction: discord.Interaction) -> bool:
     return bool(interaction.guild and is_admin(interaction.user))
+
+
+def _format_raffle_claim_timestamp(value: object) -> str:
+    if not value:
+        return "غير متاح"
+    try:
+        when = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning("Invalid timestamp in raffle claim verification result")
+        return "غير متاح"
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return f"<t:{int(when.timestamp())}:F>"
 
 
 async def _get_raffle_ready_events(client, guild_id: int) -> list[dict]:
@@ -843,6 +857,133 @@ class EventCloseSelectView(discord.ui.View):
         )
 
 
+class VerifyRaffleClaimModal(discord.ui.Modal, title="التحقق من رمز الفائز"):
+    claim_code = discord.ui.TextInput(
+        label="أدخل رمز استلام الجائزة",
+        placeholder="الصق الرمز الذي أرسله البوت للفائز",
+        min_length=1,
+        max_length=100,
+        required=True,
+    )
+
+    def __init__(self, cog: "DashboardCog") -> None:
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not _admin(interaction):
+            await interaction.response.send_message("التحقق من رموز الجوائز للمالك أو Administrator فقط.", ephemeral=True)
+            return
+
+        code = self.claim_code.value.strip()
+        if not code:
+            await interaction.response.send_message("أدخل رمزًا صالحًا للتحقق.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await self.cog.bot.db.verify_event_raffle_claim_code(
+                guild_id=interaction.guild.id,
+                actor_id=interaction.user.id,
+                token_hash=hashlib.sha256(code.encode("utf-8")).hexdigest(),
+            )
+        except Exception:
+            logger.exception(
+                "Could not verify a raffle claim code in guild %s",
+                interaction.guild.id,
+            )
+            await interaction.followup.send(
+                "تعذر التحقق من الرمز. تأكد من تطبيق ترحيل قاعدة بيانات السحب ثم حاول مجددًا.",
+                ephemeral=True,
+            )
+            return
+
+        status = result.get("result")
+        if status == "invalid":
+            await interaction.followup.send("❌ الرمز غير صحيح أو لا يتبع لهذا السيرفر.", ephemeral=True)
+            return
+        if status not in {"verified", "already_redeemed"}:
+            logger.error("Unexpected raffle claim verification status: %r", status)
+            await interaction.followup.send("تعذر تحديد حالة الرمز. راجع سجلات البوت.", ephemeral=True)
+            return
+
+        winner_id = int(result["user_id"])
+        raffle_id = int(result["raffle_id"])
+        embed = discord.Embed(
+            title=(
+                "✅ تم التحقق من الرمز وتسجيل الاستلام"
+                if status == "verified"
+                else "⚠️ الرمز صحيح لكنه استُخدم سابقًا"
+            ),
+            color=discord.Color.green() if status == "verified" else discord.Color.orange(),
+        )
+        embed.add_field(
+            name="الفائز",
+            value=f"<@{winner_id}>\nالمعرّف: `{winner_id}`",
+            inline=False,
+        )
+        embed.add_field(
+            name="السحب",
+            value=f"#{raffle_id} — {result.get('raffle_title') or 'سحب'}",
+            inline=False,
+        )
+
+        event_id = result.get("event_id")
+        if event_id is not None:
+            embed.add_field(
+                name="الفعالية",
+                value=f"#{int(event_id)} — {result.get('event_title') or 'فعالية'}",
+                inline=False,
+            )
+            event_creator_id = result.get("event_created_by")
+            embed.add_field(
+                name="منشئ الفعالية",
+                value=(
+                    f"<@{int(event_creator_id)}>\nالمعرّف: `{int(event_creator_id)}`"
+                    if event_creator_id is not None
+                    else "غير متاح"
+                ),
+                inline=True,
+            )
+            embed.add_field(
+                name="موعد الفعالية",
+                value=_format_raffle_claim_timestamp(result.get("event_starts_at")),
+                inline=True,
+            )
+        else:
+            embed.add_field(
+                name="الفعالية",
+                value="هذا السحب غير مرتبط بفعالية EventHub.",
+                inline=False,
+            )
+            raffle_creator_id = result.get("raffle_created_by")
+            embed.add_field(
+                name="منشئ السحب",
+                value=(
+                    f"<@{int(raffle_creator_id)}>\nالمعرّف: `{int(raffle_creator_id)}`"
+                    if raffle_creator_id is not None
+                    else "غير متاح"
+                ),
+                inline=True,
+            )
+
+        embed.add_field(
+            name="وقت السحب",
+            value=_format_raffle_claim_timestamp(result.get("drawn_at")),
+            inline=True,
+        )
+        embed.add_field(
+            name="وقت استلام الجائزة",
+            value=_format_raffle_claim_timestamp(result.get("redeemed_at")),
+            inline=True,
+        )
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
 class EventDashboardView(discord.ui.View):
     def __init__(self, cog: "DashboardCog") -> None:
         super().__init__(timeout=300); self.cog = cog
@@ -966,10 +1107,18 @@ class EventDashboardView(discord.ui.View):
             )
             return
         await interaction.followup.send(
-            "ابدأ باختيار الفعالية؛ بعدها ستحدد المؤهلين ثم قناة نشر السحب والعجلة:",
+            "اختر الفعالية، ثم المؤهلين وعدد الفائزين (من 1 إلى 10 لمالك السيرفر أو Administrator)، وبعدها قناة نشر السحب والعجلة:",
             view=ClosedEventRaffleSelectView(self.cog, rows),
             ephemeral=True,
         )
+
+    @discord.ui.button(label="تحقق من رمز الفائز", emoji="🔐", style=discord.ButtonStyle.secondary, row=2)
+    async def verify_raffle_claim(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not interaction.guild or not _admin(interaction):
+            await interaction.response.send_message("التحقق من رموز الجوائز للمالك أو Administrator فقط.", ephemeral=True)
+            return
+        await interaction.response.send_modal(VerifyRaffleClaimModal(self.cog))
+
 
 class RaffleInitialEntrantsView(discord.ui.View):
     def __init__(
@@ -977,11 +1126,13 @@ class RaffleInitialEntrantsView(discord.ui.View):
         cog: "DashboardCog",
         event_id: int,
         raffle_id: int | None = None,
+        winner_count: int = 1,
     ) -> None:
         super().__init__(timeout=300)
         self.cog = cog
         self.event_id = event_id
         self.raffle_id = raffle_id
+        self.winner_count = winner_count
         select = discord.ui.UserSelect(
             placeholder="اختر الأعضاء المؤهلين (حتى 25 عضوًا)",
             min_values=1,
@@ -991,9 +1142,36 @@ class RaffleInitialEntrantsView(discord.ui.View):
         select.callback = self.select_entrants
         self.select = select
         self.add_item(select)
+        winner_count_select = discord.ui.Select(
+            placeholder="اختر عدد الفائزين (1–10) — للمالك أو Administrator",
+            options=[
+                discord.SelectOption(
+                    label=f"{count} {'فائز' if count == 1 else 'فائزين'}",
+                    value=str(count),
+                    default=count == winner_count,
+                )
+                for count in range(1, 11)
+            ],
+            row=1,
+        )
+        winner_count_select.callback = self.select_winner_count
+        self.winner_count_select = winner_count_select
+        self.add_item(winner_count_select)
+
+    def _setup_prompt(self) -> str:
+        count_label = (
+            f"`{self.winner_count}`"
+            if 1 <= self.winner_count <= 10
+            else f"`{self.winner_count}` (إعداد سابق؛ يجب تغييره إلى 10 أو أقل)"
+        )
+        return (
+            f"🏆 **عدد الفائزين:** {count_label}\n"
+            "يمكن لمالك السيرفر أو Administrator تغيير العدد من القائمة، من 1 إلى 10.\n"
+            "اختر المؤهلين ثم اضغط **متابعة** لحفظهم واختيار قناة النشر."
+        )
 
     async def select_entrants(self, interaction: discord.Interaction) -> None:
-        if not interaction.guild or not _staff(interaction.user):
+        if not interaction.guild or not _staff(interaction):
             return await interaction.response.send_message("هذه العملية للإدارة فقط.", ephemeral=True)
         eligible_count = sum(
             isinstance(member, discord.Member) and not member.bot
@@ -1001,8 +1179,20 @@ class RaffleInitialEntrantsView(discord.ui.View):
         )
         await interaction.response.edit_message(
             content=(
-                f"تم تحديد `{eligible_count}` مؤهلًا. اضغط **متابعة** لحفظهم ثم اختيار قناة النشر."
+                f"تم تحديد `{eligible_count}` مؤهلًا.\n{self._setup_prompt()}"
             ),
+            view=self,
+        )
+
+    async def select_winner_count(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not _admin(interaction):
+            return await interaction.response.send_message(
+                "تحديد عدد الفائزين متاح لمالك السيرفر أو لمن لديه Administrator فقط.",
+                ephemeral=True,
+            )
+        self.winner_count = int(self.winner_count_select.values[0])
+        await interaction.response.edit_message(
+            content=self._setup_prompt(),
             view=self,
         )
 
@@ -1010,11 +1200,16 @@ class RaffleInitialEntrantsView(discord.ui.View):
         label="متابعة",
         emoji="➡️",
         style=discord.ButtonStyle.success,
-        row=1,
+        row=2,
     )
     async def save_entrants(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild or not _staff(interaction):
             return await interaction.response.send_message("هذه العملية للإدارة فقط.", ephemeral=True)
+        if not 1 <= self.winner_count <= 10:
+            return await interaction.response.send_message(
+                "يجب أن يختار مالك السيرفر أو Administrator عدد الفائزين من 1 إلى 10 أولًا.",
+                ephemeral=True,
+            )
         entrants = [
             {"user_id": member.id, "user_name": member.display_name}
             for member in self.select.values
@@ -1032,6 +1227,7 @@ class RaffleInitialEntrantsView(discord.ui.View):
                     guild_id=interaction.guild.id,
                     created_by=interaction.user.id,
                     event_id=self.event_id,
+                    winner_count=self.winner_count,
                 )
                 self.raffle_id = int(raffle["id"])
             else:
@@ -1047,6 +1243,19 @@ class RaffleInitialEntrantsView(discord.ui.View):
                     return await interaction.followup.send(
                         "السحب لم يعد مفتوحًا أو لا يطابق الفعالية المختارة.",
                         ephemeral=True,
+                    )
+                current_winner_count = int(raffle.get("winner_count") or 1)
+                if current_winner_count != self.winner_count:
+                    if not _admin(interaction):
+                        return await interaction.followup.send(
+                            "تغيير عدد الفائزين متاح لمالك السيرفر أو Administrator فقط.",
+                            ephemeral=True,
+                        )
+                    await self.cog.bot.db.set_event_raffle_winner_count(
+                        raffle_id=self.raffle_id,
+                        guild_id=interaction.guild.id,
+                        actor_id=interaction.user.id,
+                        winner_count=self.winner_count,
                     )
             added_count = 0
             already_present_count = 0
@@ -1119,7 +1328,7 @@ class ClosedEventRaffleSelectView(discord.ui.View):
             client = await self.cog.bot.db.get_client()
             raffles = (
                 await client.table("event_raffles")
-                .select("id,event_id,status")
+                .select("id,event_id,status,winner_count")
                 .eq("guild_id", interaction.guild.id)
                 .eq("event_id", int(event["id"]))
                 .neq("status", "CANCELLED")
@@ -1137,11 +1346,12 @@ class ClosedEventRaffleSelectView(discord.ui.View):
             )
         raffle_id = int(raffle["id"]) if raffle else None
         await interaction.followup.send(
-            f"اختر المؤهلين لفعالية **#{event['id']} · {event['title']}**، ثم اضغط **متابعة** لاختيار قناة النشر:",
+            f"اختر المؤهلين لفعالية **#{event['id']} · {event['title']}** وعدد الفائزين، ثم اضغط **متابعة** لاختيار قناة النشر:",
             view=RaffleInitialEntrantsView(
                 self.cog,
                 int(event["id"]),
                 raffle_id=raffle_id,
+                winner_count=int(raffle.get("winner_count") or 1) if raffle else 1,
             ),
             ephemeral=True,
         )

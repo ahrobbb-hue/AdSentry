@@ -10,6 +10,7 @@ import discord
 from PIL import Image
 
 import cogs.eventhub as eventhub
+import cogs.dashboard as dashboard
 from cogs.dashboard import EventDashboardView, RaffleInitialEntrantsView, _get_raffle_ready_events
 from cogs.eventhub import (
     EventHub,
@@ -97,6 +98,11 @@ def test_raffle_migration_freezes_entries_and_restricts_draw_rpc() -> None:
     assert "status = 'CLOSED'" in migration
     assert "registration_open = FALSE" in migration
     assert "create_event_raffle_draft" in migration
+    assert "set_event_raffle_winner_count" in migration
+    assert "winner_count BETWEEN 1 AND 10" in migration
+    assert "CHECK (winner_count BETWEEN 1 AND 10 OR status <> 'OPEN') NOT VALID" in migration
+    assert "p_winner_count NOT BETWEEN 1 AND 10" in migration
+    assert "v_raffle.winner_count NOT BETWEEN 1 AND 10" in migration
     assert "'already_present', TRUE" in migration
     assert "Could not add member to this raffle" in migration
     assert "set_event_raffle_channel" in migration
@@ -104,6 +110,11 @@ def test_raffle_migration_freezes_entries_and_restricts_draw_rpc() -> None:
     assert "created_by = p_actor_id" in migration
     assert "set_event_raffle_spin_message" in migration
     assert "verify_event_raffle_claim" in migration
+    assert "verify_event_raffle_claim_code" in migration
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS idx_event_raffle_claims_code" in migration
+    assert "'already_redeemed'" in migration
+    assert "'event_created_by', v_event.created_by" in migration
+    assert "verification_method', 'CODE_ONLY'" in migration
     assert "TO service_role" in migration
     assert "NOTIFY pgrst, 'reload schema';" in migration
     assert "char_length(p_signature) NOT BETWEEN 64 AND 512" in migration
@@ -530,16 +541,325 @@ def test_event_dashboard_buttons_are_grouped_by_workflow() -> None:
     assert buttons_by_row == {
         0: ["إنشاء فعالية", "قائمة الفعاليات", "إغلاق التسجيل"],
         1: ["تعديل فعالية", "إلغاء فعالية", "تسجيل الحضور", "الرئيسية"],
-        2: ["إعداد السحب"],
+        2: ["إعداد السحب", "تحقق من رمز الفائز"],
     }
+
+
+def test_admin_can_verify_claim_code_without_raffle_or_member_ids(monkeypatch) -> None:
+    token = "winner-code"
+    expected_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    class FakeDatabase:
+        call = None
+
+        async def verify_event_raffle_claim_code(self, **kwargs):
+            self.call = kwargs
+            return {
+                "result": "verified",
+                "user_id": 123,
+                "raffle_id": 45,
+                "raffle_title": "السحب التجريبي",
+                "raffle_created_by": 99,
+                "drawn_at": "2026-04-02T10:00:00+00:00",
+                "redeemed_at": "2026-04-03T11:00:00+00:00",
+                "event_id": 18,
+                "event_title": "الفعالية التجريبية",
+                "event_created_by": 77,
+                "event_starts_at": "2026-04-01T10:00:00+00:00",
+            }
+
+    class FakeResponse:
+        async def defer(self, **_kwargs):
+            pass
+
+        async def send_message(self, *_args, **_kwargs):
+            raise AssertionError("Authorized verification should not be rejected")
+
+    class FakeFollowup:
+        sent = None
+
+        async def send(self, **kwargs):
+            self.sent = kwargs
+
+    database = FakeDatabase()
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=1),
+        user=SimpleNamespace(id=2),
+        response=FakeResponse(),
+        followup=FakeFollowup(),
+    )
+    modal = dashboard.VerifyRaffleClaimModal(SimpleNamespace(bot=SimpleNamespace(db=database)))
+    modal.claim_code._value = token
+    monkeypatch.setattr(dashboard, "_admin", lambda _interaction: True)
+
+    asyncio.run(modal.on_submit(interaction))
+
+    assert database.call == {
+        "guild_id": 1,
+        "actor_id": 2,
+        "token_hash": expected_hash,
+    }
+    embed = interaction.followup.sent["embed"]
+    rendered_fields = {field.name: field.value for field in embed.fields}
+    assert "<@123>" in rendered_fields["الفائز"]
+    assert "الفعالية التجريبية" in rendered_fields["الفعالية"]
+    assert "<@77>" in rendered_fields["منشئ الفعالية"]
+    assert rendered_fields["وقت السحب"] == "<t:1775124000:F>"
+    assert "تم التحقق من الرمز" in embed.title
+
+
+def test_invalid_claim_code_does_not_show_claim_details(monkeypatch) -> None:
+    class FakeDatabase:
+        async def verify_event_raffle_claim_code(self, **_kwargs):
+            return {"result": "invalid"}
+
+    class FakeResponse:
+        async def defer(self, **_kwargs):
+            pass
+
+        async def send_message(self, *_args, **_kwargs):
+            raise AssertionError("Authorized verification should be deferred")
+
+    class FakeFollowup:
+        sent = None
+
+        async def send(self, *args, **kwargs):
+            self.sent = (args, kwargs)
+
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=1),
+        user=SimpleNamespace(id=2),
+        response=FakeResponse(),
+        followup=FakeFollowup(),
+    )
+    modal = dashboard.VerifyRaffleClaimModal(SimpleNamespace(bot=SimpleNamespace(db=FakeDatabase())))
+    modal.claim_code._value = "wrong-code"
+    monkeypatch.setattr(dashboard, "_admin", lambda _interaction: True)
+
+    asyncio.run(modal.on_submit(interaction))
+
+    assert "غير صحيح" in interaction.followup.sent[0][0]
+    assert "embed" not in interaction.followup.sent[1]
+
+
+def test_redeemed_claim_code_reports_reuse_and_keeps_claim_identity(monkeypatch) -> None:
+    class FakeDatabase:
+        async def verify_event_raffle_claim_code(self, **_kwargs):
+            return {
+                "result": "already_redeemed",
+                "user_id": 123,
+                "raffle_id": 45,
+                "raffle_title": "السحب التجريبي",
+                "drawn_at": "2026-04-02T10:00:00+00:00",
+                "redeemed_at": "2026-04-03T11:00:00+00:00",
+            }
+
+    class FakeResponse:
+        async def defer(self, **_kwargs):
+            pass
+
+    class FakeFollowup:
+        sent = None
+
+        async def send(self, **kwargs):
+            self.sent = kwargs
+
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=1),
+        user=SimpleNamespace(id=2),
+        response=FakeResponse(),
+        followup=FakeFollowup(),
+    )
+    modal = dashboard.VerifyRaffleClaimModal(SimpleNamespace(bot=SimpleNamespace(db=FakeDatabase())))
+    modal.claim_code._value = "redeemed-code"
+    monkeypatch.setattr(dashboard, "_admin", lambda _interaction: True)
+
+    asyncio.run(modal.on_submit(interaction))
+
+    embed = interaction.followup.sent["embed"]
+    assert "استُخدم سابقًا" in embed.title
+    assert "<@123>" in next(field.value for field in embed.fields if field.name == "الفائز")
+
+
+def test_claim_code_modal_rejects_non_admin(monkeypatch) -> None:
+    class FakeDatabase:
+        async def verify_event_raffle_claim_code(self, **_kwargs):
+            raise AssertionError("Non-admins must not verify claim codes")
+
+    class FakeResponse:
+        sent = None
+
+        async def send_message(self, *args, **kwargs):
+            self.sent = (args, kwargs)
+
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=1),
+        user=SimpleNamespace(id=2),
+        response=FakeResponse(),
+    )
+    modal = dashboard.VerifyRaffleClaimModal(SimpleNamespace(bot=SimpleNamespace(db=FakeDatabase())))
+    modal.claim_code._value = "winner-code"
+    monkeypatch.setattr(dashboard, "_admin", lambda _interaction: False)
+
+    asyncio.run(modal.on_submit(interaction))
+
+    assert "Administrator" in interaction.response.sent[0][0]
 
 
 def test_raffle_setup_collects_entrants_before_channel_selection() -> None:
     view = RaffleInitialEntrantsView(None, event_id=18)
+    winner_count_select = next(
+        item for item in view.children
+        if isinstance(item, discord.ui.Select)
+    )
 
     assert any(item.label == "متابعة" for item in view.children)
     assert any(isinstance(item, discord.ui.UserSelect) for item in view.children)
     assert not any(isinstance(item, discord.ui.ChannelSelect) for item in view.children)
+    assert [option.value for option in winner_count_select.options] == [
+        str(count) for count in range(1, 11)
+    ]
+    assert [option.value for option in winner_count_select.options if option.default] == ["1"]
+
+
+def test_raffle_winner_count_can_only_be_changed_by_admin(monkeypatch) -> None:
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.sent = None
+
+        async def send_message(self, *args, **kwargs):
+            self.sent = (args, kwargs)
+
+    monkeypatch.setattr(dashboard, "_admin", lambda _interaction: False)
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=1),
+        response=FakeResponse(),
+    )
+
+    asyncio.run(
+        RaffleInitialEntrantsView(None, event_id=18).select_winner_count(interaction)
+    )
+
+    assert "Administrator" in interaction.response.sent[0][0]
+
+
+def test_admin_selected_winner_count_is_saved_with_dashboard_draft(monkeypatch) -> None:
+    class FakeMember:
+        id = 5
+        display_name = "Eligible"
+        bot = False
+
+    class FakeDatabase:
+        def __init__(self) -> None:
+            self.draft_kwargs = None
+
+        async def create_event_raffle_draft(self, **kwargs):
+            self.draft_kwargs = kwargs
+            return {"id": 77}
+
+        async def manage_event_raffle_entry(self, **_kwargs):
+            return {"already_present": False}
+
+    class FakeResponse:
+        async def edit_message(self, **_kwargs):
+            return None
+
+        async def defer(self, **_kwargs):
+            return None
+
+    class FakeFollowup:
+        async def send(self, *_args, **_kwargs):
+            return None
+
+    async def run_test() -> None:
+        monkeypatch.setattr(dashboard, "_admin", lambda _interaction: True)
+        monkeypatch.setattr(dashboard, "_staff", lambda _interaction: True)
+        monkeypatch.setattr(dashboard.discord, "Member", FakeMember)
+        database = FakeDatabase()
+        cog = SimpleNamespace(bot=SimpleNamespace(db=database))
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(id=1),
+            user=SimpleNamespace(id=2),
+            response=FakeResponse(),
+            followup=FakeFollowup(),
+        )
+        view = RaffleInitialEntrantsView(cog, event_id=18)
+        view.winner_count_select._values = ["3"]
+        await view.select_winner_count(interaction)
+        view.select = SimpleNamespace(values=[FakeMember()])
+
+        continue_button = next(
+            item for item in view.children if item.label == "متابعة"
+        )
+        await continue_button.callback(interaction)
+
+        assert database.draft_kwargs["winner_count"] == 3
+
+    asyncio.run(run_test())
+
+
+def test_admin_can_change_winner_count_on_an_open_dashboard_draft(monkeypatch) -> None:
+    class FakeMember:
+        id = 5
+        display_name = "Eligible"
+        bot = False
+
+    class FakeDatabase:
+        def __init__(self) -> None:
+            self.updated_winner_count = None
+
+        async def get_event_raffle(self, *_args):
+            return {
+                "id": 77,
+                "event_id": 18,
+                "status": "OPEN",
+                "winner_count": 1,
+            }
+
+        async def set_event_raffle_winner_count(self, **kwargs):
+            self.updated_winner_count = kwargs["winner_count"]
+
+        async def manage_event_raffle_entry(self, **_kwargs):
+            return {"already_present": False}
+
+    class FakeResponse:
+        async def edit_message(self, **_kwargs):
+            return None
+
+        async def defer(self, **_kwargs):
+            return None
+
+    class FakeFollowup:
+        async def send(self, *_args, **_kwargs):
+            return None
+
+    async def run_test() -> None:
+        monkeypatch.setattr(dashboard, "_admin", lambda _interaction: True)
+        monkeypatch.setattr(dashboard, "_staff", lambda _interaction: True)
+        monkeypatch.setattr(dashboard.discord, "Member", FakeMember)
+        database = FakeDatabase()
+        cog = SimpleNamespace(bot=SimpleNamespace(db=database))
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(id=1),
+            user=SimpleNamespace(id=2),
+            response=FakeResponse(),
+            followup=FakeFollowup(),
+        )
+        view = RaffleInitialEntrantsView(
+            cog,
+            event_id=18,
+            raffle_id=77,
+        )
+        view.winner_count_select._values = ["4"]
+        await view.select_winner_count(interaction)
+        view.select = SimpleNamespace(values=[FakeMember()])
+
+        continue_button = next(
+            item for item in view.children if item.label == "متابعة"
+        )
+        await continue_button.callback(interaction)
+
+        assert database.updated_winner_count == 4
 
 
 def test_drand_beacon_requires_randomness_to_match_signature(monkeypatch) -> None:

@@ -109,6 +109,8 @@ class SupabaseDatabase:
         winner_count: int,
         event_id: int | None = None,
     ) -> dict[str, Any]:
+        if not 1 <= winner_count <= 10:
+            raise ValueError("Raffle winner count must be between 1 and 10.")
         return await self._event_raffle_rpc("create_event_raffle", {
             "p_guild_id": guild_id,
             "p_created_by": created_by,
@@ -125,10 +127,28 @@ class SupabaseDatabase:
         event_id: int,
         winner_count: int = 1,
     ) -> dict[str, Any]:
+        if not 1 <= winner_count <= 10:
+            raise ValueError("Raffle winner count must be between 1 and 10.")
         return await self._event_raffle_rpc("create_event_raffle_draft", {
             "p_guild_id": guild_id,
             "p_created_by": created_by,
             "p_event_id": event_id,
+            "p_winner_count": winner_count,
+        })
+
+    async def set_event_raffle_winner_count(
+        self,
+        raffle_id: int,
+        guild_id: int,
+        actor_id: int,
+        winner_count: int,
+    ) -> dict[str, Any]:
+        if not 1 <= winner_count <= 10:
+            raise ValueError("Raffle winner count must be between 1 and 10.")
+        return await self._event_raffle_rpc("set_event_raffle_winner_count", {
+            "p_raffle_id": raffle_id,
+            "p_guild_id": guild_id,
+            "p_actor_id": actor_id,
             "p_winner_count": winner_count,
         })
 
@@ -349,6 +369,18 @@ class SupabaseDatabase:
             "p_token_hash": token_hash,
         }).execute()
         return bool(response.data)
+
+    async def verify_event_raffle_claim_code(
+        self,
+        guild_id: int,
+        actor_id: int,
+        token_hash: str,
+    ) -> dict[str, Any]:
+        return await self._event_raffle_rpc("verify_event_raffle_claim_code", {
+            "p_guild_id": guild_id,
+            "p_actor_id": actor_id,
+            "p_token_hash": token_hash,
+        })
 
     async def cancel_event_raffle(
         self,

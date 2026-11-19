@@ -374,6 +374,10 @@ async def create_raffle_from_closed_event(
 ) -> dict[str, Any]:
     if not is_staff(actor):
         raise PermissionError("Only staff can create raffles.")
+    if not 1 <= winner_count <= 10:
+        raise ValueError("Raffle winner count must be between one and ten.")
+    if winner_count > 1 and not is_admin(actor):
+        raise PermissionError("Only server administrators can configure multiple raffle winners.")
     if channel.guild.id != guild.id:
         raise ValueError("The raffle channel must belong to this server.")
     bot_member = guild.me
@@ -3026,17 +3030,22 @@ class EventHub(commands.GroupCog, group_name="event"):
     @app_commands.describe(
         title="اسم المسابقة",
         channel="القناة التي ستُنشر فيها العجلة والنتيجة",
-        winner_count="عدد الفائزين من 1 إلى 20",
+        winner_count="عدد الفائزين من 1 إلى 10",
     )
     async def create_raffle(
         self,
         interaction: discord.Interaction,
         title: str,
         channel: discord.TextChannel,
-        winner_count: app_commands.Range[int, 1, 20] = 1,
+        winner_count: app_commands.Range[int, 1, 10] = 1,
     ) -> None:
         if not interaction.guild or not is_staff(interaction.user):
             return await interaction.response.send_message("هذا الأمر مخصص للإدارة.", ephemeral=True)
+        if winner_count > 1 and not is_admin(interaction.user):
+            return await interaction.response.send_message(
+                "اختيار أكثر من فائز متاح لمالك السيرفر أو لمن لديه Administrator فقط.",
+                ephemeral=True,
+            )
         if not title.strip() or len(title.strip()) > 100:
             return await interaction.response.send_message("يجب أن يكون اسم المسابقة بين 1 و100 حرف.", ephemeral=True)
         if channel.guild.id != interaction.guild.id:

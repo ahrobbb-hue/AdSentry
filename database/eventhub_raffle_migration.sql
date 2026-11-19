@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS public.event_raffles (
     title TEXT NOT NULL CHECK (char_length(title) BETWEEN 1 AND 100),
     channel_id BIGINT,
     created_by BIGINT NOT NULL,
-    winner_count INTEGER NOT NULL DEFAULT 1 CHECK (winner_count BETWEEN 1 AND 20),
+    winner_count INTEGER NOT NULL DEFAULT 1 CHECK (winner_count BETWEEN 1 AND 10),
     status TEXT NOT NULL DEFAULT 'OPEN'
         CHECK (status IN ('OPEN', 'LOCKED', 'DRAWN', 'CANCELLED')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -27,6 +27,11 @@ CREATE TABLE IF NOT EXISTS public.event_raffles (
 ALTER TABLE public.event_raffles ADD COLUMN IF NOT EXISTS event_id BIGINT REFERENCES public.events(id) ON DELETE SET NULL;
 ALTER TABLE public.event_raffles ADD COLUMN IF NOT EXISTS spin_message_id BIGINT;
 ALTER TABLE public.event_raffles ALTER COLUMN channel_id DROP NOT NULL;
+ALTER TABLE public.event_raffles
+    DROP CONSTRAINT IF EXISTS event_raffles_winner_count_max_10_check;
+ALTER TABLE public.event_raffles
+    ADD CONSTRAINT event_raffles_winner_count_max_10_check
+    CHECK (winner_count BETWEEN 1 AND 10 OR status <> 'OPEN') NOT VALID;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_event_raffles_event
     ON public.event_raffles(event_id)
     WHERE event_id IS NOT NULL AND status <> 'CANCELLED';
@@ -79,6 +84,8 @@ CREATE INDEX IF NOT EXISTS idx_event_raffle_audit
 CREATE INDEX IF NOT EXISTS idx_event_raffle_claims_pending
     ON public.event_raffle_claims(raffle_id, user_id)
     WHERE redeemed_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_event_raffle_claims_code
+    ON public.event_raffle_claims(guild_id, token_hash);
 
 CREATE OR REPLACE FUNCTION public.guard_event_raffle_entry()
 RETURNS TRIGGER
@@ -121,7 +128,7 @@ DECLARE
     v_event public.events%ROWTYPE;
 BEGIN
     IF char_length(trim(p_title)) NOT BETWEEN 1 AND 100
-       OR p_winner_count NOT BETWEEN 1 AND 20 THEN
+       OR p_winner_count NOT BETWEEN 1 AND 10 THEN
         RAISE EXCEPTION 'Invalid raffle title or winner count';
     END IF;
     IF p_channel_id IS NULL THEN
@@ -171,7 +178,7 @@ DECLARE
     v_event public.events%ROWTYPE;
     v_raffle public.event_raffles%ROWTYPE;
 BEGIN
-    IF p_winner_count NOT BETWEEN 1 AND 20 THEN
+    IF p_winner_count NOT BETWEEN 1 AND 10 THEN
         RAISE EXCEPTION 'Invalid raffle winner count';
     END IF;
 
@@ -200,6 +207,52 @@ BEGIN
     INSERT INTO public.event_raffle_audit(raffle_id, guild_id, actor_id, action, details)
     VALUES (v_raffle.id, p_guild_id, p_created_by, 'DRAFT_CREATED',
         jsonb_build_object('event_id', p_event_id, 'winner_count', p_winner_count));
+    RETURN to_jsonb(v_raffle);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.set_event_raffle_winner_count(
+    p_raffle_id BIGINT,
+    p_guild_id BIGINT,
+    p_actor_id BIGINT,
+    p_winner_count INTEGER
+) RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_raffle public.event_raffles%ROWTYPE;
+    v_previous_count INTEGER;
+BEGIN
+    IF p_winner_count NOT BETWEEN 1 AND 10 THEN
+        RAISE EXCEPTION 'Raffle winner count must be between 1 and 10';
+    END IF;
+
+    SELECT * INTO v_raffle
+    FROM public.event_raffles
+    WHERE id = p_raffle_id AND guild_id = p_guild_id
+    FOR UPDATE;
+    IF NOT FOUND OR v_raffle.status <> 'OPEN' THEN
+        RAISE EXCEPTION 'Only an open raffle can change its winner count';
+    END IF;
+
+    v_previous_count := v_raffle.winner_count;
+    IF v_previous_count <> p_winner_count THEN
+        UPDATE public.event_raffles
+        SET winner_count = p_winner_count
+        WHERE id = p_raffle_id AND guild_id = p_guild_id
+        RETURNING * INTO v_raffle;
+
+        INSERT INTO public.event_raffle_audit(
+            raffle_id, guild_id, actor_id, action, details
+        ) VALUES (
+            p_raffle_id, p_guild_id, p_actor_id, 'WINNER_COUNT_CHANGED',
+            jsonb_build_object(
+                'previous_winner_count', v_previous_count,
+                'winner_count', p_winner_count
+            )
+        );
+    END IF;
+
     RETURN to_jsonb(v_raffle);
 END;
 $$;
@@ -306,6 +359,9 @@ BEGIN
     END IF;
 
     IF v_raffle.status = 'OPEN' THEN
+        IF v_raffle.winner_count NOT BETWEEN 1 AND 10 THEN
+            RAISE EXCEPTION 'Winner count must be between 1 and 10';
+        END IF;
         SELECT COALESCE(
             jsonb_agg(jsonb_build_object('user_id', user_id, 'user_name', user_name) ORDER BY user_id),
             '[]'::jsonb
@@ -673,6 +729,78 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION public.verify_event_raffle_claim_code(
+    p_guild_id BIGINT,
+    p_actor_id BIGINT,
+    p_token_hash TEXT
+) RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+    v_claim public.event_raffle_claims%ROWTYPE;
+    v_raffle public.event_raffles%ROWTYPE;
+    v_event public.events%ROWTYPE;
+    v_result TEXT;
+BEGIN
+    IF p_token_hash IS NULL OR p_token_hash !~ '^[0-9A-Fa-f]{64}$' THEN
+        RETURN jsonb_build_object('result', 'invalid');
+    END IF;
+
+    SELECT * INTO v_claim
+    FROM public.event_raffle_claims
+    WHERE guild_id = p_guild_id
+      AND token_hash = lower(p_token_hash)
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN jsonb_build_object('result', 'invalid');
+    END IF;
+
+    SELECT * INTO v_raffle
+    FROM public.event_raffles
+    WHERE id = v_claim.raffle_id AND guild_id = p_guild_id;
+    IF NOT FOUND THEN
+        RETURN jsonb_build_object('result', 'invalid');
+    END IF;
+
+    IF v_claim.redeemed_at IS NULL THEN
+        UPDATE public.event_raffle_claims
+        SET redeemed_at = NOW(), redeemed_by = p_actor_id
+        WHERE id = v_claim.id
+        RETURNING * INTO v_claim;
+
+        INSERT INTO public.event_raffle_audit(
+            raffle_id, guild_id, actor_id, action, target_user_id, details
+        ) VALUES (
+            v_claim.raffle_id, p_guild_id, p_actor_id, 'PRIZE_CLAIM_VERIFIED',
+            v_claim.user_id, jsonb_build_object('redeemed', TRUE, 'verification_method', 'CODE_ONLY')
+        );
+        v_result := 'verified';
+    ELSE
+        v_result := 'already_redeemed';
+    END IF;
+
+    IF v_raffle.event_id IS NOT NULL THEN
+        SELECT * INTO v_event
+        FROM public.events
+        WHERE id = v_raffle.event_id AND guild_id = p_guild_id;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'result', v_result,
+        'user_id', v_claim.user_id,
+        'raffle_id', v_raffle.id,
+        'raffle_title', v_raffle.title,
+        'raffle_created_by', v_raffle.created_by,
+        'drawn_at', v_raffle.drawn_at,
+        'redeemed_at', v_claim.redeemed_at,
+        'event_id', v_event.id,
+        'event_title', v_event.title,
+        'event_created_by', v_event.created_by,
+        'event_starts_at', v_event.starts_at
+    );
+END;
+$$;
+
 ALTER TABLE public.event_raffles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.event_raffle_entries ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.event_raffle_audit ENABLE ROW LEVEL SECURITY;
@@ -685,6 +813,7 @@ GRANT USAGE, SELECT ON SEQUENCE public.event_raffles_id_seq,
 
 REVOKE ALL ON FUNCTION public.create_event_raffle(BIGINT, BIGINT, TEXT, BIGINT, INTEGER, BIGINT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.create_event_raffle_draft(BIGINT, BIGINT, BIGINT, INTEGER) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.set_event_raffle_winner_count(BIGINT, BIGINT, BIGINT, INTEGER) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.manage_event_raffle_entry(BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.lock_event_raffle(BIGINT, BIGINT, BIGINT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.prepare_event_raffle_beacon(BIGINT, BIGINT, BIGINT, TEXT, TEXT, BIGINT) FROM PUBLIC, anon, authenticated;
@@ -696,9 +825,11 @@ REVOKE ALL ON FUNCTION public.set_event_raffle_result_message(BIGINT, BIGINT, BI
 REVOKE ALL ON FUNCTION public.set_event_raffle_spin_message(BIGINT, BIGINT, BIGINT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.issue_event_raffle_claim(BIGINT, BIGINT, BIGINT, BIGINT, TEXT) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.verify_event_raffle_claim(BIGINT, BIGINT, BIGINT, BIGINT, TEXT) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.verify_event_raffle_claim_code(BIGINT, BIGINT, TEXT) FROM PUBLIC, anon, authenticated;
 
 GRANT EXECUTE ON FUNCTION public.create_event_raffle(BIGINT, BIGINT, TEXT, BIGINT, INTEGER, BIGINT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.create_event_raffle_draft(BIGINT, BIGINT, BIGINT, INTEGER) TO service_role;
+GRANT EXECUTE ON FUNCTION public.set_event_raffle_winner_count(BIGINT, BIGINT, BIGINT, INTEGER) TO service_role;
 GRANT EXECUTE ON FUNCTION public.manage_event_raffle_entry(BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT, TEXT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.lock_event_raffle(BIGINT, BIGINT, BIGINT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.prepare_event_raffle_beacon(BIGINT, BIGINT, BIGINT, TEXT, TEXT, BIGINT) TO service_role;
@@ -710,5 +841,6 @@ GRANT EXECUTE ON FUNCTION public.set_event_raffle_result_message(BIGINT, BIGINT,
 GRANT EXECUTE ON FUNCTION public.set_event_raffle_spin_message(BIGINT, BIGINT, BIGINT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.issue_event_raffle_claim(BIGINT, BIGINT, BIGINT, BIGINT, TEXT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.verify_event_raffle_claim(BIGINT, BIGINT, BIGINT, BIGINT, TEXT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.verify_event_raffle_claim_code(BIGINT, BIGINT, TEXT) TO service_role;
 
 NOTIFY pgrst, 'reload schema';
