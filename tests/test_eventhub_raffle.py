@@ -659,3 +659,104 @@ def test_drand_fetch_reports_status_for_every_unavailable_mirror(monkeypatch) ->
         "primary.example: HTTP 503",
         "mirror.example: HTTP 503",
     )
+
+
+def test_drand_425_marks_the_pinned_round_as_not_yet_published(monkeypatch) -> None:
+    class FakeResponse:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def raise_for_status(self) -> None:
+            status = 404 if "cloudflare" in self.url else 425
+            raise eventhub.aiohttp.ClientResponseError(
+                request_info=SimpleNamespace(real_url=self.url),
+                history=(),
+                status=status,
+                message="Not available yet",
+            )
+
+    class FakeSession:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def get(self, url: str) -> FakeResponse:
+            return FakeResponse(url)
+
+    monkeypatch.setattr(eventhub, "DRAND_API_BASES", (
+        "https://primary.example",
+        "https://api2.example",
+        "https://api3.example",
+        "https://drand.cloudflare.com",
+    ))
+    monkeypatch.setattr(eventhub.aiohttp, "ClientSession", FakeSession)
+
+    with pytest.raises(eventhub.DrandRoundNotAvailableError) as error:
+        asyncio.run(eventhub._fetch_drand_json("/public/42"))
+
+    assert error.value.path == "/public/42"
+    assert error.value.failures == (
+        "primary.example: HTTP 425",
+        "api2.example: HTTP 425",
+        "api3.example: HTTP 425",
+        "drand.cloudflare.com: HTTP 404",
+    )
+
+
+def test_spin_reports_when_the_pinned_round_is_not_published(monkeypatch) -> None:
+    class FakeDatabase:
+        async def get_event_raffle(self, *_args):
+            return {
+                "id": 42,
+                "guild_id": 1,
+                "status": "LOCKED",
+                "lock_message_id": 100,
+                "spin_message_id": 101,
+                "beacon_chain_hash": "a" * 64,
+                "beacon_target_round": 300,
+            }
+
+    class FakeFollowup:
+        def __init__(self) -> None:
+            self.messages = []
+
+        async def send(self, *args, **kwargs):
+            self.messages.append((args, kwargs))
+
+    async def fetch_not_yet_published(_round_number: int) -> dict:
+        raise eventhub.DrandRoundNotAvailableError("/public/300", ["api.drand.sh: HTTP 425"])
+
+    monkeypatch.setattr(eventhub, "_can_spin_raffle", lambda *_args: True)
+    monkeypatch.setattr(
+        EventHub,
+        "_refresh_raffle_wheel_without_proof",
+        lambda *_args: asyncio.sleep(0),
+    )
+    monkeypatch.setattr(eventhub, "_fetch_drand_info", lambda: asyncio.sleep(0, result={"hash": "a" * 64}))
+    monkeypatch.setattr(eventhub, "_fetch_drand_beacon", fetch_not_yet_published)
+
+    followup = FakeFollowup()
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=1),
+        user=SimpleNamespace(id=2),
+        response=SimpleNamespace(is_done=lambda: True),
+        followup=followup,
+    )
+    wheel_message = SimpleNamespace(id=101)
+    cog = EventHub(SimpleNamespace(db=FakeDatabase()))
+
+    asyncio.run(cog.spin_raffle(interaction, 42, wheel_message))
+
+    assert "لم تصدر بعد" in followup.messages[0][0][0]
+    assert "جولة بديلة" in followup.messages[0][0][0]

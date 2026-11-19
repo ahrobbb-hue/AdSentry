@@ -48,6 +48,13 @@ class DrandUnavailableError(aiohttp.ClientError):
         self.failures = tuple(failures)
 
 
+class DrandRoundNotAvailableError(aiohttp.ClientError):
+    def __init__(self, path: str, failures: list[str]) -> None:
+        super().__init__("The pinned drand round has not been published yet.")
+        self.path = path
+        self.failures = tuple(failures)
+
+
 def _raffle_entrants_hash(entrants: list[dict[str, Any]]) -> str:
     canonical = [
         {
@@ -496,6 +503,11 @@ async def _fetch_drand_json(path: str) -> dict[str, Any]:
                 logger.warning("drand endpoint %s failed for %s: %s", base_url, path, error)
 
     if errors:
+        if path.startswith("/public/") and any(
+            isinstance(error, aiohttp.ClientResponseError) and error.status == 425
+            for error in errors
+        ):
+            raise DrandRoundNotAvailableError(path, failure_details) from errors[-1]
         unavailable_errors = [
             error
             for error in errors
@@ -3821,6 +3833,13 @@ class EventHub(commands.GroupCog, group_name="event"):
                     delivery_status += " حُفظت النتيجة لكن تعذر تحديث رسالة العجلة؛ أعد تنفيذ الإجراء لعرض النتيجة نفسها."
                 if delivery_status:
                     await interaction.followup.send(delivery_status, ephemeral=True)
+            except DrandRoundNotAvailableError as error:
+                logger.info("Pinned drand round is not published yet: %s", error.path)
+                await interaction.followup.send(
+                    "جولة drand المثبّتة لم تصدر بعد. انتظر قليلًا ثم أعد المحاولة؛ "
+                    "لن يتغير السحب ولن يتم اختيار جولة بديلة.",
+                    ephemeral=True,
+                )
             except DrandUnavailableError as error:
                 details = "، ".join(error.failures)
                 stage = "إعدادات المصدر" if error.path == "/info" else "جلب الجولة المثبتة"
