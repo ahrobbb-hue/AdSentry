@@ -93,6 +93,8 @@ def test_raffle_migration_freezes_entries_and_restricts_draw_rpc() -> None:
     assert "status = 'CLOSED'" in migration
     assert "registration_open = FALSE" in migration
     assert "create_event_raffle_draft" in migration
+    assert "'already_present', TRUE" in migration
+    assert "Could not add member to this raffle" in migration
     assert "set_event_raffle_channel" in migration
     assert "set_event_raffle_spin_message" in migration
     assert "verify_event_raffle_claim" in migration
@@ -200,14 +202,15 @@ def test_event_dashboard_buttons_are_grouped_by_workflow() -> None:
     assert buttons_by_row == {
         0: ["إنشاء فعالية", "قائمة الفعاليات", "إغلاق التسجيل"],
         1: ["تعديل فعالية", "إلغاء فعالية", "تسجيل الحضور", "الرئيسية"],
-        2: ["إعداد السحب", "إدراج المؤهلين"],
+        2: ["إعداد السحب"],
     }
 
 
-def test_initial_entrant_entry_does_not_request_a_channel() -> None:
+def test_raffle_setup_collects_entrants_before_channel_selection() -> None:
     view = RaffleInitialEntrantsView(None, event_id=18)
 
-    assert any(item.label == "حفظ المؤهلين" for item in view.children)
+    assert any(item.label == "متابعة" for item in view.children)
+    assert any(isinstance(item, discord.ui.UserSelect) for item in view.children)
     assert not any(isinstance(item, discord.ui.ChannelSelect) for item in view.children)
 
 

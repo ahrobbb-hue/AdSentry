@@ -238,7 +238,21 @@ BEGIN
         WHERE existing_entry.is_active = FALSE
         RETURNING * INTO v_entry;
 
-        IF NOT FOUND THEN RAISE EXCEPTION 'Member is already in this raffle'; END IF;
+        IF NOT FOUND THEN
+            SELECT * INTO v_entry
+            FROM public.event_raffle_entries
+            WHERE raffle_id = p_raffle_id
+              AND user_id = p_user_id
+              AND is_active = TRUE;
+            IF FOUND THEN
+                RETURN jsonb_build_object(
+                    'changed', FALSE,
+                    'already_present', TRUE,
+                    'entry', to_jsonb(v_entry)
+                );
+            END IF;
+            RAISE EXCEPTION 'Could not add member to this raffle';
+        END IF;
         INSERT INTO public.event_raffle_audit(
             raffle_id, guild_id, actor_id, action, target_user_id, details
         ) VALUES (
@@ -262,7 +276,11 @@ BEGIN
         RAISE EXCEPTION 'Invalid raffle entry action';
     END IF;
 
-    RETURN jsonb_build_object('changed', TRUE, 'entry', to_jsonb(v_entry));
+    RETURN jsonb_build_object(
+        'changed', TRUE,
+        'already_present', FALSE,
+        'entry', to_jsonb(v_entry)
+    );
 END;
 $$;
 

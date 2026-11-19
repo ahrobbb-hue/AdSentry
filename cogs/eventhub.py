@@ -201,6 +201,7 @@ class RaffleEntrantAddView(discord.ui.View):
             if not raffle or raffle.get("status") != "OPEN":
                 return await interaction.followup.send("السحب غير موجود أو لم يعد مفتوحًا لإضافة المؤهلين.", ephemeral=True)
             added: list[str] = []
+            already_present: list[str] = []
             skipped: list[str] = []
             for user in self.select.values:
                 if not isinstance(user, discord.Member) or user.bot:
@@ -208,7 +209,7 @@ class RaffleEntrantAddView(discord.ui.View):
                     continue
                 member = user
                 try:
-                    await self.cog.bot.db.manage_event_raffle_entry(
+                    result = await self.cog.bot.db.manage_event_raffle_entry(
                         raffle_id=self.raffle_id,
                         guild_id=interaction.guild.id,
                         actor_id=interaction.user.id,
@@ -216,7 +217,10 @@ class RaffleEntrantAddView(discord.ui.View):
                         user_name=member.display_name,
                         action="ADD",
                     )
-                    added.append(member.mention)
+                    if result.get("already_present"):
+                        already_present.append(member.mention)
+                    else:
+                        added.append(member.mention)
                 except Exception:
                     skipped.append(member.mention)
                     logger.info(
@@ -229,9 +233,12 @@ class RaffleEntrantAddView(discord.ui.View):
             logger.exception("Could not process selected entrants for raffle %s", self.raffle_id)
             return await interaction.followup.send("تعذر تحميل السحب أو تحديث قائمة المؤهلين.", ephemeral=True)
 
-        message = f"تمت إضافة {len(added)} مؤهلًا إلى السحب `#{self.raffle_id}`."
+        message = f"تمت إضافة {len(added)} مؤهل جديد إلى السحب `#{self.raffle_id}`."
+        if already_present:
+            message += f"\nكان {len(already_present)} موجودين مسبقًا ولم تتم إضافتهم مرة أخرى: "
+            message += ", ".join(already_present[:10])
         if skipped:
-            message += "\nلم تتم إضافة: " + ", ".join(skipped[:10])
+            message += "\nتعذر تسجيل: " + ", ".join(skipped[:10])
         await interaction.followup.send(
             message,
             ephemeral=True,
@@ -2864,7 +2871,7 @@ class EventHub(commands.GroupCog, group_name="event"):
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            await self.bot.db.manage_event_raffle_entry(
+            result = await self.bot.db.manage_event_raffle_entry(
                 raffle_id=raffle_id,
                 guild_id=interaction.guild.id,
                 actor_id=interaction.user.id,
@@ -2878,6 +2885,12 @@ class EventHub(commands.GroupCog, group_name="event"):
                 "لم تتم الإضافة. تأكد من رقم السحب وأنه ما زال مفتوحًا، "
                 "وتحقق من أن العضو غير مضاف مسبقًا.",
                 ephemeral=True,
+            )
+        if result.get("already_present"):
+            return await interaction.followup.send(
+                f"العضو {member.mention} موجود مسبقًا في السحب `#{raffle_id}`.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
         await interaction.followup.send(
             f"✅ تمت إضافة {member.mention} إلى السحب `#{raffle_id}`. سجل البوت المشرف الذي أضافه.",
