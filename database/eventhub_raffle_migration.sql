@@ -413,8 +413,12 @@ BEGIN
        OR v_raffle.beacon_chain_hash <> p_chain_hash
        OR v_raffle.beacon_target_round <> p_round
        OR jsonb_array_length(p_winner_ids) <> v_raffle.winner_count
-       OR p_randomness !~ '^[0-9A-Fa-f]{64}$'
-       OR p_signature !~ '^[0-9A-Fa-f]{64,512}$' THEN
+       OR p_randomness IS NULL
+       OR char_length(p_randomness) <> 64
+       OR p_randomness !~ '^[0-9A-Fa-f]+$'
+       OR p_signature IS NULL
+       OR char_length(p_signature) NOT BETWEEN 64 AND 512
+       OR p_signature !~ '^[0-9A-Fa-f]+$' THEN
         RAISE EXCEPTION 'Raffle proof does not match the locked draw';
     END IF;
 

@@ -36,6 +36,9 @@ DRAND_API_BASES = (
 )
 DRAND_DOMAIN = b"AdSentry-EventHub-Raffle-v1"
 WHEEL_COLORS = ("#5865F2", "#EB459E", "#57F287", "#FEE75C", "#ED4245", "#9B59B6")
+RAFFLE_SPIN_DURATION_MS = 4500
+RAFFLE_SPIN_FRAME_DURATION_MS = 50
+RAFFLE_SPIN_REVOLUTIONS = 5
 
 
 class DrandUnavailableError(aiohttp.ClientError):
@@ -69,21 +72,20 @@ def _raffle_event_is_ready(event: dict[str, Any]) -> bool:
     )
 
 
-def _raffle_wheel_image(
-    entrants: list[dict[str, Any]],
-    pointer_index: int = 0,
-    *,
-    rotation_degrees: float | None = None,
-) -> io.BytesIO:
+def _raffle_wheel_base(entrants: list[dict[str, Any]], size: int = 900) -> Image.Image:
     if not entrants:
         raise ValueError("Cannot render a raffle wheel without entrants.")
-    size = 900
+    scale = size / 900
+
+    def px(value: int) -> int:
+        return max(1, round(value * scale))
+
     center = size // 2
-    radius = 350
+    radius = px(350)
     image = Image.new("RGB", (size, size), "#151923")
     draw = ImageDraw.Draw(image)
-    draw.ellipse((45, 45, size - 45, size - 45), fill="#202838")
-    draw.ellipse((90, 90, size - 90, size - 90), fill="#1B2230")
+    draw.ellipse((px(45), px(45), size - px(45), size - px(45)), fill="#202838")
+    draw.ellipse((px(90), px(90), size - px(90), size - px(90)), fill="#1B2230")
     font_candidates = (
         "C:/Windows/Fonts/arial.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -92,7 +94,7 @@ def _raffle_wheel_image(
         "DejaVuSans.ttf",
     )
     font_path = next((path for path in font_candidates if Path(path).exists()), None)
-    font_size = max(11, min(25, int(520 / max(20, len(entrants) * 0.75))))
+    font_size = px(max(11, min(25, int(520 / max(20, len(entrants) * 0.75)))))
     font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
 
     slice_size = 360 / len(entrants)
@@ -105,7 +107,7 @@ def _raffle_wheel_image(
             end=end,
             fill=WHEEL_COLORS[index % len(WHEEL_COLORS)],
             outline="#FFFFFF",
-            width=3,
+            width=px(3),
         )
         angle = math.radians(start + slice_size / 2)
         label_radius = radius * 0.67
@@ -119,52 +121,144 @@ def _raffle_wheel_image(
         text_width = label_box[2] - label_box[0]
         text_height = label_box[3] - label_box[1]
         draw.rounded_rectangle(
-            (x - text_width / 2 - 7, y - text_height / 2 - 5,
-             x + text_width / 2 + 7, y + text_height / 2 + 5),
-            radius=6,
+            (x - text_width / 2 - px(7), y - text_height / 2 - px(5),
+             x + text_width / 2 + px(7), y + text_height / 2 + px(5)),
+            radius=px(6),
             fill="#151923",
         )
         draw.text((x, y), name, fill="#FFFFFF", font=font, anchor="mm")
 
-    if rotation_degrees is None:
-        rotation_degrees = (pointer_index % len(entrants) + 0.5) * slice_size
-    image = image.rotate(
+    return image
+
+
+def _raffle_wheel_frame(
+    base: Image.Image,
+    rotation_degrees: float,
+    resample: Image.Resampling = Image.Resampling.BICUBIC,
+) -> Image.Image:
+    size = base.width
+    scale = size / 900
+
+    def px(value: int) -> int:
+        return max(1, round(value * scale))
+
+    center = size // 2
+    radius = px(350)
+    image = base.rotate(
         rotation_degrees,
-        resample=Image.Resampling.BICUBIC,
+        resample=resample,
         fillcolor="#151923",
     )
     draw = ImageDraw.Draw(image)
     draw.ellipse(
-        (center - radius - 8, center - radius - 8, center + radius + 8, center + radius + 8),
+        (
+            center - radius - px(8),
+            center - radius - px(8),
+            center + radius + px(8),
+            center + radius + px(8),
+        ),
         outline="#F5C96A",
-        width=12,
+        width=px(12),
     )
-    draw.polygon(
-        [
-            (center - 36, center - radius - 42),
-            (center + 36, center - radius - 42),
-            (center, center - radius + 22),
-        ],
-        fill="#FFE27A",
-        outline="#3B2A00",
+    pointer = [
+        (center - px(36), center - radius - px(42)),
+        (center + px(36), center - radius - px(42)),
+        (center, center - radius + px(22)),
+    ]
+    draw.polygon([(x + px(2), y + px(7)) for x, y in pointer], fill="#111722")
+    draw.polygon(pointer, fill="#FFE27A", outline="#3B2A00")
+    draw.line(
+        (
+            center - px(23),
+            center - radius - px(35),
+            center + px(23),
+            center - radius - px(35),
+        ),
+        fill="#FFF2BA",
+        width=px(3),
     )
     draw.ellipse(
-        (center - 51, center - 51, center + 51, center + 51),
+        (center - px(51), center - px(51), center + px(51), center + px(51)),
         fill="#F7D77D",
         outline="#FFF5D5",
-        width=5,
+        width=px(5),
     )
     draw.ellipse(
-        (center - 33, center - 33, center + 33, center + 33),
+        (center - px(33), center - px(33), center + px(33), center + px(33)),
         fill="#273043",
         outline="#111722",
-        width=4,
+        width=px(4),
     )
-    draw.ellipse((center - 10, center - 10, center + 10, center + 10), fill="#FFF4CE")
+    draw.ellipse(
+        (center - px(10), center - px(10), center + px(10), center + px(10)),
+        fill="#FFF4CE",
+    )
+    return image
+
+
+def _raffle_wheel_image(
+    entrants: list[dict[str, Any]],
+    pointer_index: int = 0,
+    *,
+    rotation_degrees: float | None = None,
+) -> io.BytesIO:
+    base = _raffle_wheel_base(entrants)
+    if rotation_degrees is None:
+        slice_size = 360 / len(entrants)
+        rotation_degrees = (pointer_index % len(entrants) + 0.5) * slice_size
+    image = _raffle_wheel_frame(base, rotation_degrees)
     output = io.BytesIO()
     image.save(output, format="PNG", optimize=True)
     output.seek(0)
     return output
+
+
+def _raffle_wheel_animation(
+    entrants: list[dict[str, Any]],
+    pointer_index: int,
+) -> io.BytesIO:
+    if not entrants:
+        raise ValueError("Cannot animate a raffle wheel without entrants.")
+    target_index = pointer_index % len(entrants)
+    slice_size = 360 / len(entrants)
+    start_rotation = slice_size / 2
+    end_rotation = start_rotation + (
+        RAFFLE_SPIN_REVOLUTIONS * 360 + target_index * slice_size
+    )
+    frame_count = RAFFLE_SPIN_DURATION_MS // RAFFLE_SPIN_FRAME_DURATION_MS
+    base = _raffle_wheel_base(entrants, size=640)
+    frames: list[Image.Image] = []
+    for frame_index in range(frame_count):
+        progress = frame_index / (frame_count - 1)
+        eased_progress = 1 - (1 - progress) ** 4
+        rotation = start_rotation + (end_rotation - start_rotation) * eased_progress
+        frames.append(_raffle_wheel_frame(base, rotation, Image.Resampling.BILINEAR))
+
+    palette = frames[0].convert("P", palette=Image.Palette.ADAPTIVE, colors=256)
+    indexed_frames = [palette]
+    indexed_frames.extend(
+        frame.quantize(palette=palette, dither=Image.Dither.NONE)
+        for frame in frames[1:]
+    )
+    output = io.BytesIO()
+    indexed_frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=indexed_frames[1:],
+        duration=RAFFLE_SPIN_FRAME_DURATION_MS,
+        disposal=2,
+        optimize=True,
+    )
+    output.seek(0)
+    return output
+
+
+def _raffle_wheel_attachment_name(message: discord.Message) -> str:
+    for attachment in message.attachments:
+        if attachment.filename in {"raffle-wheel.png", "raffle-wheel.gif"}:
+            return attachment.filename
+    return "raffle-wheel.png"
 
 
 def _can_spin_raffle(interaction: discord.Interaction, raffle: dict[str, Any]) -> bool:
@@ -2900,6 +2994,43 @@ class EventHub(commands.GroupCog, group_name="event"):
             ephemeral=True,
         )
 
+    @raffle.command(name="preview", description="معاينة شكل عجلة السحب وطريقة دورانها")
+    async def preview_raffle_wheel(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not is_staff(interaction.user):
+            return await interaction.response.send_message(
+                "معاينة عجلة السحب مخصصة للمشرفين فقط.",
+                ephemeral=True,
+            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        demo_entrants = [
+            {"user_id": index, "user_name": f"مؤهل {index}"}
+            for index in range(1, 5)
+        ]
+        try:
+            animation = await asyncio.to_thread(_raffle_wheel_animation, demo_entrants, 2)
+            embed = discord.Embed(
+                title="🎡 معاينة عجلة السحب",
+                description=(
+                    "هذه معاينة شكلية فقط؛ لا تحفظ فائزًا ولا تغيّر أي سحب.\n"
+                    f"تدور العجلة {RAFFLE_SPIN_REVOLUTIONS} دورات كاملة على الأقل، ثم تتباطأ تدريجيًا "
+                    f"وتتوقف عند الشريحة المحددة خلال {RAFFLE_SPIN_DURATION_MS / 1000:g} ثوانٍ كحد أقصى.\n"
+                    "في السحب الحقيقي تُحسم النتيجة أولًا، ثم يبدأ المشرف المخوّل الدوران من زر العجلة."
+                ),
+                color=discord.Color.gold(),
+            )
+            embed.set_image(url="attachment://raffle-wheel-preview.gif")
+            await interaction.followup.send(
+                embed=embed,
+                file=discord.File(animation, filename="raffle-wheel-preview.gif"),
+                ephemeral=True,
+            )
+        except Exception:
+            logger.exception("Could not render staff raffle wheel preview")
+            await interaction.followup.send(
+                "تعذر إنشاء معاينة العجلة حاليًا.",
+                ephemeral=True,
+            )
+
     @raffle.command(name="add", description="إضافة عضو مؤهل إلى قائمة السحب")
     @app_commands.describe(raffle_id="رقم السحب", member="العضو المؤهل")
     async def add_raffle_entrant(
@@ -3214,6 +3345,33 @@ class EventHub(commands.GroupCog, group_name="event"):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
+    async def _animate_raffle_wheel_message(
+        self,
+        message: discord.Message,
+        raffle: dict[str, Any],
+        entrants: list[dict[str, Any]],
+        winner_index: int,
+    ) -> None:
+        animation = await asyncio.to_thread(
+            _raffle_wheel_animation,
+            entrants,
+            winner_index,
+        )
+        embed = discord.Embed(
+            title=f"🎡 عجلة السحب #{raffle['id']} · {raffle['title']}",
+            description="🎡 العجلة تدور...",
+            color=discord.Color.blurple(),
+        )
+        embed.set_image(url="attachment://raffle-wheel.gif")
+        embed.set_footer(text="توقف تدريجي · النتيجة نهائية")
+        await message.edit(
+            embed=embed,
+            attachments=[discord.File(animation, filename="raffle-wheel.gif")],
+            view=RaffleSpinView(self, int(raffle["id"]), disabled=True),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await asyncio.sleep(RAFFLE_SPIN_DURATION_MS / 1000)
+
     async def _deliver_raffle_claim_code(
         self,
         raffle: dict[str, Any],
@@ -3286,7 +3444,7 @@ class EventHub(commands.GroupCog, group_name="event"):
             ),
             color=discord.Color.green(),
         )
-        embed.set_image(url="attachment://raffle-wheel.png")
+        embed.set_image(url=f"attachment://{_raffle_wheel_attachment_name(wheel_message)}")
         embed.set_footer(text="نتيجة واحدة محفوظة · تم تحديث رسالة العجلة")
         await wheel_message.edit(
             content=" ".join(f"<@{user_id}>" for user_id in winners),
@@ -3364,7 +3522,7 @@ class EventHub(commands.GroupCog, group_name="event"):
             description=description,
             color=discord.Color.green() if is_drawn else discord.Color.blurple(),
         )
-        embed.set_image(url="attachment://raffle-wheel.png")
+        embed.set_image(url=f"attachment://{_raffle_wheel_attachment_name(message)}")
         embed.set_footer(text="🎡 التدوير يدوي · النتيجة نهائية")
         await message.edit(
             embed=embed,
@@ -3503,27 +3661,13 @@ class EventHub(commands.GroupCog, group_name="event"):
                         index for index, entrant in enumerate(entrants)
                         if int(entrant["user_id"]) == winner_ids[0]
                     )
-                    slice_size = 360 / len(entrants)
-                    start_rotation = slice_size / 2
-                    total_rotation = 360 * 3 + target_index * slice_size
-                    frames = 24
                     try:
-                        for frame in range(1, frames + 1):
-                            progress = frame / frames
-                            eased = 1 - (1 - progress) ** 3
-                            rotation = start_rotation + (
-                                total_rotation if frame == frames else total_rotation * eased
-                            )
-                            await self._edit_raffle_wheel(
-                                wheel_message,
-                                raffle,
-                                entrants,
-                                rotation_degrees=rotation,
-                                description="🎡 العجلة تدور...",
-                                disabled=True,
-                            )
-                            if frame < frames:
-                                await asyncio.sleep(0.25 + progress * 0.18)
+                        await self._animate_raffle_wheel_message(
+                            wheel_message,
+                            raffle,
+                            entrants,
+                            target_index,
+                        )
                     except Exception:
                         animation_warning = True
                         logger.exception("Wheel animation failed after raffle %s result was committed", raffle_id)

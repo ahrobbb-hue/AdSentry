@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import asyncio
 import hashlib
+import io
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from cogs.eventhub import (
     _fetch_drand_beacon,
     _raffle_event_is_ready,
     _raffle_entrants_hash,
+    _raffle_wheel_animation,
     _raffle_wheel_image,
     _raffle_target_round,
     _select_raffle_winners,
@@ -104,6 +106,9 @@ def test_raffle_migration_freezes_entries_and_restricts_draw_rpc() -> None:
     assert "verify_event_raffle_claim" in migration
     assert "TO service_role" in migration
     assert "NOTIFY pgrst, 'reload schema';" in migration
+    assert "char_length(p_signature) NOT BETWEEN 64 AND 512" in migration
+    assert "p_signature !~ '^[0-9A-Fa-f]+$'" in migration
+    assert "{64,512}" not in migration
 
 
 def test_raffle_slash_commands_are_registered_under_event_group() -> None:
@@ -114,6 +119,7 @@ def test_raffle_slash_commands_are_registered_under_event_group() -> None:
 
     assert {command.name for command in raffle_group.commands} == {
         "create",
+        "preview",
         "add",
         "remove",
         "list",
@@ -137,6 +143,32 @@ def test_raffle_wheel_rotation_changes_the_rendered_orientation() -> None:
     rotated = _raffle_wheel_image(ENTRANTS, rotation_degrees=90).getvalue()
 
     assert initial != rotated
+
+
+def test_raffle_wheel_animation_is_smooth_bounded_and_stops_on_winner() -> None:
+    animation = _raffle_wheel_animation(ENTRANTS, pointer_index=2)
+    gif = Image.open(animation)
+    durations = []
+    for frame_index in range(gif.n_frames):
+        gif.seek(frame_index)
+        durations.append(gif.info["duration"])
+    sample_point = (
+        gif.width // 2,
+        gif.height // 2 - round(300 * gif.width / 900),
+    )
+    gif.seek(0)
+    first_frame = gif.convert("RGB").getpixel(sample_point)
+    gif.seek(gif.n_frames - 1)
+    final_frame = gif.convert("RGB")
+    expected_color = tuple(bytes.fromhex(eventhub.WHEEL_COLORS[2][1:]))
+    final_color = final_frame.getpixel(sample_point)
+
+    assert gif.format == "GIF"
+    assert gif.n_frames == 90
+    assert sum(durations) == 4500
+    assert gif.info.get("loop") is None
+    assert max(abs(actual - expected) for actual, expected in zip(final_color, expected_color)) <= 6
+    assert first_frame != final_color
 
 
 def test_raffle_wheel_stops_selected_entrant_under_fixed_pointer() -> None:
@@ -171,6 +203,69 @@ def test_raffle_spin_is_limited_to_owner_admin_or_setup_staff(monkeypatch) -> No
     assert _can_spin_raffle(interaction_for(admin_id), raffle)
     assert _can_spin_raffle(interaction_for(creator_id), raffle)
     assert not _can_spin_raffle(interaction_for(other_staff_id), raffle)
+
+
+def test_raffle_wheel_preview_command_is_staff_only(monkeypatch) -> None:
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.sent = None
+
+        async def send_message(self, *args, **kwargs):
+            self.sent = (args, kwargs)
+
+    raffle_group = next(
+        command for command in EventHub.__cog_app_commands__
+        if command.name == "raffle"
+    )
+    preview_command = next(command for command in raffle_group.commands if command.name == "preview")
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=1),
+        user=SimpleNamespace(id=2),
+        response=FakeResponse(),
+    )
+    monkeypatch.setattr(eventhub, "is_staff", lambda _user: False)
+
+    asyncio.run(preview_command.callback(EventHub(SimpleNamespace()), interaction))
+
+    assert interaction.response.sent[1]["ephemeral"] is True
+    assert "للمشرفين فقط" in interaction.response.sent[0][0]
+
+
+def test_real_raffle_spin_uploads_one_gif_and_waits_for_its_duration(monkeypatch) -> None:
+    class FakeMessage:
+        def __init__(self) -> None:
+            self.edits = []
+
+        async def edit(self, **kwargs):
+            self.edits.append(kwargs)
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(
+        eventhub,
+        "_raffle_wheel_animation",
+        lambda _entrants, _winner_index: io.BytesIO(b"gif"),
+    )
+    monkeypatch.setattr(eventhub.asyncio, "sleep", fake_sleep)
+    message = FakeMessage()
+    cog = EventHub(SimpleNamespace())
+
+    asyncio.run(
+        cog._animate_raffle_wheel_message(
+            message,
+            {"id": 5, "title": "Preview"},
+            ENTRANTS,
+            winner_index=1,
+        )
+    )
+
+    assert len(message.edits) == 1
+    assert message.edits[0]["attachments"][0].filename == "raffle-wheel.gif"
+    assert message.edits[0]["view"].children[0].disabled
+    assert sleep_calls == [4.5]
 
 
 def test_locking_publishes_only_one_wheel_message(monkeypatch) -> None:
@@ -276,7 +371,7 @@ def test_locking_publishes_only_one_wheel_message(monkeypatch) -> None:
 def test_raffle_result_updates_the_wheel_message_without_posting_another(monkeypatch) -> None:
     class FakeWheelMessage:
         id = 900
-        attachments = []
+        attachments = [SimpleNamespace(filename="raffle-wheel.gif")]
 
         async def edit(self, **kwargs):
             self.edited = kwargs
@@ -331,6 +426,7 @@ def test_raffle_result_updates_the_wheel_message_without_posting_another(monkeyp
     assert not embed.fields
     assert "drand" not in embed.description.lower()
     assert raffle["entrants_hash"] not in embed.description
+    assert embed.image.url == "attachment://raffle-wheel.gif"
     assert channel.wheel_message.edited["view"].children[0].disabled
     assert bot.db.result_message_id == FakeWheelMessage.id
 
