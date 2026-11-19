@@ -23,15 +23,17 @@ Staff can use `/dashboard` and open the EventHub, StaffFlow, or dedicated Shifts
 - **إغلاق التسجيل** in the dashboard, the admin card, or `/event close event_id:<id>` only prevents new registrations. The event stays open, current participant roles remain, and it closes automatically at its configured end time; roles are removed then. Use the separate **إلغاء الفعالية** action to cancel an event before its end.
 - Existing events receive a one-time two-hour end time when the duration migration is applied. Reminders are sent automatically once when due.
 
-### Transparent manual raffle
+### Transparent event raffle
 
-- `/event raffle create` creates a raffle and lets staff select the channel where the frozen entrant list and final proof will be published.
-- Staff add/remove eligible members with `/event raffle add` and `/event raffle remove`. Every change records the acting staff member in the raffle audit log. `/event raffle list` shows the current list and recent changes to staff.
+- From `/dashboard` → **الفعاليات**, use **إعداد سحب لفعالية مغلقة**. The selector lists only events whose status is `CLOSED`; choose the public channel for the entrant manifest, wheel, and result. An event can have only one non-cancelled raffle.
+- Use **إدراج المؤهلين** and select up to 25 verified members at a time. `/event raffle add` and `/event raffle remove` remain available; every change records the acting staff member in the audit log. `/event raffle list` shows the current list and recent changes to staff.
 - `/event raffle lock` freezes the list in the database, computes its SHA-256 hash, commits to a specific future drand round, and publishes the full list plus the add/remove audit history as CSV files in the selected channel. No entrant changes are accepted after locking.
-- After that exact drand round is available, staff run `/event raffle draw`. The bot derives the winner(s) deterministically from the frozen list and beacon randomness, stores the result once, and publishes the winners plus the beacon proof. Re-running the command can only publish the same stored result, never draw again.
+- Locking also publishes a wheel with the frozen names and a spin button. The button is available to the server owner, an Administrator, or the raffle creator if they are staff. It is not automatic: it remains unavailable until the committed drand round is published. `/event raffle draw` is an equivalent shortcut for an authorized spinner.
+- The bot derives the winner(s) deterministically from the frozen list and beacon randomness and stores the result once. The wheel animation only displays that already-fixed result; it never chooses a winner. Repeated clicks or commands can only show the same result and cannot redraw.
 - The proof uses compact UTF-8 JSON with entrants sorted by Discord user ID to hash the list. Each pick hashes the versioned domain, drand randomness, raffle ID, list hash, pick index, and nonce; rejection sampling avoids modulo bias, and a winner is removed before selecting the next.
 - Anyone in the server can use `/event raffle verify` to check the list hash, winner calculation, and that the published randomness/signature match the selected drand round. The signature and chain hash are included so the beacon proof can also be independently checked.
-- `/event raffle cancel` is available only while the list is still open. The wheel, if added as a visual effect later, must only animate the already determined result.
+- Each winner receives a private, random prize-claim code; only its SHA-256 hash is stored. Staff can use `/event raffle resend-code` if the DM was unavailable. The server owner or an Administrator verifies the code with `/event raffle verify-claim`, which records the redemption and rejects reuse.
+- `/event raffle cancel` is available only while the list is still open. If a winner cannot receive DMs, have staff enable DMs and issue a new code before prize pickup.
 
 Use a timezone offset in the ISO date, for example `2026-11-01T19:00+03:00`. A naive ISO date is interpreted as UTC.
 

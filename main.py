@@ -10,6 +10,7 @@ import asyncio
 from pathlib import Path
 from aiohttp import web
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from config import Config
@@ -75,6 +76,8 @@ class AdSentryBot(commands.Bot):
         self.db = SupabaseDatabase()
         self.health_check_runner: web.AppRunner | None = None
         self.database_ready = False
+        self._stale_command_cleanup_started = False
+        self._stale_command_cleanup_task: asyncio.Task[None] | None = None
 
     async def setup_hook(self) -> None:
         """Executes asynchronous setup before the bot connects to Discord gateway."""
@@ -149,22 +152,73 @@ class AdSentryBot(commands.Bot):
         )
         await self.change_presence(status=discord.Status.online, activity=activity)
 
-        # Remove stale guild-scoped copies left by older versions. Current
-        # production commands are registered globally (or only in GUILD_ID).
-        for guild in self.guilds:
+        if not self._stale_command_cleanup_started:
+            self._stale_command_cleanup_started = True
+            self._stale_command_cleanup_task = asyncio.create_task(
+                self._cleanup_stale_guild_commands(),
+                name="adsentry-stale-command-cleanup",
+            )
+
+    async def _cleanup_stale_guild_commands(self) -> None:
+        """Cleans old guild command copies once per process without blocking readiness."""
+        semaphore = asyncio.Semaphore(5)
+
+        async def cleanup_guild(guild: discord.Guild) -> None:
             if Config.GUILD_ID and guild.id == Config.GUILD_ID:
-                continue
-            try:
-                self.tree.clear_commands(guild=guild)
-                synced_guild = await self.tree.sync(guild=guild)
-                if synced_guild:
-                    logger.info(f"Removed {len(synced_guild)} stale guild-scoped slash command(s) from {guild.name} ({guild.id}).")
-            except Exception as e:
-                logger.warning(f"Could not clean stale guild-scoped commands in guild {guild.id}: {e}")
+                return
+            async with semaphore:
+                try:
+                    self.tree.clear_commands(guild=guild)
+                    synced_guild = await self.tree.sync(guild=guild)
+                    if synced_guild:
+                        logger.info(
+                            "Removed %s stale guild-scoped slash command(s) from %s (%s).",
+                            len(synced_guild),
+                            guild.name,
+                            guild.id,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Could not clean stale guild-scoped commands in guild %s",
+                        guild.id,
+                    )
+
+        await asyncio.gather(*(cleanup_guild(guild) for guild in self.guilds))
+
+    async def on_app_command_completion(
+        self,
+        interaction: discord.Interaction,
+        command: app_commands.Command,
+    ) -> None:
+        """Logs slow slash commands using the interaction's end-to-end age."""
+        elapsed_ms = max(
+            0.0,
+            (discord.utils.utcnow() - interaction.created_at).total_seconds() * 1000,
+        )
+        command_name = command.qualified_name
+        guild_id = interaction.guild_id or 0
+        if elapsed_ms >= 1000:
+            logger.warning(
+                "Slow application command %s in guild %s completed in %.0fms from interaction creation.",
+                command_name,
+                guild_id,
+                elapsed_ms,
+            )
+        else:
+            logger.debug(
+                "Application command %s in guild %s completed in %.0fms from interaction creation.",
+                command_name,
+                guild_id,
+                elapsed_ms,
+            )
 
     async def close(self) -> None:
         """Gracefully cleanup connections upon bot shutdown."""
         logger.info("Shutting down AdSentry...")
+        if self._stale_command_cleanup_task is not None:
+            self._stale_command_cleanup_task.cancel()
+            await asyncio.gather(self._stale_command_cleanup_task, return_exceptions=True)
+            self._stale_command_cleanup_task = None
         if self.health_check_runner is not None:
             await self.health_check_runner.cleanup()
             self.health_check_runner = None

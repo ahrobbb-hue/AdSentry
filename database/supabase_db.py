@@ -107,6 +107,7 @@ class SupabaseDatabase:
         title: str,
         channel_id: int,
         winner_count: int,
+        event_id: int | None = None,
     ) -> dict[str, Any]:
         return await self._event_raffle_rpc("create_event_raffle", {
             "p_guild_id": guild_id,
@@ -114,6 +115,7 @@ class SupabaseDatabase:
             "p_title": title,
             "p_channel_id": channel_id,
             "p_winner_count": winner_count,
+            "p_event_id": event_id,
         })
 
     async def get_event_raffle(self, raffle_id: int, guild_id: int) -> dict[str, Any] | None:
@@ -230,6 +232,20 @@ class SupabaseDatabase:
         }).execute()
         return bool(response.data)
 
+    async def set_event_raffle_spin_message(
+        self,
+        raffle_id: int,
+        guild_id: int,
+        message_id: int,
+    ) -> bool:
+        client = await self.get_client()
+        response = await client.rpc("set_event_raffle_spin_message", {
+            "p_raffle_id": raffle_id,
+            "p_guild_id": guild_id,
+            "p_message_id": message_id,
+        }).execute()
+        return bool(response.data)
+
     async def record_event_raffle_result(
         self,
         raffle_id: int,
@@ -241,6 +257,7 @@ class SupabaseDatabase:
         round_number: int,
         randomness: str,
         signature: str,
+        claim_hashes: list[dict[str, Any]],
     ) -> dict[str, Any]:
         return await self._event_raffle_rpc("record_event_raffle_result", {
             "p_raffle_id": raffle_id,
@@ -252,6 +269,7 @@ class SupabaseDatabase:
             "p_round": round_number,
             "p_randomness": randomness,
             "p_signature": signature,
+            "p_claim_hashes": claim_hashes,
         })
 
     async def set_event_raffle_result_message(
@@ -265,6 +283,42 @@ class SupabaseDatabase:
             "p_raffle_id": raffle_id,
             "p_guild_id": guild_id,
             "p_message_id": message_id,
+        }).execute()
+        return bool(response.data)
+
+    async def issue_event_raffle_claim(
+        self,
+        raffle_id: int,
+        guild_id: int,
+        actor_id: int,
+        user_id: int,
+        token_hash: str,
+    ) -> bool:
+        client = await self.get_client()
+        response = await client.rpc("issue_event_raffle_claim", {
+            "p_raffle_id": raffle_id,
+            "p_guild_id": guild_id,
+            "p_actor_id": actor_id,
+            "p_user_id": user_id,
+            "p_token_hash": token_hash,
+        }).execute()
+        return bool(response.data)
+
+    async def verify_event_raffle_claim(
+        self,
+        raffle_id: int,
+        guild_id: int,
+        user_id: int,
+        actor_id: int,
+        token_hash: str,
+    ) -> bool:
+        client = await self.get_client()
+        response = await client.rpc("verify_event_raffle_claim", {
+            "p_raffle_id": raffle_id,
+            "p_guild_id": guild_id,
+            "p_user_id": user_id,
+            "p_actor_id": actor_id,
+            "p_token_hash": token_hash,
         }).execute()
         return bool(response.data)
 

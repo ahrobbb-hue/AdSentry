@@ -7,16 +7,20 @@ import hashlib
 import io
 import json
 import logging
+import math
 import re
+import secrets
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import aiohttp
 import discord
+from PIL import Image, ImageDraw, ImageFont
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from cogs.moderation import is_staff
+from cogs.moderation import is_admin, is_staff
 
 logger = logging.getLogger("AdSentry.EventHub")
 
@@ -24,6 +28,7 @@ EVENT_ROLE_NAMES = ("Event", "Event 2", "Event 3", "Event 4", "Event 5")
 _EVENT_ROLE_LOCKS: dict[int, asyncio.Lock] = {}
 DRAND_API_BASE = "https://api.drand.sh"
 DRAND_DOMAIN = b"AdSentry-EventHub-Raffle-v1"
+WHEEL_COLORS = ("#5865F2", "#EB459E", "#57F287", "#FEE75C", "#ED4245", "#9B59B6")
 
 
 def _raffle_entrants_hash(entrants: list[dict[str, Any]]) -> str:
@@ -48,6 +53,242 @@ def _safe_raffle_csv_text(value: Any) -> str:
     if text.lstrip().startswith(("=", "+", "-", "@")):
         return "'" + text
     return text
+
+
+def _raffle_wheel_image(entrants: list[dict[str, Any]], pointer_index: int = 0) -> io.BytesIO:
+    if not entrants:
+        raise ValueError("Cannot render a raffle wheel without entrants.")
+    size = 900
+    center = size // 2
+    radius = 350
+    image = Image.new("RGB", (size, size), "#202225")
+    draw = ImageDraw.Draw(image)
+    font_candidates = (
+        "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansArabicUI-Regular.ttf",
+        "DejaVuSans.ttf",
+    )
+    font_path = next((path for path in font_candidates if Path(path).exists()), None)
+    font_size = max(11, min(25, int(520 / max(20, len(entrants) * 0.75))))
+    font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
+
+    slice_size = 360 / len(entrants)
+    for index, entrant in enumerate(entrants):
+        start = -90 + index * slice_size
+        end = -90 + (index + 1) * slice_size
+        draw.pieslice(
+            (center - radius, center - radius, center + radius, center + radius),
+            start=start,
+            end=end,
+            fill=WHEEL_COLORS[index % len(WHEEL_COLORS)],
+            outline="#FFFFFF",
+            width=3,
+        )
+        angle = math.radians(start + slice_size / 2)
+        label_radius = radius * 0.67
+        x = center + math.cos(angle) * label_radius
+        y = center + math.sin(angle) * label_radius
+        name = str(entrant["user_name"]).replace("\n", " ").strip()
+        max_chars = max(8, min(22, int(360 / max(1, len(entrants)))))
+        if len(name) > max_chars:
+            name = name[:max_chars - 1] + "…"
+        label_box = draw.textbbox((0, 0), name, font=font)
+        text_width = label_box[2] - label_box[0]
+        text_height = label_box[3] - label_box[1]
+        draw.rounded_rectangle(
+            (x - text_width / 2 - 7, y - text_height / 2 - 5,
+             x + text_width / 2 + 7, y + text_height / 2 + 5),
+            radius=6,
+            fill="#202225",
+        )
+        draw.text((x, y), name, fill="#FFFFFF", font=font, anchor="mm")
+
+    selected_index = pointer_index % len(entrants)
+    pointer_angle = math.radians(-90 + (selected_index + 0.5) * slice_size)
+    tip_radius = radius - 5
+    base_radius = radius + 54
+    half_width = 28
+    tip = (
+        center + math.cos(pointer_angle) * tip_radius,
+        center + math.sin(pointer_angle) * tip_radius,
+    )
+    base_center = (
+        center + math.cos(pointer_angle) * base_radius,
+        center + math.sin(pointer_angle) * base_radius,
+    )
+    perpendicular = pointer_angle + math.pi / 2
+    base_left = (
+        base_center[0] + math.cos(perpendicular) * half_width,
+        base_center[1] + math.sin(perpendicular) * half_width,
+    )
+    base_right = (
+        base_center[0] - math.cos(perpendicular) * half_width,
+        base_center[1] - math.sin(perpendicular) * half_width,
+    )
+    draw.polygon([tip, base_left, base_right], fill="#F1C40F", outline="#111111")
+    draw.ellipse(
+        (center - 46, center - 46, center + 46, center + 46),
+        fill="#FFFFFF",
+        outline="#202225",
+        width=5,
+    )
+    draw.ellipse((center - 12, center - 12, center + 12, center + 12), fill="#202225")
+    output = io.BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    output.seek(0)
+    return output
+
+
+def _can_spin_raffle(interaction: discord.Interaction, raffle: dict[str, Any]) -> bool:
+    return bool(
+        interaction.guild
+        and is_staff(interaction.user)
+        and (
+            is_admin(interaction.user)
+            or interaction.user.id == int(raffle["created_by"])
+        )
+    )
+
+
+class RaffleSpinView(discord.ui.View):
+    def __init__(self, cog: "EventHub", raffle_id: int, disabled: bool = False) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.raffle_id = raffle_id
+        button = discord.ui.Button(
+            label="تدوير الدولاب",
+            emoji="🎡",
+            style=discord.ButtonStyle.success,
+            custom_id=f"adsentry:raffle:spin:{raffle_id}",
+            disabled=disabled,
+        )
+        button.callback = self.spin
+        self.add_item(button)
+
+    async def spin(self, interaction: discord.Interaction) -> None:
+        await self.cog.spin_raffle(interaction, self.raffle_id, interaction.message)
+
+
+class RaffleEntrantAddView(discord.ui.View):
+    def __init__(self, cog: "EventHub", raffle_id: int) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.raffle_id = raffle_id
+        select = discord.ui.UserSelect(
+            placeholder="اختر المؤهلين (يمكن اختيار عدة أعضاء)",
+            min_values=1,
+            max_values=25,
+        )
+        select.callback = self.add_selected
+        self.select = select
+        self.add_item(select)
+
+    async def add_selected(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not is_staff(interaction.user):
+            return await interaction.response.send_message("هذه العملية للإدارة فقط.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            raffle = await self.cog.bot.db.get_event_raffle(self.raffle_id, interaction.guild.id)
+            if not raffle or raffle.get("status") != "OPEN":
+                return await interaction.followup.send("السحب غير موجود أو لم يعد مفتوحًا لإضافة المؤهلين.", ephemeral=True)
+            added: list[str] = []
+            skipped: list[str] = []
+            for user in self.select.values:
+                if not isinstance(user, discord.Member) or user.bot:
+                    skipped.append(f"<@{user.id}> (غير عضو أو حساب بوت)")
+                    continue
+                member = user
+                try:
+                    await self.cog.bot.db.manage_event_raffle_entry(
+                        raffle_id=self.raffle_id,
+                        guild_id=interaction.guild.id,
+                        actor_id=interaction.user.id,
+                        user_id=member.id,
+                        user_name=member.display_name,
+                        action="ADD",
+                    )
+                    added.append(member.mention)
+                except Exception:
+                    skipped.append(member.mention)
+                    logger.info(
+                        "Could not add selected entrant %s to raffle %s",
+                        member.id,
+                        self.raffle_id,
+                        exc_info=True,
+                    )
+        except Exception:
+            logger.exception("Could not process selected entrants for raffle %s", self.raffle_id)
+            return await interaction.followup.send("تعذر تحميل السحب أو تحديث قائمة المؤهلين.", ephemeral=True)
+
+        message = f"تمت إضافة {len(added)} مؤهلًا إلى السحب `#{self.raffle_id}`."
+        if skipped:
+            message += "\nلم تتم إضافة: " + ", ".join(skipped[:10])
+        await interaction.followup.send(
+            message,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+async def create_raffle_from_closed_event(
+    bot: commands.Bot,
+    guild: discord.Guild,
+    actor: discord.Member,
+    event_id: int,
+    channel: discord.TextChannel,
+    winner_count: int = 1,
+) -> dict[str, Any]:
+    if not is_staff(actor):
+        raise PermissionError("Only staff can create raffles.")
+    if channel.guild.id != guild.id:
+        raise ValueError("The raffle channel must belong to this server.")
+    bot_member = guild.me
+    if bot_member is None:
+        raise RuntimeError("The bot member could not be resolved.")
+    permissions = channel.permissions_for(bot_member)
+    if not permissions.send_messages or not permissions.embed_links or not permissions.attach_files:
+        raise PermissionError("The bot needs message, embed, and attachment permissions in the selected channel.")
+
+    client = await bot.db.get_client()
+    events = (
+        await client.table("events")
+        .select("id,title,status")
+        .eq("id", event_id)
+        .eq("guild_id", guild.id)
+        .limit(1)
+        .execute()
+    ).data or []
+    if not events or events[0].get("status") != "CLOSED":
+        raise ValueError("Only a closed event can be linked to a raffle.")
+    event = events[0]
+    raffle = await bot.db.create_event_raffle(
+        guild_id=guild.id,
+        created_by=actor.id,
+        title=str(event["title"])[:100],
+        channel_id=channel.id,
+        winner_count=winner_count,
+        event_id=event_id,
+    )
+    embed = discord.Embed(
+        title=f"🎟️ سحب الفعالية #{event_id} · {event['title']}",
+        description=(
+            f"عدد الفائزين: `{winner_count}`\n"
+            "أُغلقت الفعالية. ستُدرج الإدارة المؤهلين يدويًا، ثم تثبّت القائمة وتنشر بصمتها "
+            "وسجل التغييرات قبل السحب. لا تختار العجلة الفائز؛ النتيجة تحسمها عشوائية عامة قابلة للتحقق."
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text=f"السحب #{raffle['id']} · اضغط زر إدراج المؤهلين في لوحة الإدارة")
+    try:
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException:
+        logger.exception("Raffle %s was created but its setup announcement could not be sent", raffle["id"])
+        raffle["_announcement_sent"] = False
+    else:
+        raffle["_announcement_sent"] = True
+    return raffle
 
 
 def _raffle_target_round(locked_at: str, info: dict[str, Any]) -> int:
@@ -2189,6 +2430,18 @@ class EventHub(commands.GroupCog, group_name="event"):
                 ))
                 self.bot.add_view(RegisterEventView(event_id))
                 self.bot.add_view(AdminView(int(r["id"])))
+            locked_raffles = (
+                await client.table("event_raffles")
+                .select("id,spin_message_id")
+                .eq("status", "LOCKED")
+                .not_.is_("spin_message_id", "null")
+                .execute()
+            ).data or []
+            for raffle in locked_raffles:
+                self.bot.add_view(
+                    RaffleSpinView(self, int(raffle["id"])),
+                    message_id=int(raffle["spin_message_id"]),
+                )
         except Exception:
             logger.exception("Could not restore persistent event views")
 
@@ -2452,12 +2705,23 @@ class EventHub(commands.GroupCog, group_name="event"):
         ).data or []
         if not rows:
             return await interaction.followup.send("لا توجد فعاليات مفتوحة حالياً.", ephemeral=True)
+
+        count_responses = await asyncio.gather(*(
+            client.table("event_participants")
+            .select("id", count="exact")
+            .eq("event_id", int(event["id"]))
+            .eq("status", "REGISTERED")
+            .execute()
+            for event in rows
+        ))
+        registered_counts = {
+            int(event["id"]): int(response.count or 0)
+            for event, response in zip(rows, count_responses)
+        }
+
         embed = discord.Embed(title="🎪  الفعاليات القادمة", color=discord.Color.blurple())
         for ev in rows:
-            count = (
-                await client.table("event_participants").select("id", count="exact")
-                .eq("event_id", ev["id"]).eq("status", "REGISTERED").execute()
-            ).count or 0
+            count = registered_counts[int(ev["id"])]
             ts = int(datetime.fromisoformat(ev["starts_at"].replace("Z", "+00:00")).timestamp())
             bar = _seats_bar(count, ev["capacity"])
             embed.add_field(
@@ -2572,7 +2836,9 @@ class EventHub(commands.GroupCog, group_name="event"):
             f"✅ تم إنشاء السحب **#{raffle['id']} · {raffle['title']}**.\n"
             f"قناة إعلان القائمة والنتيجة: {channel.mention}\n"
             f"عدد الفائزين: `{raffle['winner_count']}`\n"
-            f"أضف المؤهلين عبر `/event raffle add`، ثم استخدم `/event raffle lock` لتثبيت القائمة.",
+            "اختر المؤهلين من القائمة أدناه أو أضفهم عبر `/event raffle add`، "
+            "ثم استخدم `/event raffle lock` لتثبيت القائمة.",
+            view=RaffleEntrantAddView(self, int(raffle["id"])),
             ephemeral=True,
         )
 
@@ -2735,8 +3001,10 @@ class EventHub(commands.GroupCog, group_name="event"):
                 raise RuntimeError("The configured raffle channel is unavailable.")
 
             if raffle.get("lock_message_id"):
+                if not raffle.get("spin_message_id"):
+                    await self._publish_raffle_wheel(raffle, channel)
                 return await interaction.followup.send(
-                    f"🔒 القائمة مثبتة ومنشورة مسبقًا في {channel.mention}. "
+                    f"🔒 القائمة مثبتة ومنشورة في {channel.mention}، والعجلة جاهزة للتدوير. "
                     f"موعد العشوائية العام: drand round `{raffle['beacon_target_round']}`.",
                     ephemeral=True,
                 )
@@ -2797,9 +3065,11 @@ class EventHub(commands.GroupCog, group_name="event"):
                 interaction.guild.id,
                 message.id,
             )
+            raffle["lock_message_id"] = message.id
+            await self._publish_raffle_wheel(raffle, channel)
             await interaction.followup.send(
-                f"✅ تم تثبيت القائمة ونشرها في {channel.mention}.\n"
-                f"استخدم `/event raffle draw raffle_id:{raffle_id}` بعد صدور drand round "
+                f"✅ تم تثبيت القائمة ونشرها في {channel.mention}، والعجلة جاهزة.\n"
+                f"يستطيع المالك أو المدير أو منشئ السحب الإداري الضغط على زر التدوير بعد صدور drand round "
                 f"`{raffle['beacon_target_round']}`.",
                 ephemeral=True,
             )
@@ -2810,6 +3080,111 @@ class EventHub(commands.GroupCog, group_name="event"):
                 "يمكن إعادة `/event raffle lock` وسيحافظ على القائمة المقفلة نفسها.",
                 ephemeral=True,
             )
+
+    async def _publish_raffle_wheel(
+        self,
+        raffle: dict[str, Any],
+        channel: discord.TextChannel,
+    ) -> discord.Message:
+        if raffle.get("spin_message_id"):
+            message = await channel.fetch_message(int(raffle["spin_message_id"]))
+            return message
+        entrants = raffle.get("entrants_snapshot") or []
+        if not entrants:
+            raise RuntimeError("The locked raffle has no entrants to display.")
+        image_buffer = await asyncio.to_thread(_raffle_wheel_image, entrants)
+        embed = discord.Embed(
+            title=f"🎡 عجلة السحب #{raffle['id']} · {raffle['title']}",
+            description=(
+                f"المؤهلون: `{len(entrants)}` · الفائزون: `{raffle['winner_count']}`\n"
+                f"قائمة المشاركين مثبتة ببصمة `{raffle['entrants_hash']}`.\n"
+                "اضغط زر التدوير بعد وقت العشوائية المحدد. العجلة عرض مرئي فقط؛ "
+                "النتيجة تُحسم من جولة drand المحفوظة ولا يمكن إعادة السحب."
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.set_image(url="attachment://raffle-wheel.png")
+        embed.set_footer(text=f"drand round {raffle['beacon_target_round']} · لا يبدأ الدوران تلقائيًا")
+        view = RaffleSpinView(self, int(raffle["id"]))
+        message = await channel.send(
+            embed=embed,
+            file=discord.File(image_buffer, filename="raffle-wheel.png"),
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        stored = await self.bot.db.set_event_raffle_spin_message(
+            int(raffle["id"]),
+            int(raffle["guild_id"]),
+            message.id,
+        )
+        if not stored:
+            current = await self.bot.db.get_event_raffle(
+                int(raffle["id"]),
+                int(raffle["guild_id"]),
+            )
+            current_message_id = int((current or {}).get("spin_message_id") or 0)
+            if not current_message_id:
+                raise RuntimeError("The wheel message was sent but could not be registered.")
+            if current_message_id != message.id:
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    logger.exception("Could not remove duplicate wheel message for raffle %s", raffle["id"])
+                message = await channel.fetch_message(current_message_id)
+        self.bot.add_view(view, message_id=message.id)
+        raffle["spin_message_id"] = message.id
+        return message
+
+    async def _edit_raffle_wheel(
+        self,
+        message: discord.Message,
+        raffle: dict[str, Any],
+        entrants: list[dict[str, Any]],
+        pointer_index: int,
+        *,
+        description: str,
+        disabled: bool,
+    ) -> None:
+        image_buffer = await asyncio.to_thread(_raffle_wheel_image, entrants, pointer_index)
+        embed = discord.Embed(
+            title=f"🎡 عجلة السحب #{raffle['id']} · {raffle['title']}",
+            description=description,
+            color=discord.Color.green() if disabled else discord.Color.blurple(),
+        )
+        embed.set_image(url="attachment://raffle-wheel.png")
+        embed.set_footer(text=f"قائمة مثبتة · drand round {raffle['beacon_target_round']}")
+        await message.edit(
+            embed=embed,
+            attachments=[discord.File(image_buffer, filename="raffle-wheel.png")],
+            view=RaffleSpinView(self, int(raffle["id"]), disabled=disabled),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _deliver_raffle_claim_code(
+        self,
+        raffle: dict[str, Any],
+        user_id: int,
+        token: str,
+    ) -> bool:
+        user = self.bot.get_user(user_id)
+        if user is None:
+            user = await self.bot.fetch_user(user_id)
+        embed = discord.Embed(
+            title=f"🎉 مبروك! فزت في {raffle['title']}",
+            description=(
+                f"رقم السحب: `#{raffle['id']}`\n"
+                f"رمز استلام جائزتك: `{token}`\n\n"
+                "احتفظ بالرمز ولا تشاركه علنًا. أرسله إلى إدارة السيرفر عند استلام الجائزة. "
+                "ستتحقق الإدارة منه مرة واحدة فقط."
+            ),
+            color=discord.Color.gold(),
+        )
+        try:
+            await user.send(embed=embed)
+            return True
+        except discord.Forbidden:
+            logger.info("Could not DM raffle claim code to winner %s for raffle %s", user_id, raffle["id"])
+            return False
 
     async def _publish_raffle_result(
         self,
@@ -2860,7 +3235,8 @@ class EventHub(commands.GroupCog, group_name="event"):
                 f"(https://api.drand.sh/public/{raffle['beacon_target_round']})\n"
                 f"**العشوائية العامة:** `{raffle['beacon_randomness']}`\n"
                 f"**توقيع الجولة:** `{raffle['beacon_signature']}`\n\n"
-                "تحقق من النتيجة عبر `/event raffle verify`؛ العجلة إن عُرضت لاحقًا ستكون أنيميشن فقط."
+                "تحقق من النتيجة عبر `/event raffle verify`؛ العجلة عرض مرئي فقط ولا تختار الفائز. "
+                "أُرسل رمز استلام الجائزة للفائز عبر الخاص."
             ),
             color=discord.Color.green(),
         )
@@ -2885,35 +3261,68 @@ class EventHub(commands.GroupCog, group_name="event"):
             ephemeral=True,
         )
 
-    @raffle.command(name="draw", description="تنفيذ السحب من جولة عشوائية عامة محددة مسبقًا")
-    @app_commands.describe(raffle_id="رقم السحب المقفل")
-    async def draw_raffle(
+    async def spin_raffle(
         self,
         interaction: discord.Interaction,
         raffle_id: int,
+        wheel_message: discord.Message | None,
     ) -> None:
-        if not interaction.guild or not is_staff(interaction.user):
-            return await interaction.response.send_message("هذا الأمر مخصص للإدارة.", ephemeral=True)
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not interaction.guild:
+            if not interaction.response.is_done():
+                await interaction.response.send_message("استخدم هذا الإجراء داخل السيرفر.", ephemeral=True)
+            return
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
 
-        lock = self._raffle_draw_locks.setdefault(raffle_id, asyncio.Lock())
-        async with lock:
+        draw_lock = self._raffle_draw_locks.setdefault(raffle_id, asyncio.Lock())
+        async with draw_lock:
             try:
                 raffle = await self.bot.db.get_event_raffle(raffle_id, interaction.guild.id)
                 if not raffle:
                     return await interaction.followup.send("لم يتم العثور على هذا السحب.", ephemeral=True)
+                if not _can_spin_raffle(interaction, raffle):
+                    return await interaction.followup.send(
+                        "التدوير متاح لمالك السيرفر أو مديره أو منشئ السحب إذا كان من الطاقم الإداري.",
+                        ephemeral=True,
+                    )
+
                 if raffle.get("status") == "DRAWN":
+                    winners = [int(user_id) for user_id in (raffle.get("winner_ids") or [])]
+                    entrants = raffle.get("entrants_snapshot") or []
+                    if wheel_message and winners:
+                        winner_index = next(
+                            index for index, entrant in enumerate(entrants)
+                            if int(entrant["user_id"]) == winners[0]
+                        )
+                        await self._edit_raffle_wheel(
+                            wheel_message,
+                            raffle,
+                            entrants,
+                            winner_index,
+                            description=f"🏆 الفائز: <@{winners[0]}>\nالنتيجة مثبتة ولا يمكن إعادة السحب.",
+                            disabled=True,
+                        )
                     return await self._publish_raffle_result(interaction, raffle)
                 if raffle.get("status") != "LOCKED":
                     return await interaction.followup.send(
-                        "يجب تثبيت القائمة أولًا باستخدام `/event raffle lock`.",
+                        "يجب تثبيت قائمة المؤهلين ونشر العجلة أولًا من لوحة الفعاليات.",
                         ephemeral=True,
                     )
-                if not raffle.get("lock_message_id"):
+                if not raffle.get("lock_message_id") or not raffle.get("spin_message_id"):
                     return await interaction.followup.send(
-                        "لم يُنشر إثبات القائمة بعد. أعد تشغيل `/event raffle lock` أولًا.",
+                        "لم تُنشر القائمة والعجلة بعد. أعد `/event raffle lock` أولًا.",
                         ephemeral=True,
                     )
+                if wheel_message and wheel_message.id != int(raffle["spin_message_id"]):
+                    return await interaction.followup.send("هذا الزر لا يخص رسالة عجلة السحب المسجلة.", ephemeral=True)
+
+                if wheel_message is None:
+                    channel = self.bot.get_channel(int(raffle["channel_id"]))
+                    if not isinstance(channel, discord.TextChannel):
+                        channel = await self.bot.fetch_channel(int(raffle["channel_id"]))
+                    if not isinstance(channel, discord.TextChannel):
+                        raise RuntimeError("The configured raffle channel is unavailable.")
+                    wheel_message = await channel.fetch_message(int(raffle["spin_message_id"]))
 
                 info = await _fetch_drand_info()
                 if str(info["hash"]).lower() != str(raffle["beacon_chain_hash"]).lower():
@@ -2924,7 +3333,7 @@ class EventHub(commands.GroupCog, group_name="event"):
                 beacon = await _fetch_drand_beacon(int(raffle["beacon_target_round"]))
                 if int(beacon.get("round", 0)) != int(raffle["beacon_target_round"]):
                     return await interaction.followup.send(
-                        "جولة العشوائية المحددة لم تصدر بعد. أعد الأمر لاحقًا؛ لن يتم اختيار جولة بديلة.",
+                        "جولة العشوائية المحددة لم تصدر بعد. أعد المحاولة لاحقًا؛ لن يتم اختيار جولة بديلة.",
                         ephemeral=True,
                     )
                 randomness = str(beacon.get("randomness") or "")
@@ -2948,6 +3357,17 @@ class EventHub(commands.GroupCog, group_name="event"):
                     winner_count=int(raffle["winner_count"]),
                     entrants_hash=entrants_hash,
                 )
+                claim_tokens = {
+                    user_id: secrets.token_urlsafe(16)
+                    for user_id in winner_ids
+                }
+                claim_hashes = [
+                    {
+                        "user_id": user_id,
+                        "token_hash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                    }
+                    for user_id, token in claim_tokens.items()
+                ]
                 result = await self.bot.db.record_event_raffle_result(
                     raffle_id=raffle_id,
                     guild_id=interaction.guild.id,
@@ -2958,15 +3378,99 @@ class EventHub(commands.GroupCog, group_name="event"):
                     round_number=int(raffle["beacon_target_round"]),
                     randomness=randomness.lower(),
                     signature=signature.lower(),
+                    claim_hashes=claim_hashes,
                 )
                 raffle = result.get("raffle") or {}
                 if not raffle:
                     raise RuntimeError("Database did not return the recorded raffle result.")
-                await self._publish_raffle_result(interaction, raffle)
+
+                animation_warning = False
+                if result.get("changed"):
+                    target_index = next(
+                        index for index, entrant in enumerate(entrants)
+                        if int(entrant["user_id"]) == winner_ids[0]
+                    )
+                    start_index = int(randomness[:16], 16) % len(entrants)
+                    total_steps = len(entrants) * 3 + ((target_index - start_index) % len(entrants))
+                    frames = 18
+                    try:
+                        for frame in range(1, frames + 1):
+                            progress = frame / frames
+                            eased = 1 - (1 - progress) ** 3
+                            offset = total_steps if frame == frames else round(total_steps * eased)
+                            pointer_index = (start_index + offset) % len(entrants)
+                            await self._edit_raffle_wheel(
+                                wheel_message,
+                                raffle,
+                                entrants,
+                                pointer_index,
+                                description="🎡 العجلة تدور... النتيجة محسومة مسبقًا من جولة العشوائية العامة.",
+                                disabled=True,
+                            )
+                            if frame < frames:
+                                await asyncio.sleep(0.12 + progress * 0.28)
+                    except Exception:
+                        animation_warning = True
+                        logger.exception("Wheel animation failed after raffle %s result was committed", raffle_id)
+                    try:
+                        await self._edit_raffle_wheel(
+                            wheel_message,
+                            raffle,
+                            entrants,
+                            target_index,
+                            description=f"🏆 الفائز: <@{winner_ids[0]}>\nالنتيجة مثبتة ولا يمكن إعادة السحب.",
+                            disabled=True,
+                        )
+                    except Exception:
+                        animation_warning = True
+                        logger.exception("Could not finalize wheel message for raffle %s", raffle_id)
+                else:
+                    stored_winners = [int(user_id) for user_id in (raffle.get("winner_ids") or [])]
+                    target_index = next(
+                        index for index, entrant in enumerate(entrants)
+                        if int(entrant["user_id"]) == stored_winners[0]
+                    )
+                    try:
+                        await self._edit_raffle_wheel(
+                            wheel_message,
+                            raffle,
+                            entrants,
+                            target_index,
+                            description=f"🏆 الفائز: <@{stored_winners[0]}>\nالنتيجة مثبتة ولا يمكن إعادة السحب.",
+                            disabled=True,
+                        )
+                    except Exception:
+                        animation_warning = True
+                        logger.exception("Could not show the stored winner on raffle %s wheel", raffle_id)
+
+                delivery_status = ""
+                if result.get("changed"):
+                    delivered = 0
+                    for user_id, token in claim_tokens.items():
+                        try:
+                            if await self._deliver_raffle_claim_code(raffle, user_id, token):
+                                delivered += 1
+                        except discord.HTTPException:
+                            logger.exception("Could not deliver claim code for raffle %s winner %s", raffle_id, user_id)
+                    failed = len(claim_tokens) - delivered
+                    delivery_status = (
+                        f"وصلت رموز الاستلام خاصًا إلى `{delivered}` فائز."
+                        if not failed else
+                        f"تعذر إرسال رمز خاص إلى `{failed}` فائز؛ أعِد إصداره عبر `/event raffle resend-code`."
+                    )
+                    if animation_warning:
+                        delivery_status += " تعذر تحديث بعض إطارات العجلة، لكن النتيجة محفوظة."
+                try:
+                    await self._publish_raffle_result(interaction, raffle)
+                except Exception:
+                    logger.exception("Raffle %s result was committed but could not be published", raffle_id)
+                    delivery_status += " حُفظت النتيجة لكن تعذر نشر بطاقة الإثبات؛ أعد تنفيذ الإجراء لنشر النتيجة نفسها."
+                if delivery_status:
+                    await interaction.followup.send(delivery_status, ephemeral=True)
             except aiohttp.ClientResponseError as error:
                 if error.status == 404:
                     await interaction.followup.send(
-                        "جولة drand المحددة لم تصدر بعد. أعد الأمر لاحقًا؛ لن يتم اختيار جولة بديلة.",
+                        "جولة drand المحددة لم تصدر بعد. أعد المحاولة لاحقًا؛ لن يتم اختيار جولة بديلة.",
                         ephemeral=True,
                     )
                 else:
@@ -2984,9 +3488,18 @@ class EventHub(commands.GroupCog, group_name="event"):
             except Exception:
                 logger.exception("Could not draw or publish raffle %s", raffle_id)
                 await interaction.followup.send(
-                    "تعذر إكمال السحب أو نشره. إذا حُفظت النتيجة، فإن إعادة الأمر تنشر النتيجة نفسها ولا تعيد السحب.",
+                    "تعذر إكمال السحب أو نشره. إذا حُفظت النتيجة، فإن إعادة الإجراء تنشر النتيجة نفسها ولا تعيد السحب.",
                     ephemeral=True,
                 )
+
+    @raffle.command(name="draw", description="تنفيذ السحب من زر العجلة بعد صدور جولة drand")
+    @app_commands.describe(raffle_id="رقم السحب المقفل")
+    async def draw_raffle(
+        self,
+        interaction: discord.Interaction,
+        raffle_id: int,
+    ) -> None:
+        await self.spin_raffle(interaction, raffle_id, None)
 
     @raffle.command(name="verify", description="التحقق من أن النتيجة تطابق القائمة وجولة drand")
     @app_commands.describe(raffle_id="رقم السحب")
@@ -3048,6 +3561,80 @@ class EventHub(commands.GroupCog, group_name="event"):
                 "تعذر التحقق بسبب نقص أو خلل في بيانات الإثبات.",
                 ephemeral=True,
             )
+
+    @raffle.command(name="resend-code", description="إصدار رمز استلام جديد وإرساله للفائز خاصًا")
+    @app_commands.describe(raffle_id="رقم السحب", member="الفائز")
+    async def resend_raffle_claim_code(
+        self,
+        interaction: discord.Interaction,
+        raffle_id: int,
+        member: discord.Member,
+    ) -> None:
+        if not interaction.guild or not is_staff(interaction.user):
+            return await interaction.response.send_message("هذا الأمر مخصص للإدارة.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            raffle = await self.bot.db.get_event_raffle(raffle_id, interaction.guild.id)
+            if not raffle or raffle.get("status") != "DRAWN":
+                return await interaction.followup.send("السحب غير موجود أو لم تُعلن نتيجته.", ephemeral=True)
+            token = secrets.token_urlsafe(16)
+            token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+            await self.bot.db.issue_event_raffle_claim(
+                raffle_id,
+                interaction.guild.id,
+                interaction.user.id,
+                member.id,
+                token_hash,
+            )
+            delivered = await self._deliver_raffle_claim_code(raffle, member.id, token)
+        except Exception:
+            logger.exception("Could not issue raffle claim code for raffle %s and member %s", raffle_id, member.id)
+            return await interaction.followup.send(
+                "تعذر إصدار الرمز. تأكد أن العضو فائز ولم يستلم جائزته بعد.",
+                ephemeral=True,
+            )
+        if not delivered:
+            return await interaction.followup.send(
+                "تم إصدار رمز جديد لكن تعذر إرساله خاصًا. اطلب من الفائز فتح الرسائل الخاصة ثم أعد إصدار الرمز.",
+                ephemeral=True,
+            )
+        await interaction.followup.send(
+            "تم إرسال رمز استلام جديد للفائز عبر الخاص. أصبح أي رمز سابق غير صالح.",
+            ephemeral=True,
+        )
+
+    @raffle.command(name="verify-claim", description="التحقق من رمز الفائز وتسجيل استلام الجائزة")
+    @app_commands.describe(raffle_id="رقم السحب", member="الفائز", code="رمز الاستلام الذي قدمه الفائز")
+    async def verify_raffle_claim(
+        self,
+        interaction: discord.Interaction,
+        raffle_id: int,
+        member: discord.Member,
+        code: str,
+    ) -> None:
+        if not interaction.guild or not is_admin(interaction.user):
+            return await interaction.response.send_message("التحقق من استلام الجوائز متاح لمالك السيرفر والمدير فقط.", ephemeral=True)
+        if not code.strip() or len(code) > 100:
+            return await interaction.response.send_message("رمز الاستلام غير صالح.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            token_hash = hashlib.sha256(code.strip().encode("utf-8")).hexdigest()
+            redeemed = await self.bot.db.verify_event_raffle_claim(
+                raffle_id,
+                interaction.guild.id,
+                member.id,
+                interaction.user.id,
+                token_hash,
+            )
+        except Exception:
+            logger.exception("Could not verify raffle claim for raffle %s and member %s", raffle_id, member.id)
+            return await interaction.followup.send("تعذر التحقق من الرمز. تحقق من رقم السحب والترحيل.", ephemeral=True)
+        await interaction.followup.send(
+            "✅ تم التحقق من الرمز وتسجيل استلام الجائزة."
+            if redeemed else
+            "❌ الرمز غير صحيح أو سبق استخدامه.",
+            ephemeral=True,
+        )
 
     @raffle.command(name="cancel", description="إلغاء سحب مفتوح قبل تثبيت قائمة المؤهلين")
     @app_commands.describe(raffle_id="رقم السحب", reason="سبب الإلغاء")

@@ -10,6 +10,7 @@ from cogs.eventhub import (
     EventHub,
     _fetch_drand_beacon,
     _raffle_entrants_hash,
+    _raffle_wheel_image,
     _raffle_target_round,
     _select_raffle_winners,
 )
@@ -85,6 +86,9 @@ def test_raffle_migration_freezes_entries_and_restricts_draw_rpc() -> None:
     assert "guard_event_raffle_entry" in migration
     assert "lock_event_raffle" in migration
     assert "record_event_raffle_result" in migration
+    assert "status = 'CLOSED'" in migration
+    assert "set_event_raffle_spin_message" in migration
+    assert "verify_event_raffle_claim" in migration
     assert "TO service_role" in migration
 
 
@@ -102,8 +106,21 @@ def test_raffle_slash_commands_are_registered_under_event_group() -> None:
         "lock",
         "draw",
         "verify",
+        "resend-code",
+        "verify-claim",
         "cancel",
     }
+
+
+def test_raffle_wheel_renders_a_png_for_the_locked_entrants() -> None:
+    image = _raffle_wheel_image(ENTRANTS, pointer_index=2)
+
+    assert image.read(8) == b"\x89PNG\r\n\x1a\n"
+
+
+def test_raffle_wheel_rejects_an_empty_entrant_list() -> None:
+    with pytest.raises(ValueError):
+        _raffle_wheel_image([])
 
 
 def test_drand_beacon_requires_randomness_to_match_signature(monkeypatch) -> None:
