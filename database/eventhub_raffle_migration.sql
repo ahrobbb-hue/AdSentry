@@ -706,3 +706,5 @@ GRANT EXECUTE ON FUNCTION public.set_event_raffle_result_message(BIGINT, BIGINT,
 GRANT EXECUTE ON FUNCTION public.set_event_raffle_spin_message(BIGINT, BIGINT, BIGINT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.issue_event_raffle_claim(BIGINT, BIGINT, BIGINT, BIGINT, TEXT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.verify_event_raffle_claim(BIGINT, BIGINT, BIGINT, BIGINT, TEXT) TO service_role;
+
+NOTIFY pgrst, 'reload schema';

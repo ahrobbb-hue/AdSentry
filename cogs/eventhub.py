@@ -19,6 +19,7 @@ import discord
 from PIL import Image, ImageDraw, ImageFont
 from discord import app_commands
 from discord.ext import commands, tasks
+from postgrest.exceptions import APIError
 
 from cogs.moderation import is_admin, is_staff
 
@@ -3592,6 +3593,20 @@ class EventHub(commands.GroupCog, group_name="event"):
                 await interaction.followup.send(
                     f"تعذر الاتصال بمرايا drand أثناء {stage}. لم يتم تنفيذ السحب. "
                     f"التشخيص الخاص: `{details}`",
+                    ephemeral=True,
+                )
+            except APIError as error:
+                logger.exception("Supabase rejected raffle %s draw processing", raffle_id)
+                if error.code == "PGRST202":
+                    detail = (
+                        "واجهة قاعدة البيانات لا تجد دالة السحب الحالية. "
+                        "أعد تطبيق `database/eventhub_raffle_migration.sql` في Supabase."
+                    )
+                else:
+                    message = " ".join((error.message or "خطأ غير محدد").split())[:180]
+                    detail = f"قاعدة البيانات رفضت العملية ({error.code or 'unknown'}): {message}"
+                await interaction.followup.send(
+                    f"تعذر حفظ نتيجة السحب: {detail}",
                     ephemeral=True,
                 )
             except aiohttp.ClientResponseError as error:

@@ -103,6 +103,7 @@ def test_raffle_migration_freezes_entries_and_restricts_draw_rpc() -> None:
     assert "set_event_raffle_spin_message" in migration
     assert "verify_event_raffle_claim" in migration
     assert "TO service_role" in migration
+    assert "NOTIFY pgrst, 'reload schema';" in migration
 
 
 def test_raffle_slash_commands_are_registered_under_event_group() -> None:
