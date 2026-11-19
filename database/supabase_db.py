@@ -15,8 +15,30 @@ from config import Config
 logger = logging.getLogger("AdSentry.SupabaseDB")
 
 
+def summarize_review_ratings(ratings: list[dict[str, Any]]) -> dict[str, Any]:
+    """Returns rating totals, distribution, and average for stored star votes."""
+    distribution = {star: 0 for star in range(1, 6)}
+    for row in ratings:
+        try:
+            star = int(row["rating"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if star in distribution:
+            distribution[star] += 1
+
+    count = sum(distribution.values())
+    total_score = sum(star * amount for star, amount in distribution.items())
+    return {
+        "avg_rating": round(total_score / count, 2) if count else 0.0,
+        "review_count": count,
+        "rating_distribution": distribution,
+    }
+
+
 class SupabaseDatabase:
     """Manages asynchronous database interactions with Supabase."""
+
+    GUILD_CONFIG_CACHE_TTL_SECONDS = 300
 
     def __init__(self, url: str | None = None, key: str | None = None) -> None:
         self.url = (url or Config.SUPABASE_URL).strip()
@@ -25,8 +47,6 @@ class SupabaseDatabase:
         self._guild_configs_cache: dict[int, dict[str, Any]] = {}
         # Track when each guild config was last fetched for TTL-based cache invalidation
         self._guild_configs_fetched_at: dict[int, datetime] = {}
-        # Cache TTL: re-fetch from DB after 5 minutes to pick up external changes
-        _GUILD_CONFIG_TTL_SECONDS = 300
 
     async def connect(self) -> None:
         """Initializes the Supabase asynchronous client."""
@@ -48,10 +68,18 @@ class SupabaseDatabase:
         return self.client
 
     async def check_connection(self) -> bool:
-        """Performs a quick heartbeat check to verify Supabase connectivity."""
+        """Verifies Supabase connectivity and the core database tables required at startup."""
         try:
             client = await self.get_client()
-            await client.table("submissions").select("id").limit(1).execute()
+            required_tables = (
+                "server_configs",
+                "submissions",
+                "user_cooldowns",
+                "active_posts",
+                "ad_interests",
+            )
+            for table in required_tables:
+                await client.table(table).select("id").limit(1).execute()
             return True
         except Exception as e:
             logger.warning(f"Supabase connectivity check notice: {e}")
@@ -61,6 +89,198 @@ class SupabaseDatabase:
         """Closes the client connection cleanly."""
         self.client = None
         logger.info("Supabase client connection closed.")
+
+    async def _event_raffle_rpc(self, function_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        client = await self.get_client()
+        response = await client.rpc(function_name, payload).execute()
+        data = response.data
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Unexpected response from {function_name}.")
+        return data
+
+    async def create_event_raffle(
+        self,
+        guild_id: int,
+        created_by: int,
+        title: str,
+        channel_id: int,
+        winner_count: int,
+    ) -> dict[str, Any]:
+        return await self._event_raffle_rpc("create_event_raffle", {
+            "p_guild_id": guild_id,
+            "p_created_by": created_by,
+            "p_title": title,
+            "p_channel_id": channel_id,
+            "p_winner_count": winner_count,
+        })
+
+    async def get_event_raffle(self, raffle_id: int, guild_id: int) -> dict[str, Any] | None:
+        client = await self.get_client()
+        response = (
+            await client.table("event_raffles")
+            .select("*")
+            .eq("id", raffle_id)
+            .eq("guild_id", guild_id)
+            .limit(1)
+            .execute()
+        )
+        return response.data[0] if response.data else None
+
+    async def manage_event_raffle_entry(
+        self,
+        raffle_id: int,
+        guild_id: int,
+        actor_id: int,
+        user_id: int,
+        user_name: str,
+        action: str,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        return await self._event_raffle_rpc("manage_event_raffle_entry", {
+            "p_raffle_id": raffle_id,
+            "p_guild_id": guild_id,
+            "p_actor_id": actor_id,
+            "p_user_id": user_id,
+            "p_user_name": user_name,
+            "p_action": action,
+            "p_reason": reason,
+        })
+
+    async def get_event_raffle_entries(
+        self,
+        raffle_id: int,
+        guild_id: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        client = await self.get_client()
+        response = (
+            await client.table("event_raffle_entries")
+            .select("user_id,user_name,added_by,added_at", count="exact")
+            .eq("raffle_id", raffle_id)
+            .eq("guild_id", guild_id)
+            .eq("is_active", True)
+            .order("user_id")
+            .limit(25)
+            .execute()
+        )
+        return response.data or [], int(response.count or 0)
+
+    async def get_event_raffle_audit(self, raffle_id: int, guild_id: int) -> list[dict[str, Any]]:
+        client = await self.get_client()
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            response = (
+                await client.table("event_raffle_audit")
+                .select("actor_id,action,target_user_id,details,created_at")
+                .eq("raffle_id", raffle_id)
+                .eq("guild_id", guild_id)
+                .order("created_at")
+                .range(offset, offset + 999)
+                .execute()
+            )
+            batch = response.data or []
+            rows.extend(batch)
+            if len(batch) < 1000:
+                return rows
+            offset += 1000
+
+    async def lock_event_raffle(
+        self,
+        raffle_id: int,
+        guild_id: int,
+        actor_id: int,
+    ) -> dict[str, Any]:
+        return await self._event_raffle_rpc("lock_event_raffle", {
+            "p_raffle_id": raffle_id,
+            "p_guild_id": guild_id,
+            "p_actor_id": actor_id,
+        })
+
+    async def prepare_event_raffle_beacon(
+        self,
+        raffle_id: int,
+        guild_id: int,
+        actor_id: int,
+        entrants_hash: str,
+        chain_hash: str,
+        target_round: int,
+    ) -> dict[str, Any]:
+        return await self._event_raffle_rpc("prepare_event_raffle_beacon", {
+            "p_raffle_id": raffle_id,
+            "p_guild_id": guild_id,
+            "p_actor_id": actor_id,
+            "p_entrants_hash": entrants_hash,
+            "p_chain_hash": chain_hash,
+            "p_target_round": target_round,
+        })
+
+    async def set_event_raffle_lock_message(
+        self,
+        raffle_id: int,
+        guild_id: int,
+        message_id: int,
+    ) -> bool:
+        client = await self.get_client()
+        response = await client.rpc("set_event_raffle_lock_message", {
+            "p_raffle_id": raffle_id,
+            "p_guild_id": guild_id,
+            "p_message_id": message_id,
+        }).execute()
+        return bool(response.data)
+
+    async def record_event_raffle_result(
+        self,
+        raffle_id: int,
+        guild_id: int,
+        actor_id: int,
+        winner_ids: list[int],
+        entrants_hash: str,
+        chain_hash: str,
+        round_number: int,
+        randomness: str,
+        signature: str,
+    ) -> dict[str, Any]:
+        return await self._event_raffle_rpc("record_event_raffle_result", {
+            "p_raffle_id": raffle_id,
+            "p_guild_id": guild_id,
+            "p_actor_id": actor_id,
+            "p_winner_ids": winner_ids,
+            "p_entrants_hash": entrants_hash,
+            "p_chain_hash": chain_hash,
+            "p_round": round_number,
+            "p_randomness": randomness,
+            "p_signature": signature,
+        })
+
+    async def set_event_raffle_result_message(
+        self,
+        raffle_id: int,
+        guild_id: int,
+        message_id: int,
+    ) -> bool:
+        client = await self.get_client()
+        response = await client.rpc("set_event_raffle_result_message", {
+            "p_raffle_id": raffle_id,
+            "p_guild_id": guild_id,
+            "p_message_id": message_id,
+        }).execute()
+        return bool(response.data)
+
+    async def cancel_event_raffle(
+        self,
+        raffle_id: int,
+        guild_id: int,
+        actor_id: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        return await self._event_raffle_rpc("cancel_event_raffle", {
+            "p_raffle_id": raffle_id,
+            "p_guild_id": guild_id,
+            "p_actor_id": actor_id,
+            "p_reason": reason,
+        })
 
     # -------------------------------------------------------------
     # Recruitment operations
@@ -212,13 +432,12 @@ class SupabaseDatabase:
         Checks cache first (TTL: 5 minutes), then fetches from Supabase.
         Falls back to .env if unconfigured in database.
         """
-        CACHE_TTL = 300  # seconds
         now = datetime.now(timezone.utc)
         cached_at = self._guild_configs_fetched_at.get(guild_id)
         if (
             guild_id in self._guild_configs_cache
             and cached_at is not None
-            and (now - cached_at).total_seconds() < CACHE_TTL
+            and (now - cached_at).total_seconds() < self.GUILD_CONFIG_CACHE_TTL_SECONDS
         ):
             return self._guild_configs_cache[guild_id]
 
@@ -280,6 +499,7 @@ class SupabaseDatabase:
                 self._guild_configs_cache[guild_id] = refreshed.data[0]
             else:
                 self._guild_configs_cache[guild_id] = payload
+            self._guild_configs_fetched_at[guild_id] = datetime.now(timezone.utc)
             logger.info(
                 f"Configured guild {guild_id}: Announcement Channel={announcement_channel_id}, "
                 f"Review Channel={staff_review_channel_id}, Panel Message ID={panel_id}"
@@ -338,6 +558,7 @@ class SupabaseDatabase:
                 }
                 await client.table("server_configs").upsert(payload).execute()
                 self._guild_configs_cache[guild_id] = payload
+            self._guild_configs_fetched_at[guild_id] = datetime.now(timezone.utc)
 
             logger.info(f"Updated last_panel_message_id for guild {guild_id} -> {message_id}")
         except Exception as e:
@@ -733,7 +954,7 @@ class SupabaseDatabase:
             # Fetch all submissions in the window for this guild
             response = (
                 await client.table("submissions")
-                .select("status, category, reviewed_by")
+                .select("status, category, reviewed_by, created_at, reviewed_at")
                 .eq("guild_id", guild_id)
                 .gte("created_at", cutoff)
                 .execute()
@@ -759,18 +980,146 @@ class SupabaseDatabase:
                     reviewer_counts[rev_str] = reviewer_counts.get(rev_str, 0) + 1
             top_reviewers = sorted(reviewer_counts.items(), key=lambda x: x[1], reverse=True)[:5]
 
+            review_minutes: list[float] = []
+            for row in rows:
+                created_at = row.get("created_at")
+                reviewed_at = row.get("reviewed_at")
+                if not created_at or not reviewed_at:
+                    continue
+                try:
+                    created = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+                    reviewed = datetime.fromisoformat(str(reviewed_at).replace("Z", "+00:00"))
+                    if reviewed >= created:
+                        review_minutes.append((reviewed - created).total_seconds() / 60)
+                except (TypeError, ValueError):
+                    continue
+
+            avg_review_minutes = (
+                round(sum(review_minutes) / len(review_minutes), 1)
+                if review_minutes
+                else 0.0
+            )
+            rejection_rate = round((len(rejected) / len(rows) * 100) if rows else 0.0, 1)
+            approval_rate = round((len(approved) / len(rows) * 100) if rows else 0.0, 1)
+
             return {
                 "approved_count": len(approved),
                 "rejected_count": len(rejected),
                 "total_count": len(rows),
                 "top_categories": top_categories,
                 "top_reviewers": top_reviewers,
+                "approval_rate": approval_rate,
+                "rejection_rate": rejection_rate,
+                "avg_review_minutes": avg_review_minutes,
                 "days": days,
             }
         except Exception as e:
             logger.error(f"Error fetching ad stats for guild {guild_id}: {e}", exc_info=True)
             return {"approved_count": 0, "rejected_count": 0, "total_count": 0,
-                    "top_categories": [], "top_reviewers": [], "days": days}
+                    "top_categories": [], "top_reviewers": [], "approval_rate": 0.0,
+                    "rejection_rate": 0.0, "avg_review_minutes": 0.0, "days": days}
+
+    async def log_moderation_action(
+        self,
+        guild_id: int,
+        actor_id: int,
+        action: str,
+        target_type: str,
+        target_id: int | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Writes one staff moderation action to the audit log."""
+        client = await self.get_client()
+        payload = {
+            "guild_id": guild_id,
+            "actor_id": actor_id,
+            "action": action,
+            "target_type": target_type,
+            "target_id": target_id,
+            "details": details or {},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            response = await client.table("moderation_audit_log").insert(payload).execute()
+            return response.data[0] if response.data else payload
+        except Exception as e:
+            logger.error("Could not write moderation audit action %s: %s", action, e, exc_info=True)
+            return None
+
+    async def get_moderation_audit(
+        self,
+        guild_id: int,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        """Returns recent moderation actions for a guild."""
+        client = await self.get_client()
+        try:
+            response = (
+                await client.table("moderation_audit_log")
+                .select("*")
+                .eq("guild_id", guild_id)
+                .order("created_at", desc=True)
+                .limit(max(1, min(limit, 100)))
+                .execute()
+            )
+            return response.data or []
+        except Exception as e:
+            logger.error("Could not fetch moderation audit for guild %s: %s", guild_id, e, exc_info=True)
+            return []
+
+    async def save_moderation_reply_template(
+        self,
+        guild_id: int,
+        created_by: int,
+        action_type: str,
+        name: str,
+        content: str,
+    ) -> dict[str, Any]:
+        """Creates or updates a reusable moderation reply template."""
+        action_type = action_type.upper()
+        if action_type not in {"APPROVE", "REJECT", "CHANGE_REQUEST"}:
+            raise ValueError("Invalid moderation reply template type")
+
+        client = await self.get_client()
+        payload = {
+            "guild_id": guild_id,
+            "created_by": created_by,
+            "action_type": action_type,
+            "name": name.strip()[:80],
+            "content": content.strip()[:1500],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        response = await client.table("moderation_reply_templates").upsert(payload).execute()
+        return response.data[0] if response.data else payload
+
+    async def get_moderation_reply_templates(
+        self,
+        guild_id: int,
+        action_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Lists reusable reply templates for a guild."""
+        client = await self.get_client()
+        query = client.table("moderation_reply_templates").select("*").eq("guild_id", guild_id)
+        if action_type:
+            query = query.eq("action_type", action_type.upper())
+        response = await query.order("action_type").order("name").execute()
+        return response.data or []
+
+    async def delete_moderation_reply_template(
+        self,
+        guild_id: int,
+        template_id: int,
+    ) -> bool:
+        """Deletes a guild reply template."""
+        client = await self.get_client()
+        response = (
+            await client.table("moderation_reply_templates")
+            .delete()
+            .eq("id", template_id)
+            .eq("guild_id", guild_id)
+            .execute()
+        )
+        return bool(response.data)
 
     # -------------------------------------------------------------
     # User Active Ads (for /my-ads command)
@@ -1125,12 +1474,24 @@ class SupabaseDatabase:
         }
 
         try:
-            response = await client.table("review_ratings").upsert(payload).execute()
+            response = await client.table("review_ratings").insert(payload).execute()
             logger.info(f"Saved rating {rating}/5 for submission {submission_id}")
             return response.data[0] if response.data else payload
         except Exception as e:
             logger.error(f"Error saving rating for submission {submission_id}: {e}", exc_info=True)
             raise
+
+    async def has_review_rating(self, submission_id: int) -> bool:
+        """Checks whether a submission has already received its one rating."""
+        client = await self.get_client()
+        response = (
+            await client.table("review_ratings")
+            .select("id")
+            .eq("submission_id", submission_id)
+            .limit(1)
+            .execute()
+        )
+        return bool(response.data)
 
     async def get_reviewer_stats(self, reviewer_id: int, guild_id: int) -> dict[str, Any]:
         """Gets average rating and review count for a reviewer."""
@@ -1143,16 +1504,45 @@ class SupabaseDatabase:
                 .eq("guild_id", guild_id)
                 .execute()
             )
-            ratings = response.data or []
-            if not ratings:
-                return {"avg_rating": 0.0, "review_count": 0}
-
-            avg = sum(r["rating"] for r in ratings) / len(ratings)
-            return {"avg_rating": round(avg, 2), "review_count": len(ratings)}
+            return summarize_review_ratings(response.data or [])
 
         except Exception as e:
             logger.error(f"Error fetching reviewer stats for {reviewer_id}: {e}", exc_info=True)
-            return {"avg_rating": 0.0, "review_count": 0}
+            return summarize_review_ratings([])
+
+    async def get_guild_reviewer_rating_stats(self, guild_id: int) -> list[dict[str, Any]]:
+        """Returns one anonymous-voter rating summary per reviewer in a guild."""
+        client = await self.get_client()
+        try:
+            response = (
+                await client.table("review_ratings")
+                .select("reviewer_id, rating")
+                .eq("guild_id", guild_id)
+                .execute()
+            )
+            ratings_by_reviewer: dict[int, list[dict[str, Any]]] = {}
+            for row in response.data or []:
+                try:
+                    reviewer_id = int(row["reviewer_id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                ratings_by_reviewer.setdefault(reviewer_id, []).append(row)
+
+            summaries = [
+                {"reviewer_id": reviewer_id, **summarize_review_ratings(ratings)}
+                for reviewer_id, ratings in ratings_by_reviewer.items()
+            ]
+            return sorted(
+                summaries,
+                key=lambda summary: (
+                    summary["review_count"],
+                    summary["avg_rating"],
+                ),
+                reverse=True,
+            )
+        except Exception as e:
+            logger.error("Error fetching guild reviewer stats for %s: %s", guild_id, e, exc_info=True)
+            return []
 
     # -------------------------------------------------------------
     # Expiry Alerts (NEW)

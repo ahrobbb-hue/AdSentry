@@ -324,6 +324,48 @@ class ChangeRequestModal(discord.ui.Modal):
         )
 
 
+class ChangeRequestTemplateSelect(discord.ui.Select):
+    """Lets staff start a revision request from a ready-made template."""
+
+    def __init__(self, cog: ModerationCog, submission_id: int, review_message: discord.Message) -> None:
+        options = [
+            discord.SelectOption(label="تحسين العنوان والمحتوى", value="يرجى تحسين العنوان والمحتوى ليكونا أوضح، وإزالة التكرار أو المعلومات غير الضرورية.", emoji="✏️"),
+            discord.SelectOption(label="تصحيح الرابط أو الدعوة", value="يرجى تصحيح رابط الدعوة أو الموقع والتأكد من أنه عام ويعمل ولا يحتوي على انتهاء صلاحية.", emoji="🔗"),
+            discord.SelectOption(label="اختيار التصنيف الصحيح", value="يرجى مراجعة تصنيف الإعلان واختيار التصنيف الأنسب لمحتواه قبل إعادة الإرسال.", emoji="📌"),
+            discord.SelectOption(label="نص مخصص", value="CUSTOM", description="فتح نموذج كتابة ملاحظات يدوية", emoji="📝"),
+        ]
+        super().__init__(
+            placeholder="اختر قالب طلب تعديل جاهزًا...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.cog = cog
+        self.submission_id = submission_id
+        self.review_message = review_message
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if self.values[0] == "CUSTOM":
+            await interaction.response.send_modal(
+                ChangeRequestModal(self.cog, self.submission_id, self.review_message)
+            )
+            return
+
+        modal = ChangeRequestModal(
+            self.cog,
+            self.submission_id,
+            self.review_message,
+        )
+        modal.notes_input.default = self.values[0]
+        await interaction.response.send_modal(modal)
+
+
+class ChangeRequestTemplateView(discord.ui.View):
+    def __init__(self, cog: ModerationCog, submission_id: int, review_message: discord.Message) -> None:
+        super().__init__(timeout=180)
+        self.add_item(ChangeRequestTemplateSelect(cog, submission_id, review_message))
+
+
 class UserEditSubmissionView(discord.ui.View):
     """DM view sent to advertiser with an 'Edit Ad' button."""
 
@@ -524,7 +566,8 @@ class ModerationCog(commands.Cog, name="Moderation"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self.expiry_sweeper.start()
+        if not self.expiry_sweeper.is_running():
+            self.expiry_sweeper.start()
 
     def cog_unload(self) -> None:
         """Cancels background tasks on cog unload."""
@@ -558,26 +601,65 @@ class ModerationCog(commands.Cog, name="Moderation"):
         # Handle Advertiser Actions (Rating & User Editing) - No Staff Check
         # ---------------------------------------------------------
         if action == "rate":
-            stars = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 5
+            stars = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
             try:
+                if not 1 <= stars <= 5:
+                    await interaction.response.send_message("❌ قيمة التقييم غير صالحة.", ephemeral=True)
+                    return
+
+                await interaction.response.defer(ephemeral=True)
                 sub = await self.bot.db.get_submission(submission_id)
                 if not sub:
-                    await interaction.response.send_message("❌ لم يتم العثور على الإعلان.", ephemeral=True)
+                    await interaction.followup.send("❌ لم يتم العثور على الإعلان.", ephemeral=True)
+                    return
+
+                if interaction.user.id != sub.get("user_id"):
+                    await interaction.followup.send("⛔ هذا التقييم مخصص لصاحب الإعلان فقط.", ephemeral=True)
+                    return
+                if sub.get("status") != "APPROVED":
+                    await interaction.followup.send("ℹ️ يمكن تقييم المراجع بعد الموافقة على الإعلان فقط.", ephemeral=True)
                     return
 
                 reviewer_id = sub.get("reviewed_by")
                 guild_id = sub.get("guild_id") or (interaction.guild.id if interaction.guild else 0)
                 if not reviewer_id:
-                    await interaction.response.send_message("❌ لم يتم تسجيل المشرف الذي راجع الإعلان.", ephemeral=True)
+                    await interaction.followup.send("❌ لم يتم تسجيل المشرف الذي راجع الإعلان.", ephemeral=True)
                     return
 
-                await self.bot.db.save_review_rating(
-                    submission_id=submission_id,
-                    guild_id=guild_id,
-                    user_id=interaction.user.id,
-                    reviewer_id=reviewer_id,
-                    rating=stars,
-                )
+                if await self.bot.db.has_review_rating(submission_id):
+                    await interaction.followup.send("ℹ️ سبق أن قيّمت هذا الإعلان، شكرًا لك.", ephemeral=True)
+                    return
+
+                try:
+                    await self.bot.db.save_review_rating(
+                        submission_id=submission_id,
+                        guild_id=guild_id,
+                        user_id=interaction.user.id,
+                        reviewer_id=reviewer_id,
+                        rating=stars,
+                    )
+                except Exception:
+                    if await self.bot.db.has_review_rating(submission_id):
+                        await interaction.followup.send("ℹ️ سبق أن قيّمت هذا الإعلان، شكرًا لك.", ephemeral=True)
+                        return
+                    raise
+
+                try:
+                    reviewer_user = await self.bot.fetch_user(reviewer_id)
+                    rating_notice = discord.Embed(
+                        title="⭐ وصل تقييم جديد لمراجعتك",
+                        description=(
+                            f"حصلت على **{stars} من 5** "
+                            f"({'⭐' * stars}{'☆' * (5 - stars)})."
+                        ),
+                        color=discord.Color.gold(),
+                    )
+                    rating_notice.set_footer(text="AdSentry • هوية صاحب التقييم مخفية")
+                    await reviewer_user.send(embed=rating_notice)
+                except discord.Forbidden:
+                    logger.info("Could not send anonymous rating notification to reviewer %s (DMs closed).", reviewer_id)
+                except discord.HTTPException:
+                    logger.exception("Could not deliver anonymous rating notification to reviewer %s.", reviewer_id)
 
                 # Disable buttons in DM message
                 try:
@@ -586,13 +668,16 @@ class ModerationCog(commands.Cog, name="Moderation"):
                 except Exception:
                     pass
 
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"⭐ شكرًا لك! تم تسجيل تقييمك بنجاح ({stars}/5) للمشرف الذي راجع إعلانك.",
                     ephemeral=True,
                 )
             except Exception as e:
                 logger.error(f"Error handling rate interaction for #{submission_id}: {e}", exc_info=True)
-                await interaction.response.send_message("❌ حدث خطأ أثناء تسجيل تقييمك.", ephemeral=True)
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ حدث خطأ أثناء تسجيل تقييمك.", ephemeral=True)
+                else:
+                    await interaction.followup.send("❌ حدث خطأ أثناء تسجيل تقييمك.", ephemeral=True)
             return
 
         if action == "user_edit":
@@ -683,8 +768,12 @@ class ModerationCog(commands.Cog, name="Moderation"):
                     )
                     return
 
-                modal = ChangeRequestModal(self, submission_id, interaction.message)
-                await interaction.response.send_modal(modal)
+                view = ChangeRequestTemplateView(self, submission_id, interaction.message)
+                await interaction.response.send_message(
+                    "✏️ اختر قالبًا جاهزًا لطلب التعديل، أو اكتب ملاحظاتك بنفسك.",
+                    view=view,
+                    ephemeral=True,
+                )
 
             elif action == "reject":
                 # Present rejection reasons view (instant response, zero timeout risk)
@@ -791,6 +880,14 @@ class ModerationCog(commands.Cog, name="Moderation"):
                 submission_id=submission_id,
                 status="APPROVED",
                 reviewed_by=interaction.user.id,
+            )
+            await self.bot.db.log_moderation_action(
+                guild_id=guild_id or 0,
+                actor_id=interaction.user.id,
+                action="AD_APPROVED",
+                target_type="SUBMISSION",
+                target_id=submission_id,
+                details={"duration_key": duration_key, "channel_id": announcement_channel.id},
             )
             active_post = await self.bot.db.create_active_post(
                 submission_id=submission_id,
@@ -924,6 +1021,14 @@ class ModerationCog(commands.Cog, name="Moderation"):
                 reviewed_by=interaction.user.id,
                 rejection_reason=reason,
             )
+            await self.bot.db.log_moderation_action(
+                guild_id=submission.get("guild_id") or (interaction.guild.id if interaction.guild else 0),
+                actor_id=interaction.user.id,
+                action="AD_REJECTED",
+                target_type="SUBMISSION",
+                target_id=submission_id,
+                details={"reason": reason},
+            )
         except Exception as e:
             logger.error(f"Failed to update rejection in Supabase: {e}", exc_info=True)
 
@@ -1007,6 +1112,15 @@ class ModerationCog(commands.Cog, name="Moderation"):
             if not updated_sub:
                 await interaction.followup.send("⚠️ تم استنفاد الحد الأقصى لمحاولات التعديل لهذا الإعلان.", ephemeral=True)
                 return
+
+            await self.bot.db.log_moderation_action(
+                guild_id=submission.get("guild_id") or (interaction.guild.id if interaction.guild else 0),
+                actor_id=interaction.user.id,
+                action="AD_CHANGE_REQUESTED",
+                target_type="SUBMISSION",
+                target_id=submission_id,
+                details={"notes": notes[:500]},
+            )
 
             req_num = updated_sub.get("change_requests", 1)
             max_reqs = updated_sub.get("max_change_requests", 3)
@@ -1231,6 +1345,15 @@ class ModerationCog(commands.Cog, name="Moderation"):
         if clear_pending and has_pending:
             cancelled_count = await self.bot.db.cancel_pending_submissions(target.id)
 
+        await self.bot.db.log_moderation_action(
+            guild_id=interaction.guild.id if interaction.guild else 0,
+            actor_id=interaction.user.id,
+            action="COOLDOWN_RESET",
+            target_type="USER",
+            target_id=target.id,
+            details={"clear_pending": clear_pending, "cancelled_count": cancelled_count},
+        )
+
         embed = discord.Embed(
             title="🔄 تم تصفير وقت الانتظار | Cooldown Reset",
             description=(
@@ -1365,6 +1488,14 @@ class ModerationCog(commands.Cog, name="Moderation"):
 
             post = res.data[0]
             await self.bot.db.pin_ad(post_id=post["id"], staff_id=interaction.user.id, duration_hours=hours)
+            await self.bot.db.log_moderation_action(
+                guild_id=interaction.guild.id if interaction.guild else 0,
+                actor_id=interaction.user.id,
+                action="AD_PINNED",
+                target_type="POST",
+                target_id=post["id"],
+                details={"message_id": int(message_id), "hours": hours},
+            )
 
             # Try to Discord pin the message in channel
             channel = self.bot.get_channel(post["channel_id"])
@@ -1415,6 +1546,14 @@ class ModerationCog(commands.Cog, name="Moderation"):
 
             post = res.data[0]
             await self.bot.db.unpin_ad(post_id=post["id"])
+            await self.bot.db.log_moderation_action(
+                guild_id=interaction.guild.id if interaction.guild else 0,
+                actor_id=interaction.user.id,
+                action="AD_UNPINNED",
+                target_type="POST",
+                target_id=post["id"],
+                details={"message_id": int(message_id)},
+            )
 
             channel = self.bot.get_channel(post["channel_id"])
             if channel and isinstance(channel, discord.TextChannel):
@@ -1430,47 +1569,200 @@ class ModerationCog(commands.Cog, name="Moderation"):
             await interaction.followup.send(f"❌ حدث خطأ أثناء إلغاء التثبيت: `{e}`", ephemeral=True)
 
     # -------------------------------------------------------------
-    # 7. Reviewer Stats Command
+    # 7. Audit & Reply Template Commands
+    # -------------------------------------------------------------
+
+    @app_commands.command(
+        name="moderation-audit",
+        description="عرض آخر إجراءات المراجعة والإدارة في هذا السيرفر",
+    )
+    @app_commands.describe(limit="عدد السجلات المطلوب عرضها (من 1 إلى 100)")
+    async def moderation_audit(
+        self,
+        interaction: discord.Interaction,
+        limit: app_commands.Range[int, 1, 100] = 25,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("❌ هذا الأمر داخل السيرفرات فقط.", ephemeral=True)
+            return
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("❌ هذا الأمر مخصص للمشرفين فقط.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        rows = await self.bot.db.get_moderation_audit(interaction.guild.id, int(limit))
+        if not rows:
+            await interaction.followup.send("لا توجد إجراءات مسجلة بعد.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="🛡️ سجل تدقيق الإدارة",
+            description=f"آخر {len(rows)} إجراء في هذا السيرفر",
+            color=discord.Color.blurple(),
+        )
+        for row in rows[:10]:
+            created = str(row.get("created_at") or "")
+            try:
+                dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                stamp = f"<t:{int(dt.timestamp())}:f>"
+            except (TypeError, ValueError):
+                stamp = created[:19]
+            details = row.get("details") or {}
+            embed.add_field(
+                name=f"{row.get('action', 'ACTION')} · بواسطة <@{row.get('actor_id')}>",
+                value=f"{stamp}\nالهدف: `{row.get('target_type')}` #{row.get('target_id') or '-'}\nتفاصيل: `{str(details)[:220]}`",
+                inline=False,
+            )
+        embed.set_footer(text="AdSentry Moderation Audit")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    reply_template_group = app_commands.Group(
+        name="reply-template",
+        description="إدارة قوالب ردود المراجعة الجاهزة",
+        default_permissions=discord.Permissions(manage_messages=True),
+    )
+
+    @reply_template_group.command(name="save", description="حفظ قالب رد للموافقة أو الرفض أو طلب التعديل")
+    @app_commands.describe(
+        action_type="نوع القالب",
+        name="اسم مختصر للقالب",
+        content="نص القالب",
+    )
+    @app_commands.choices(action_type=[
+        app_commands.Choice(name="موافقة", value="APPROVE"),
+        app_commands.Choice(name="رفض", value="REJECT"),
+        app_commands.Choice(name="طلب تعديل", value="CHANGE_REQUEST"),
+    ])
+    async def save_reply_template(
+        self,
+        interaction: discord.Interaction,
+        action_type: app_commands.Choice[str],
+        name: str,
+        content: str,
+    ) -> None:
+        if not interaction.guild or not is_staff(interaction.user):
+            await interaction.response.send_message("❌ هذا الأمر مخصص للمشرفين فقط.", ephemeral=True)
+            return
+        if len(name.strip()) < 2 or len(content.strip()) < 5:
+            await interaction.response.send_message("❌ الاسم والنص قصيران جدًا.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        await self.bot.db.save_moderation_reply_template(
+            guild_id=interaction.guild.id,
+            created_by=interaction.user.id,
+            action_type=action_type.value,
+            name=name,
+            content=content,
+        )
+        await interaction.followup.send(f"✅ تم حفظ قالب الرد **{name.strip()}**.", ephemeral=True)
+
+    @reply_template_group.command(name="list", description="عرض قوالب الردود الجاهزة")
+    async def list_reply_templates(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not is_staff(interaction.user):
+            await interaction.response.send_message("❌ هذا الأمر مخصص للمشرفين فقط.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        rows = await self.bot.db.get_moderation_reply_templates(interaction.guild.id)
+        if not rows:
+            await interaction.followup.send("لا توجد قوالب مخصصة بعد.", ephemeral=True)
+            return
+        lines = [
+            f"**#{row['id']}** · `{row['action_type']}` · **{row['name']}**: {row['content'][:100]}"
+            for row in rows[:25]
+        ]
+        embed = discord.Embed(
+            title="📝 قوالب ردود الإدارة",
+            description="\n".join(lines),
+            color=discord.Color.gold(),
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @reply_template_group.command(name="delete", description="حذف قالب رد محفوظ")
+    async def delete_reply_template(self, interaction: discord.Interaction, template_id: int) -> None:
+        if not interaction.guild or not is_staff(interaction.user):
+            await interaction.response.send_message("❌ هذا الأمر مخصص للمشرفين فقط.", ephemeral=True)
+            return
+        deleted = await self.bot.db.delete_moderation_reply_template(interaction.guild.id, template_id)
+        await interaction.response.send_message(
+            "✅ تم حذف قالب الرد." if deleted else "❌ لم يتم العثور على قالب بهذا الرقم.",
+            ephemeral=True,
+        )
+
+    # -------------------------------------------------------------
+    # 8. Reviewer Stats Command
     # -------------------------------------------------------------
 
     @app_commands.command(
         name="reviewer-stats",
-        description="⭐ عرض إحصائيات وتقييمات المراجعين في السيرفر | View reviewer ratings & stats",
+        description="⭐ عرض توزيع تقييمات المراجعين (للإدارة فقط)",
     )
+    @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(
-        reviewer="المشرف المراد عرض تقييماته (اتركه فارغاً لعرض تقييماتك)",
+        reviewer="اختر مراجعًا لعرض إحصاءاته بالتفصيل، أو اتركه فارغًا لعرض الجميع",
     )
     async def reviewer_stats(
         self,
         interaction: discord.Interaction,
         reviewer: discord.Member | None = None,
     ) -> None:
-        """Shows reviewer rating stats."""
-        target = reviewer or interaction.user
+        """Shows anonymous rating distributions to server administrators."""
         if not interaction.guild:
             await interaction.response.send_message("❌ هذا الأمر داخل السيرفرات فقط.", ephemeral=True)
             return
+        member = interaction.user
+        if not is_admin(member) and not (
+            isinstance(member, discord.Member) and member.guild_permissions.manage_guild
+        ):
+            await interaction.response.send_message(
+                "⛔ هذه الإحصاءات متاحة لمالك السيرفر والمدراء فقط.",
+                ephemeral=True,
+            )
+            return
 
         await interaction.response.defer(ephemeral=True)
-        stats = await self.bot.db.get_reviewer_stats(target.id, interaction.guild.id)
-        avg = stats.get("avg_rating", 0.0)
-        cnt = stats.get("review_count", 0)
+        if reviewer:
+            summaries = [{
+                "reviewer_id": reviewer.id,
+                **await self.bot.db.get_reviewer_stats(reviewer.id, interaction.guild.id),
+            }]
+        else:
+            summaries = await self.bot.db.get_guild_reviewer_rating_stats(interaction.guild.id)
 
-        stars_visual = "⭐" * int(round(avg)) if avg > 0 else "لا توجد تقييمات بعد"
-        embed = discord.Embed(
-            title=f"⭐ تقييم المشرف: {target.display_name}",
-            description=(
-                f"👤 **المشرف:** {target.mention}\n\n"
-                f"📊 **متوسط التقييم:** `{avg}/5.0`\n"
-                f"✨ **النجوم:** {stars_visual}\n"
-                f"📝 **عدد التقييمات المستلمة:** `{cnt}` تقييم"
-            ),
-            color=discord.Color.gold(),
-        )
-        if target.display_avatar:
-            embed.set_thumbnail(url=target.display_avatar.url)
-        embed.set_footer(text="AdSentry Staff Quality System")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        if not summaries:
+            await interaction.followup.send("لا توجد تقييمات مسجلة في هذا السيرفر بعد.", ephemeral=True)
+            return
+
+        pages: list[discord.Embed] = []
+        page_count = (len(summaries) + 24) // 25
+        for page_index, start in enumerate(range(0, len(summaries), 25), start=1):
+            page = discord.Embed(
+                title="⭐ توزيع تقييمات المراجعين",
+                description=(
+                    f"السيرفر: **{interaction.guild.name}**"
+                    + (f" · الصفحة {page_index}/{page_count}" if page_count > 1 else "")
+                ),
+                color=discord.Color.gold(),
+            )
+            for summary in summaries[start:start + 25]:
+                reviewer_id = summary["reviewer_id"]
+                distribution = summary["rating_distribution"]
+                counts = " · ".join(
+                    f"{star}⭐ `{distribution.get(star, 0)}`"
+                    for star in range(5, 0, -1)
+                )
+                page.add_field(
+                    name=f"<@{reviewer_id}> — {summary['avg_rating']}/5 ({summary['review_count']} تقييم)",
+                    value=counts,
+                    inline=False,
+                )
+            page.set_footer(text="التقييمات مجهولة؛ الترتيب حسب عدد التقييمات • AdSentry")
+            pages.append(page)
+
+        for start in range(0, len(pages), 10):
+            await interaction.followup.send(
+                embeds=pages[start:start + 10],
+                ephemeral=True,
+            )
 
 
 async def setup(bot: commands.Bot) -> None:

@@ -38,6 +38,11 @@ Run `database/supabase_schema.sql` in the Supabase SQL Editor first. Then apply
 the migration files required by the features you plan to use. The EventHub and
 StaffFlow setup is described in [docs/eventhub-staffflow.md](docs/eventhub-staffflow.md);
 recruitment setup is described in [docs/recruitment.md](docs/recruitment.md).
+For moderation statistics, audit logs, and reusable reply templates, apply
+`database/moderation_experience_migration.sql`.
+For anonymous reviewer ratings and the `/reviewer-stats` command, also apply
+`database/enhancements_migration.sql`. Server owners and members with Manage
+Server can view per-reviewer star distributions; voter identities are not shown.
 The bot does not automatically apply database migrations.
 
 After configuring the database, start the bot:

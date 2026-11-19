@@ -531,7 +531,9 @@ class FeaturesCog(commands.Cog, name="Features"):
         rejected = stats["rejected_count"]
         total = stats["total_count"]
         pending = total - approved - rejected
-        approval_rate = round((approved / total * 100) if total > 0 else 0, 1)
+        approval_rate = stats.get("approval_rate", round((approved / total * 100) if total > 0 else 0, 1))
+        rejection_rate = stats.get("rejection_rate", round((rejected / total * 100) if total > 0 else 0, 1))
+        avg_review_minutes = stats.get("avg_review_minutes", 0.0)
 
         embed = discord.Embed(
             title=f"📊 إحصائيات الإعلانات | Ad Statistics — آخر {days} يوم",
@@ -544,7 +546,9 @@ class FeaturesCog(commands.Cog, name="Features"):
                 f"✅ **مقبولة / Approved:** `{approved}`\n"
                 f"❌ **مرفوضة / Rejected:** `{rejected}`\n"
                 f"⏳ **معلقة / Pending:** `{pending}`\n"
-                f"📊 **نسبة القبول / Approval Rate:** `{approval_rate}%`"
+                f"📊 **نسبة القبول / Approval Rate:** `{approval_rate}%`\n"
+                f"📉 **نسبة الرفض / Rejection Rate:** `{rejection_rate}%`\n"
+                f"⏱️ **متوسط زمن المراجعة / Avg. Review:** `{avg_review_minutes}` دقيقة"
             ),
             inline=False,
         )

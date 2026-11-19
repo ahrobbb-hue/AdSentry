@@ -2,6 +2,8 @@
 
 Run `database/eventhub_staffflow_migration.sql` and then `database/eventhub_advanced_migration.sql` in the Supabase SQL Editor before using the advanced EventHub features. Apply `database/eventhub_contest_slots_migration.sql` after them to strictly limit each server to five open events, assign separate participant roles, and support event editing/cancellation. Then apply `database/eventhub_event_duration_migration.sql`, `database/eventhub_manual_role_slots_migration.sql`, and `database/eventhub_registration_control_migration.sql` in order to add explicit end times, staff-selected participant roles, and separate registration state from event state. If the duration migration was already applied, rerun it to update the maximum duration to four weeks; it safely replaces its functions. The slot migration also closes any pre-existing overflow, keeping the five soonest upcoming events. The bot must use `SUPABASE_SERVICE_ROLE_KEY`; the tables have RLS enabled and expose no client-side policies. Configure the private staff review channel with `/ad-setup` before using StaffFlow requests.
 
+For manual, auditable prize draws, apply `database/eventhub_raffle_migration.sql` after the base EventHub migration. The draw uses the public drand randomness beacon; the selected channel must allow the bot to send embeds and attach files. If the beacon or its committed round is unavailable, the bot does not switch to a different source or round.
+
 Staff can use `/dashboard` and open the EventHub, StaffFlow, or dedicated Shifts page to use graphical buttons and forms for the core actions below. The shifts page shows the 10 nearest scheduled shifts and lets administrators schedule a new shift. The slash commands remain available as shortcuts.
 
 ## EventHub (`/event`)
@@ -20,6 +22,16 @@ Staff can use `/dashboard` and open the EventHub, StaffFlow, or dedicated Shifts
 - `/event attendance` records or corrects attendance for a registered member; staff only.
 - **إغلاق التسجيل** in the dashboard, the admin card, or `/event close event_id:<id>` only prevents new registrations. The event stays open, current participant roles remain, and it closes automatically at its configured end time; roles are removed then. Use the separate **إلغاء الفعالية** action to cancel an event before its end.
 - Existing events receive a one-time two-hour end time when the duration migration is applied. Reminders are sent automatically once when due.
+
+### Transparent manual raffle
+
+- `/event raffle create` creates a raffle and lets staff select the channel where the frozen entrant list and final proof will be published.
+- Staff add/remove eligible members with `/event raffle add` and `/event raffle remove`. Every change records the acting staff member in the raffle audit log. `/event raffle list` shows the current list and recent changes to staff.
+- `/event raffle lock` freezes the list in the database, computes its SHA-256 hash, commits to a specific future drand round, and publishes the full list plus the add/remove audit history as CSV files in the selected channel. No entrant changes are accepted after locking.
+- After that exact drand round is available, staff run `/event raffle draw`. The bot derives the winner(s) deterministically from the frozen list and beacon randomness, stores the result once, and publishes the winners plus the beacon proof. Re-running the command can only publish the same stored result, never draw again.
+- The proof uses compact UTF-8 JSON with entrants sorted by Discord user ID to hash the list. Each pick hashes the versioned domain, drand randomness, raffle ID, list hash, pick index, and nonce; rejection sampling avoids modulo bias, and a winner is removed before selecting the next.
+- Anyone in the server can use `/event raffle verify` to check the list hash, winner calculation, and that the published randomness/signature match the selected drand round. The signature and chain hash are included so the beacon proof can also be independently checked.
+- `/event raffle cancel` is available only while the list is still open. The wheel, if added as a visual effect later, must only animate the already determined result.
 
 Use a timezone offset in the ISO date, for example `2026-11-01T19:00+03:00`. A naive ISO date is interpreted as UTC.
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -10,6 +11,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -20,6 +22,123 @@ logger = logging.getLogger("AdSentry.EventHub")
 
 EVENT_ROLE_NAMES = ("Event", "Event 2", "Event 3", "Event 4", "Event 5")
 _EVENT_ROLE_LOCKS: dict[int, asyncio.Lock] = {}
+DRAND_API_BASE = "https://api.drand.sh"
+DRAND_DOMAIN = b"AdSentry-EventHub-Raffle-v1"
+
+
+def _raffle_entrants_hash(entrants: list[dict[str, Any]]) -> str:
+    canonical = [
+        {
+            "user_id": int(entrant["user_id"]),
+            "user_name": str(entrant["user_name"]),
+        }
+        for entrant in sorted(entrants, key=lambda row: int(row["user_id"]))
+    ]
+    payload = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _safe_raffle_csv_text(value: Any) -> str:
+    text = str(value or "")
+    if text.lstrip().startswith(("=", "+", "-", "@")):
+        return "'" + text
+    return text
+
+
+def _raffle_target_round(locked_at: str, info: dict[str, Any]) -> int:
+    locked = datetime.fromisoformat(locked_at.replace("Z", "+00:00"))
+    if locked.tzinfo is None:
+        locked = locked.replace(tzinfo=timezone.utc)
+    period = int(info["period"])
+    genesis_time = int(info["genesis_time"])
+    if period <= 0:
+        raise ValueError("Invalid drand period.")
+    return max(1, int((locked.timestamp() - genesis_time) // period) + 4)
+
+
+def _select_raffle_winners(
+    randomness: str,
+    raffle_id: int,
+    entrants: list[dict[str, Any]],
+    winner_count: int,
+    entrants_hash: str | None = None,
+) -> list[int]:
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", randomness):
+        raise ValueError("Invalid drand randomness value.")
+    if not entrants or not 1 <= winner_count <= len(entrants):
+        raise ValueError("Winner count must be between one and the entrant count.")
+
+    ordered = sorted(entrants, key=lambda row: int(row["user_id"]))
+    digest = entrants_hash or _raffle_entrants_hash(ordered)
+    random_bytes = bytes.fromhex(randomness)
+    selected: list[int] = []
+    remaining = [int(entrant["user_id"]) for entrant in ordered]
+    draw_index = 0
+
+    while len(selected) < winner_count:
+        candidate_count = len(remaining)
+        space = 1 << 256
+        acceptance_limit = space - (space % candidate_count)
+        nonce = 0
+        while True:
+            message = (
+                f"{raffle_id}|{digest}|{draw_index}|{nonce}".encode("ascii")
+            )
+            value = int.from_bytes(
+                hashlib.sha256(DRAND_DOMAIN + random_bytes + message).digest(),
+                "big",
+            )
+            if value < acceptance_limit:
+                break
+            nonce += 1
+
+        selected.append(remaining.pop(value % candidate_count))
+        draw_index += 1
+
+    return selected
+
+
+async def _fetch_drand_json(path: str) -> dict[str, Any]:
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(f"{DRAND_API_BASE}{path}") as response:
+            response.raise_for_status()
+            payload = await response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid response from the drand randomness beacon.")
+    return payload
+
+
+async def _fetch_drand_info() -> dict[str, Any]:
+    info = await _fetch_drand_json("/info")
+    chain_hash = str(info.get("hash") or "")
+    if (
+        not re.fullmatch(r"[0-9a-fA-F]{64}", chain_hash)
+        or int(info.get("period", 0)) <= 0
+        or int(info.get("genesis_time", 0)) <= 0
+    ):
+        raise ValueError("The drand chain returned invalid configuration.")
+    return info
+
+
+async def _fetch_drand_beacon(round_number: int) -> dict[str, Any]:
+    beacon = await _fetch_drand_json(f"/public/{round_number}")
+    randomness = str(beacon.get("randomness") or "")
+    signature = str(beacon.get("signature") or "")
+    if int(beacon.get("round", 0)) != round_number:
+        raise ValueError("The drand response did not match the committed round.")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", randomness):
+        raise ValueError("The drand round has no valid randomness value.")
+    if not re.fullmatch(r"[0-9a-fA-F]{64,512}", signature):
+        raise ValueError("The drand round has no valid signature.")
+    if hashlib.sha256(bytes.fromhex(signature)).hexdigest() != randomness.lower():
+        raise ValueError("The drand signature does not match its randomness.")
+    return beacon
 
 
 def _event_role_name(slot: int) -> str:
@@ -2048,12 +2167,16 @@ async def refresh_event_announcement(
 class EventHub(commands.GroupCog, group_name="event"):
     """AdSentry EventHub — complete events lifecycle management."""
 
+    raffle = app_commands.Group(name="raffle", description="إدارة مسابقات السحب الشفاف")
+
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self._participant_roles_synced = False
+        self._raffle_draw_locks: dict[int, asyncio.Lock] = {}
 
     async def cog_load(self) -> None:
-        self.reminder_sweeper.start()
+        if not self.reminder_sweeper.is_running():
+            self.reminder_sweeper.start()
         try:
             client = await self.bot.db.get_client()
             rows = (await client.table("events").select("id,registration_type,registration_open").eq("status", "OPEN").execute()).data or []
@@ -2375,6 +2498,604 @@ class EventHub(commands.GroupCog, group_name="event"):
         else:
             embed.add_field(name="الحالة", value="✅  لا يوجد إيقاف", inline=True)
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @raffle.command(name="create", description="إنشاء سحب وتحديد قناة نشر القائمة والنتيجة")
+    @app_commands.describe(
+        title="اسم المسابقة",
+        channel="القناة التي ستُنشر فيها القائمة وإثبات السحب والفائزون",
+        winner_count="عدد الفائزين من 1 إلى 20",
+    )
+    async def create_raffle(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        channel: discord.TextChannel,
+        winner_count: app_commands.Range[int, 1, 20] = 1,
+    ) -> None:
+        if not interaction.guild or not is_staff(interaction.user):
+            return await interaction.response.send_message("هذا الأمر مخصص للإدارة.", ephemeral=True)
+        if not title.strip() or len(title.strip()) > 100:
+            return await interaction.response.send_message("يجب أن يكون اسم المسابقة بين 1 و100 حرف.", ephemeral=True)
+        if channel.guild.id != interaction.guild.id:
+            return await interaction.response.send_message("اختر قناة من هذا السيرفر.", ephemeral=True)
+        bot_member = interaction.guild.me
+        if bot_member is None:
+            return await interaction.response.send_message("تعذر التحقق من صلاحيات البوت.", ephemeral=True)
+        permissions = channel.permissions_for(bot_member)
+        if not permissions.send_messages or not permissions.embed_links or not permissions.attach_files:
+            return await interaction.response.send_message(
+                "يحتاج البوت صلاحيات إرسال الرسائل والـEmbeds وإرفاق الملفات في القناة المحددة.",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            raffle = await self.bot.db.create_event_raffle(
+                guild_id=interaction.guild.id,
+                created_by=interaction.user.id,
+                title=title.strip(),
+                channel_id=channel.id,
+                winner_count=int(winner_count),
+            )
+        except Exception:
+            logger.exception("Could not create EventHub raffle for guild %s", interaction.guild.id)
+            return await interaction.followup.send(
+                "تعذر إنشاء السحب. تأكد من تطبيق `eventhub_raffle_migration.sql` ثم حاول مجددًا.",
+                ephemeral=True,
+            )
+
+        setup_embed = discord.Embed(
+            title=f"🎟️ مسابقة سحب جديدة #{raffle['id']} · {raffle['title']}",
+            description=(
+                f"عدد الفائزين: `{raffle['winner_count']}`\n"
+                "سيضيف المشرفون الأعضاء الذين تحققوا من استيفائهم للشروط. "
+                "بعدها تُنشر القائمة وسجل تغييراتها قبل اختيار الفائزين.\n"
+                "لن يمكن تعديل القائمة بعد تثبيتها، وسيستخدم السحب جولة عشوائية عامة قابلة للتحقق."
+            ),
+            color=discord.Color.blurple(),
+        )
+        setup_embed.set_footer(text="القائمة النهائية وإثبات النتيجة سينشران في هذه القناة")
+        try:
+            await channel.send(
+                embed=setup_embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.exception("Raffle %s was created but its announcement could not be posted", raffle["id"])
+            return await interaction.followup.send(
+                f"تم إنشاء السحب `#{raffle['id']}` لكن تعذر نشر إعلانه في {channel.mention}. "
+                "لم يُنشأ سحب آخر؛ تحقق من صلاحيات القناة.",
+                ephemeral=True,
+            )
+
+        await interaction.followup.send(
+            f"✅ تم إنشاء السحب **#{raffle['id']} · {raffle['title']}**.\n"
+            f"قناة إعلان القائمة والنتيجة: {channel.mention}\n"
+            f"عدد الفائزين: `{raffle['winner_count']}`\n"
+            f"أضف المؤهلين عبر `/event raffle add`، ثم استخدم `/event raffle lock` لتثبيت القائمة.",
+            ephemeral=True,
+        )
+
+    @raffle.command(name="add", description="إضافة عضو مؤهل إلى قائمة السحب")
+    @app_commands.describe(raffle_id="رقم السحب", member="العضو المؤهل")
+    async def add_raffle_entrant(
+        self,
+        interaction: discord.Interaction,
+        raffle_id: int,
+        member: discord.Member,
+    ) -> None:
+        if not interaction.guild or not is_staff(interaction.user):
+            return await interaction.response.send_message("هذا الأمر مخصص للإدارة.", ephemeral=True)
+        if member.bot:
+            return await interaction.response.send_message("لا يمكن إضافة حساب بوت إلى السحب.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await self.bot.db.manage_event_raffle_entry(
+                raffle_id=raffle_id,
+                guild_id=interaction.guild.id,
+                actor_id=interaction.user.id,
+                user_id=member.id,
+                user_name=member.display_name,
+                action="ADD",
+            )
+        except Exception:
+            logger.exception("Could not add entrant %s to raffle %s", member.id, raffle_id)
+            return await interaction.followup.send(
+                "لم تتم الإضافة. تأكد من رقم السحب وأنه ما زال مفتوحًا، "
+                "وتحقق من أن العضو غير مضاف مسبقًا.",
+                ephemeral=True,
+            )
+        await interaction.followup.send(
+            f"✅ تمت إضافة {member.mention} إلى السحب `#{raffle_id}`. سجل البوت المشرف الذي أضافه.",
+            ephemeral=True,
+        )
+
+    @raffle.command(name="remove", description="إزالة عضو من سحب مفتوح مع تسجيل السبب")
+    @app_commands.describe(raffle_id="رقم السحب", member="العضو المراد إزالته", reason="سبب الإزالة")
+    async def remove_raffle_entrant(
+        self,
+        interaction: discord.Interaction,
+        raffle_id: int,
+        member: discord.Member,
+        reason: str = "لم يعد مستوفيًا للشروط",
+    ) -> None:
+        if not interaction.guild or not is_staff(interaction.user):
+            return await interaction.response.send_message("هذا الأمر مخصص للإدارة.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await self.bot.db.manage_event_raffle_entry(
+                raffle_id=raffle_id,
+                guild_id=interaction.guild.id,
+                actor_id=interaction.user.id,
+                user_id=member.id,
+                user_name=member.display_name,
+                action="REMOVE",
+                reason=reason,
+            )
+        except Exception:
+            logger.exception("Could not remove entrant %s from raffle %s", member.id, raffle_id)
+            return await interaction.followup.send(
+                "لم تتم الإزالة. تأكد أن السحب مفتوح وأن العضو موجود في قائمته.",
+                ephemeral=True,
+            )
+        await interaction.followup.send(
+            f"✅ تمت إزالة {member.mention} من السحب `#{raffle_id}` وتسجيل السبب في سجل التدقيق.",
+            ephemeral=True,
+        )
+
+    @raffle.command(name="list", description="عرض قائمة المؤهلين وسجل تغييرات الإدارة")
+    @app_commands.describe(raffle_id="رقم السحب")
+    async def list_raffle_entrants(
+        self,
+        interaction: discord.Interaction,
+        raffle_id: int,
+    ) -> None:
+        if not interaction.guild or not is_staff(interaction.user):
+            return await interaction.response.send_message("هذا الأمر مخصص للإدارة.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            raffle = await self.bot.db.get_event_raffle(raffle_id, interaction.guild.id)
+            if not raffle:
+                return await interaction.followup.send("لم يتم العثور على هذا السحب في السيرفر.", ephemeral=True)
+            entrants, entrant_count = await self.bot.db.get_event_raffle_entries(
+                raffle_id,
+                interaction.guild.id,
+            )
+            audit = await self.bot.db.get_event_raffle_audit(raffle_id, interaction.guild.id)
+        except Exception:
+            logger.exception("Could not list raffle %s", raffle_id)
+            return await interaction.followup.send("تعذر تحميل بيانات السحب وسجل التدقيق.", ephemeral=True)
+
+        embed = discord.Embed(
+            title=f"📋 المؤهلون للسحب #{raffle_id} · {raffle['title']}",
+            description=f"الحالة: `{raffle['status']}` · عدد المؤهلين الحالي: `{entrant_count}`",
+            color=discord.Color.blurple(),
+        )
+        if entrants:
+            lines = [
+                f"`{index}.` <@{row['user_id']}> · أضافه <@{row['added_by']}>"
+                for index, row in enumerate(entrants[:25], start=1)
+            ]
+            embed.add_field(name="قائمة المشاركين", value="\n".join(lines), inline=False)
+        else:
+            embed.add_field(name="قائمة المشاركين", value="لا يوجد مشاركون حاليًا.", inline=False)
+
+        audit_lines = [
+            f"`{row['action']}` بواسطة <@{row['actor_id']}>"
+            + (f" · العضو <@{row['target_user_id']}>" if row.get("target_user_id") else "")
+            for row in audit[-10:]
+        ]
+        if audit_lines:
+            embed.add_field(name="آخر إجراءات الإدارة", value="\n".join(audit_lines), inline=False)
+        if entrant_count > 25:
+            embed.set_footer(text="يعرض الأمر أول 25 مشاركًا فقط؛ القائمة الكاملة ستُنشر عند تثبيت السحب.")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @raffle.command(name="lock", description="تثبيت قائمة المؤهلين ونشر بصمتها قبل السحب")
+    @app_commands.describe(raffle_id="رقم السحب")
+    async def lock_raffle(
+        self,
+        interaction: discord.Interaction,
+        raffle_id: int,
+    ) -> None:
+        if not interaction.guild or not is_staff(interaction.user):
+            return await interaction.response.send_message("هذا الأمر مخصص للإدارة.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            raffle = await self.bot.db.lock_event_raffle(
+                raffle_id,
+                interaction.guild.id,
+                interaction.user.id,
+            )
+            if raffle.get("status") == "DRAWN":
+                return await interaction.followup.send("هذا السحب انتهى بالفعل.", ephemeral=True)
+
+            entrants = raffle.get("entrants_snapshot") or []
+            if not raffle.get("entrants_hash"):
+                info = await _fetch_drand_info()
+                entrants_hash = _raffle_entrants_hash(entrants)
+                target_round = max(
+                    _raffle_target_round(raffle["locked_at"], info),
+                    _raffle_target_round(datetime.now(timezone.utc).isoformat(), info),
+                )
+                raffle = await self.bot.db.prepare_event_raffle_beacon(
+                    raffle_id=raffle_id,
+                    guild_id=interaction.guild.id,
+                    actor_id=interaction.user.id,
+                    entrants_hash=entrants_hash,
+                    chain_hash=str(info["hash"]).lower(),
+                    target_round=target_round,
+                )
+
+            channel = self.bot.get_channel(int(raffle["channel_id"]))
+            if not isinstance(channel, discord.TextChannel):
+                channel = await self.bot.fetch_channel(int(raffle["channel_id"]))
+            if not isinstance(channel, discord.TextChannel):
+                raise RuntimeError("The configured raffle channel is unavailable.")
+
+            if raffle.get("lock_message_id"):
+                return await interaction.followup.send(
+                    f"🔒 القائمة مثبتة ومنشورة مسبقًا في {channel.mention}. "
+                    f"موعد العشوائية العام: drand round `{raffle['beacon_target_round']}`.",
+                    ephemeral=True,
+                )
+
+            manifest_buffer = io.StringIO(newline="")
+            writer = csv.writer(manifest_buffer)
+            writer.writerow(("discord_user_id", "username"))
+            for entrant in entrants:
+                writer.writerow((entrant["user_id"], _safe_raffle_csv_text(entrant["user_name"])))
+
+            audit_rows = await self.bot.db.get_event_raffle_audit(
+                raffle_id,
+                interaction.guild.id,
+            )
+            audit_buffer = io.StringIO(newline="")
+            audit_writer = csv.writer(audit_buffer)
+            audit_writer.writerow(("timestamp_utc", "action", "actor_id", "target_user_id", "details"))
+            for row in audit_rows:
+                details = row.get("details") or {}
+                audit_writer.writerow((
+                    row.get("created_at", ""),
+                    row.get("action", ""),
+                    row.get("actor_id", ""),
+                    row.get("target_user_id") or "",
+                    json.dumps(details, ensure_ascii=False, sort_keys=True),
+                ))
+            manifest_files = [
+                discord.File(
+                    io.BytesIO(manifest_buffer.getvalue().encode("utf-8-sig")),
+                    filename=f"raffle-{raffle_id}-entrants.csv",
+                ),
+                discord.File(
+                    io.BytesIO(audit_buffer.getvalue().encode("utf-8-sig")),
+                    filename=f"raffle-{raffle_id}-audit.csv",
+                ),
+            ]
+            lock_embed = discord.Embed(
+                title=f"🔒 تثبيت قائمة السحب #{raffle_id} · {raffle['title']}",
+                description=(
+                    f"تم إغلاق القائمة نهائيًا. لا يمكن إضافة أعضاء أو حذفهم بعد هذه اللحظة.\n"
+                    f"**المؤهلون:** `{len(entrants)}` · **الفائزون:** `{raffle['winner_count']}`\n"
+                    f"**بصمة القائمة SHA-256:**\n`{raffle['entrants_hash']}`\n"
+                    f"**مصدر العشوائية:** drand · chain `{raffle['beacon_chain_hash']}`\n"
+                    f"**الجولة المحددة مسبقًا:** `{raffle['beacon_target_round']}`\n\n"
+                    "قائمة المشاركين وسجل الإضافة/الإزالة مع أسماء المشرفين مرفقان. "
+                    "بعد ظهور الجولة المحددة فقط يمكن تنفيذ السحب."
+                ),
+                color=discord.Color.gold(),
+            )
+            lock_embed.set_footer(text="القائمة مجمدة قبل صدور العشوائية العامة")
+            message = await channel.send(
+                embed=lock_embed,
+                files=manifest_files,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            await self.bot.db.set_event_raffle_lock_message(
+                raffle_id,
+                interaction.guild.id,
+                message.id,
+            )
+            await interaction.followup.send(
+                f"✅ تم تثبيت القائمة ونشرها في {channel.mention}.\n"
+                f"استخدم `/event raffle draw raffle_id:{raffle_id}` بعد صدور drand round "
+                f"`{raffle['beacon_target_round']}`.",
+                ephemeral=True,
+            )
+        except Exception:
+            logger.exception("Could not lock or publish entrant manifest for raffle %s", raffle_id)
+            await interaction.followup.send(
+                "تعذر تثبيت القائمة أو نشر إثباتها. لم يُنفذ أي سحب؛ "
+                "يمكن إعادة `/event raffle lock` وسيحافظ على القائمة المقفلة نفسها.",
+                ephemeral=True,
+            )
+
+    async def _publish_raffle_result(
+        self,
+        interaction: discord.Interaction,
+        raffle: dict[str, Any],
+    ) -> None:
+        if raffle.get("result_message_id"):
+            await interaction.followup.send(
+                f"تم نشر نتيجة السحب مسبقًا: <#{raffle['channel_id']}>.",
+                ephemeral=True,
+            )
+            return
+
+        channel = self.bot.get_channel(int(raffle["channel_id"]))
+        if not isinstance(channel, discord.TextChannel):
+            channel = await self.bot.fetch_channel(int(raffle["channel_id"]))
+        if not isinstance(channel, discord.TextChannel):
+            raise RuntimeError("The configured raffle channel is unavailable.")
+
+        winners = [int(user_id) for user_id in (raffle.get("winner_ids") or [])]
+        winner_text = "\n".join(
+            f"🏆 **الفائز {index}:** <@{user_id}>"
+            for index, user_id in enumerate(winners, start=1)
+        )
+        entrants = raffle.get("entrants_snapshot") or []
+        proof_text = (
+            "Algorithm version: AdSentry-EventHub-Raffle-v1\n"
+            "Entrant canonicalization: UTF-8 compact JSON array sorted by user_id; object keys sorted.\n"
+            "Selection: SHA-256(domain || randomness_bytes || "
+            "raffle_id|entrants_hash|draw_index|nonce), unsigned big-endian, "
+            "with rejection sampling; remove each selected winner before the next pick.\n"
+            "domain: AdSentry-EventHub-Raffle-v1\n"
+            f"Raffle ID: {raffle['id']}\n"
+            f"Entrants SHA-256: {raffle['entrants_hash']}\n"
+            f"drand chain hash: {raffle['beacon_chain_hash']}\n"
+            f"drand round: {raffle['beacon_target_round']}\n"
+            f"drand randomness: {raffle['beacon_randomness']}\n"
+            f"drand signature: {raffle['beacon_signature']}\n"
+            f"Winners: {', '.join(map(str, winners))}\n"
+        )
+        embed = discord.Embed(
+            title=f"🎉 نتيجة السحب #{raffle['id']} · {raffle['title']}",
+            description=(
+                f"{winner_text}\n\n"
+                f"**عدد المؤهلين:** `{len(entrants)}`\n"
+                f"**بصمة قائمة المؤهلين:** `{raffle['entrants_hash']}`\n"
+                f"**drand round:** [`{raffle['beacon_target_round']}`]"
+                f"(https://api.drand.sh/public/{raffle['beacon_target_round']})\n"
+                f"**العشوائية العامة:** `{raffle['beacon_randomness']}`\n"
+                f"**توقيع الجولة:** `{raffle['beacon_signature']}`\n\n"
+                "تحقق من النتيجة عبر `/event raffle verify`؛ العجلة إن عُرضت لاحقًا ستكون أنيميشن فقط."
+            ),
+            color=discord.Color.green(),
+        )
+        embed.set_footer(text="السحب حُسم من قائمة مجمدة وجولة drand عامة محددة قبل صدورها")
+        proof_file = discord.File(
+            io.BytesIO(proof_text.encode("utf-8")),
+            filename=f"raffle-{raffle['id']}-proof.txt",
+        )
+        result_message = await channel.send(
+            content=" ".join(f"<@{user_id}>" for user_id in winners),
+            embed=embed,
+            file=proof_file,
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+        await self.bot.db.set_event_raffle_result_message(
+            int(raffle["id"]),
+            int(raffle["guild_id"]),
+            result_message.id,
+        )
+        await interaction.followup.send(
+            f"✅ تم نشر النتيجة وإثباتها في {channel.mention}.",
+            ephemeral=True,
+        )
+
+    @raffle.command(name="draw", description="تنفيذ السحب من جولة عشوائية عامة محددة مسبقًا")
+    @app_commands.describe(raffle_id="رقم السحب المقفل")
+    async def draw_raffle(
+        self,
+        interaction: discord.Interaction,
+        raffle_id: int,
+    ) -> None:
+        if not interaction.guild or not is_staff(interaction.user):
+            return await interaction.response.send_message("هذا الأمر مخصص للإدارة.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        lock = self._raffle_draw_locks.setdefault(raffle_id, asyncio.Lock())
+        async with lock:
+            try:
+                raffle = await self.bot.db.get_event_raffle(raffle_id, interaction.guild.id)
+                if not raffle:
+                    return await interaction.followup.send("لم يتم العثور على هذا السحب.", ephemeral=True)
+                if raffle.get("status") == "DRAWN":
+                    return await self._publish_raffle_result(interaction, raffle)
+                if raffle.get("status") != "LOCKED":
+                    return await interaction.followup.send(
+                        "يجب تثبيت القائمة أولًا باستخدام `/event raffle lock`.",
+                        ephemeral=True,
+                    )
+                if not raffle.get("lock_message_id"):
+                    return await interaction.followup.send(
+                        "لم يُنشر إثبات القائمة بعد. أعد تشغيل `/event raffle lock` أولًا.",
+                        ephemeral=True,
+                    )
+
+                info = await _fetch_drand_info()
+                if str(info["hash"]).lower() != str(raffle["beacon_chain_hash"]).lower():
+                    return await interaction.followup.send(
+                        "تعذر التحقق من سلسلة drand المثبتة. لم يتغير السحب ويمكن إعادة المحاولة لاحقًا.",
+                        ephemeral=True,
+                    )
+                beacon = await _fetch_drand_beacon(int(raffle["beacon_target_round"]))
+                if int(beacon.get("round", 0)) != int(raffle["beacon_target_round"]):
+                    return await interaction.followup.send(
+                        "جولة العشوائية المحددة لم تصدر بعد. أعد الأمر لاحقًا؛ لن يتم اختيار جولة بديلة.",
+                        ephemeral=True,
+                    )
+                randomness = str(beacon.get("randomness") or "")
+                signature = str(beacon.get("signature") or "")
+                if not re.fullmatch(r"[0-9a-fA-F]{64}", randomness) or not re.fullmatch(r"[0-9a-fA-F]{64,512}", signature):
+                    return await interaction.followup.send(
+                        "رد مصدر العشوائية غير صالح. لم يتم تنفيذ السحب.",
+                        ephemeral=True,
+                    )
+                entrants = raffle.get("entrants_snapshot") or []
+                entrants_hash = _raffle_entrants_hash(entrants)
+                if entrants_hash != raffle.get("entrants_hash"):
+                    return await interaction.followup.send(
+                        "بصمة قائمة المشاركين لا تطابق القائمة المقفلة. تم إيقاف السحب لحماية نزاهته.",
+                        ephemeral=True,
+                    )
+                winner_ids = _select_raffle_winners(
+                    randomness=randomness,
+                    raffle_id=raffle_id,
+                    entrants=entrants,
+                    winner_count=int(raffle["winner_count"]),
+                    entrants_hash=entrants_hash,
+                )
+                result = await self.bot.db.record_event_raffle_result(
+                    raffle_id=raffle_id,
+                    guild_id=interaction.guild.id,
+                    actor_id=interaction.user.id,
+                    winner_ids=winner_ids,
+                    entrants_hash=entrants_hash,
+                    chain_hash=str(raffle["beacon_chain_hash"]),
+                    round_number=int(raffle["beacon_target_round"]),
+                    randomness=randomness.lower(),
+                    signature=signature.lower(),
+                )
+                raffle = result.get("raffle") or {}
+                if not raffle:
+                    raise RuntimeError("Database did not return the recorded raffle result.")
+                await self._publish_raffle_result(interaction, raffle)
+            except aiohttp.ClientResponseError as error:
+                if error.status == 404:
+                    await interaction.followup.send(
+                        "جولة drand المحددة لم تصدر بعد. أعد الأمر لاحقًا؛ لن يتم اختيار جولة بديلة.",
+                        ephemeral=True,
+                    )
+                else:
+                    logger.exception("drand request failed for raffle %s", raffle_id)
+                    await interaction.followup.send(
+                        "تعذر الوصول إلى مصدر العشوائية. لم يتم تنفيذ السحب؛ أعد المحاولة لاحقًا.",
+                        ephemeral=True,
+                    )
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                logger.exception("Could not obtain or validate drand proof for raffle %s", raffle_id)
+                await interaction.followup.send(
+                    "تعذر التحقق من مصدر العشوائية. لم يتم تنفيذ السحب؛ أعد المحاولة لاحقًا.",
+                    ephemeral=True,
+                )
+            except Exception:
+                logger.exception("Could not draw or publish raffle %s", raffle_id)
+                await interaction.followup.send(
+                    "تعذر إكمال السحب أو نشره. إذا حُفظت النتيجة، فإن إعادة الأمر تنشر النتيجة نفسها ولا تعيد السحب.",
+                    ephemeral=True,
+                )
+
+    @raffle.command(name="verify", description="التحقق من أن النتيجة تطابق القائمة وجولة drand")
+    @app_commands.describe(raffle_id="رقم السحب")
+    async def verify_raffle(
+        self,
+        interaction: discord.Interaction,
+        raffle_id: int,
+    ) -> None:
+        if not interaction.guild:
+            return await interaction.response.send_message("استخدم الأمر داخل السيرفر.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            raffle = await self.bot.db.get_event_raffle(raffle_id, interaction.guild.id)
+            if not raffle:
+                return await interaction.followup.send("لم يتم العثور على هذا السحب.", ephemeral=True)
+            if raffle.get("status") != "DRAWN":
+                return await interaction.followup.send("لم يتم تنفيذ هذا السحب بعد.", ephemeral=True)
+
+            entrants = raffle.get("entrants_snapshot") or []
+            hash_matches = _raffle_entrants_hash(entrants) == raffle.get("entrants_hash")
+            calculated_winners = _select_raffle_winners(
+                randomness=str(raffle["beacon_randomness"]),
+                raffle_id=raffle_id,
+                entrants=entrants,
+                winner_count=int(raffle["winner_count"]),
+                entrants_hash=str(raffle["entrants_hash"]),
+            )
+            stored_winners = [int(user_id) for user_id in (raffle.get("winner_ids") or [])]
+            calculation_matches = calculated_winners == stored_winners
+
+            beacon_matches = False
+            try:
+                info = await _fetch_drand_info()
+                beacon = await _fetch_drand_beacon(int(raffle["beacon_target_round"]))
+                beacon_matches = (
+                    str(info.get("hash", "")).lower() == str(raffle["beacon_chain_hash"]).lower()
+                    and int(beacon.get("round", 0)) == int(raffle["beacon_target_round"])
+                    and str(beacon.get("randomness", "")).lower() == str(raffle["beacon_randomness"]).lower()
+                    and str(beacon.get("signature", "")).lower() == str(raffle["beacon_signature"]).lower()
+                )
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError):
+                logger.warning("Could not verify raffle %s against live drand endpoint", raffle_id)
+
+            valid = hash_matches and calculation_matches and beacon_matches
+            embed = discord.Embed(
+                title="🔍 نتيجة التحقق من السحب",
+                description=(
+                    f"قائمة المشاركين: {'✅ مطابقة' if hash_matches else '❌ غير مطابقة'}\n"
+                    f"حساب الفائزين: {'✅ مطابق' if calculation_matches else '❌ غير مطابق'}\n"
+                    f"مصدر drand: {'✅ مطابق' if beacon_matches else '⚠️ تعذر التحقق المباشر'}\n\n"
+                    f"**الحالة:** {'✅ الإثبات سليم' if valid else '⚠️ الإثبات غير مكتمل أو غير مطابق'}"
+                ),
+                color=discord.Color.green() if valid else discord.Color.orange(),
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except (KeyError, TypeError, ValueError):
+            logger.exception("Invalid stored proof for raffle %s", raffle_id)
+            await interaction.followup.send(
+                "تعذر التحقق بسبب نقص أو خلل في بيانات الإثبات.",
+                ephemeral=True,
+            )
+
+    @raffle.command(name="cancel", description="إلغاء سحب مفتوح قبل تثبيت قائمة المؤهلين")
+    @app_commands.describe(raffle_id="رقم السحب", reason="سبب الإلغاء")
+    async def cancel_raffle(
+        self,
+        interaction: discord.Interaction,
+        raffle_id: int,
+        reason: str = "إلغاء إداري",
+    ) -> None:
+        if not interaction.guild or not is_staff(interaction.user):
+            return await interaction.response.send_message("هذا الأمر مخصص للإدارة.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            raffle = await self.bot.db.cancel_event_raffle(
+                raffle_id,
+                interaction.guild.id,
+                interaction.user.id,
+                reason,
+            )
+        except Exception:
+            logger.exception("Could not cancel raffle %s", raffle_id)
+            return await interaction.followup.send(
+                "لا يمكن إلغاء هذا السحب؛ الإلغاء مسموح فقط قبل تثبيت القائمة.",
+                ephemeral=True,
+            )
+        try:
+            channel = self.bot.get_channel(int(raffle["channel_id"]))
+            if not isinstance(channel, discord.TextChannel):
+                channel = await self.bot.fetch_channel(int(raffle["channel_id"]))
+            if isinstance(channel, discord.TextChannel):
+                await channel.send(
+                    embed=discord.Embed(
+                        title=f"🚫 تم إلغاء السحب #{raffle_id} · {raffle['title']}",
+                        description=f"بواسطة {interaction.user.mention}\nالسبب: {reason[:300]}",
+                        color=discord.Color.red(),
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+        except discord.HTTPException:
+            logger.exception("Raffle %s was cancelled but its announcement could not be posted", raffle_id)
+            return await interaction.followup.send(
+                f"تم إلغاء السحب `#{raffle_id}` وتسجيل الإجراء، لكن تعذر نشر إشعار الإلغاء.",
+                ephemeral=True,
+            )
+        await interaction.followup.send(
+            f"تم إلغاء السحب `#{raffle_id}` وتسجيل السبب.",
+            ephemeral=True,
+        )
 
 
 async def setup(bot: commands.Bot) -> None:

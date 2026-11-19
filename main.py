@@ -19,7 +19,7 @@ from utils import setup_logger
 logger = setup_logger("AdSentry", level=Config.LOG_LEVEL)
 
 
-async def start_health_check_server() -> web.AppRunner | None:
+async def start_health_check_server(bot: "AdSentryBot") -> web.AppRunner | None:
     """Starts an asynchronous HTTP server to satisfy Render Web Service port checks."""
     port_str = os.getenv("PORT")
     if not port_str:
@@ -28,8 +28,14 @@ async def start_health_check_server() -> web.AppRunner | None:
     try:
         port = int(port_str)
         app = web.Application()
-        app.router.add_get("/", lambda r: web.Response(text="AdSentry Bot is Online and Healthy!"))
-        app.router.add_get("/health", lambda r: web.Response(text="OK"))
+
+        async def health(request: web.Request) -> web.Response:
+            if not bot.database_ready:
+                return web.Response(text="Database unavailable", status=503)
+            return web.Response(text="OK")
+
+        app.router.add_get("/", health)
+        app.router.add_get("/health", health)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", port)
@@ -68,6 +74,7 @@ class AdSentryBot(commands.Bot):
 
         self.db = SupabaseDatabase()
         self.health_check_runner: web.AppRunner | None = None
+        self.database_ready = False
 
     async def setup_hook(self) -> None:
         """Executes asynchronous setup before the bot connects to Discord gateway."""
@@ -78,11 +85,13 @@ class AdSentryBot(commands.Bot):
         try:
             await self.db.connect()
             database_ready = await self.db.check_connection()
+            self.database_ready = database_ready
             if database_ready:
                 logger.info("Supabase database handler initialized.")
             else:
                 logger.warning("Supabase is unreachable; database-backed features may be unavailable.")
         except Exception as e:
+            self.database_ready = False
             logger.warning(f"Notice during Supabase initialization: {e}")
 
         # 2. Dynamic Cog / Extension Loading
@@ -124,7 +133,7 @@ class AdSentryBot(commands.Bot):
             logger.info(f"Synced {len(synced)} global slash command(s).")
 
         # 5. Start Render Web Service Health-Check Server (if PORT is set)
-        self.health_check_runner = await start_health_check_server()
+        self.health_check_runner = await start_health_check_server(self)
 
     async def on_ready(self) -> None:
         """Triggered when the bot is connected and ready."""
@@ -169,9 +178,8 @@ async def main() -> None:
     if missing_configs:
         for err in missing_configs:
             logger.warning(f"Config Warning: {err}")
-        if not Config.DISCORD_TOKEN:
-            logger.error("Cannot launch bot: DISCORD_TOKEN is missing. Please populate .env file.")
-            return
+        logger.error("Cannot launch bot: required environment configuration is missing.")
+        return
 
     bot = AdSentryBot()
     async with bot:
