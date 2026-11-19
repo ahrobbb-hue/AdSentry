@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from datetime import datetime, timedelta, timezone
@@ -7,6 +9,7 @@ from cogs.eventhub import (
     _available_event_role_slots,
     _event_end_datetime,
     _event_embed,
+    _format_capacity_count,
     _parse_event_duration,
     _event_role_name,
     _parse_event_datetime,
@@ -112,6 +115,36 @@ def test_event_embed_marks_registration_closed_without_closing_event() -> None:
     registration_field = next(field for field in embed.fields if field.name == "📝  التسجيل")
     assert "مغلق" in registration_field.value
     assert "الفعالية مستمرة" in registration_field.value
+
+
+def test_zero_capacity_is_displayed_as_unlimited_without_remaining_count() -> None:
+    embed = _event_embed({
+        "id": 43,
+        "title": "Unlimited",
+        "description": "Open event",
+        "starts_at": datetime(2027, 1, 15, 17, 30, tzinfo=timezone.utc),
+        "status": "OPEN",
+        "capacity": 0,
+    }, registered=250)
+
+    seats_field = next(field for field in embed.fields if field.name == "🎟️  المقاعد")
+    assert "250/∞" in seats_field.value
+    assert "غير محدودة" in seats_field.value
+    assert "متبقي" not in seats_field.value
+    assert _format_capacity_count(250, 0) == "`250/∞` · مقاعد غير محدودة"
+
+
+def test_unlimited_capacity_migration_removes_capacity_guards_from_registration() -> None:
+    migration = (
+        Path(__file__).parent.parent
+        / "database"
+        / "eventhub_unlimited_capacity_migration.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "CHECK (capacity BETWEEN 0 AND 500)" in migration
+    assert "IF v_event.capacity <> 0 AND v_count >= v_event.capacity THEN" in migration
+    assert "IF v_event.capacity = 0 OR v_count < v_event.capacity THEN" in migration
+    assert "IF p_capacity <> 0 AND p_capacity < v_registered THEN" in migration
 
 
 @pytest.mark.parametrize("value", ["0m", "5w", "tomorrow", ""])

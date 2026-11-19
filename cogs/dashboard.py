@@ -22,6 +22,7 @@ from cogs.eventhub import (
     EventEditModal,
     RegisterView,
     _event_end_datetime,
+    _format_capacity_count,
     _format_event_duration,
     _parse_event_duration,
     build_event_embed,
@@ -460,12 +461,13 @@ class EventDateTimePickerView(discord.ui.View):
         end_ts = int(self.get_end_datetime().timestamp())
         role_name = EVENT_ROLE_NAMES[self.selected_role_slot - 1] if self.selected_role_slot else "لم يتم اختيارها بعد"
         admin_info = f" · إشعارات الإدارة: {self.admin_channel.mention}" if self.admin_channel else ""
+        seat_limit = f"{self.capacity} مقعد" if self.capacity else "مقاعد غير محدودة ♾️"
         return (
             f"🎪 **تحديد موعد الفعالية: {self.title}**\n\n"
             f"📅 **البداية:** <t:{ts}:F> (<t:{ts}:R>)\n"
             f"🕒 **النهاية:** <t:{end_ts}:F> · المدة `{_format_event_duration(self.duration)}`\n"
             f"🏷️ **رتبة المشاركين:** `{role_name}`\n"
-            f"👥 **المقاعد:** `{self.capacity}`  ·  🔔 **التذكير:** قبل `{self.reminder_hours}` ساعة\n"
+            f"👥 **المقاعد:** `{seat_limit}`  ·  🔔 **التذكير:** قبل `{self.reminder_hours}` ساعة\n"
             f"📢 **قناة الفعالية:** {self.event_channel.mention}{admin_info}\n\n"
             "👇 **حدد التاريخ والساعة المناسبة من القوائم أدناه، ثم اضغط على زر التأكيد:**"
         )
@@ -639,7 +641,12 @@ class EventDateTimePickerView(discord.ui.View):
 class EventCreateModal(discord.ui.Modal, title="إنشاء فعالية"):
     title_input = discord.ui.TextInput(label="اسم الفعالية", max_length=100)
     description = discord.ui.TextInput(label="الوصف", style=discord.TextStyle.paragraph, max_length=800)
-    capacity = discord.ui.TextInput(label="عدد المقاعد", default="25", max_length=3)
+    capacity = discord.ui.TextInput(
+        label="عدد المقاعد (0 = غير محدود)",
+        default="25",
+        max_length=3,
+        placeholder="0 أو رقم حتى 500",
+    )
     reminder = discord.ui.TextInput(label="التذكير قبل الموعد بالساعات (0 لتعطيله)", default="24", max_length=3)
     duration = discord.ui.TextInput(
         label="المدة (مثل 30m أو 1h أو 1d أو 1w)",
@@ -661,11 +668,11 @@ class EventCreateModal(discord.ui.Modal, title="إنشاء فعالية"):
             capacity = int(self.capacity.value.strip())
             reminder_hours = int(self.reminder.value.strip())
             duration = _parse_event_duration(self.duration.value)
-            if not 1 <= capacity <= 500 or not 0 <= reminder_hours <= 168:
+            if not 0 <= capacity <= 500 or not 0 <= reminder_hours <= 168:
                 raise ValueError
         except ValueError as exc:
             await interaction.response.send_message(
-                f"تحقق من عدد المقاعد (1–500) والتذكير (0–168 ساعة). {exc}",
+                f"تحقق من عدد المقاعد (0 لغير المحدود أو 1–500) والتذكير (0–168 ساعة). {exc}",
                 ephemeral=True,
             )
             return
@@ -2391,7 +2398,8 @@ class DashboardCog(commands.Cog):
                 end = datetime.fromisoformat(event["ends_at"].replace("Z", "+00:00"))
                 details.append(
                     f"• **#{event['id']} {event['title']}** · <t:{int(start.timestamp())}:f>"
-                    f" إلى <t:{int(end.timestamp())}:t> · {count}/{event['capacity']} مقعد"
+                    f" إلى <t:{int(end.timestamp())}:t> · "
+                    f"{_format_capacity_count(count, int(event['capacity']))}"
                 )
             description = "\n".join(details) if details else "لا توجد فعاليات مفتوحة حاليًا."
             description += "\n\nاختر إجراءً من الأزرار لإدارة الفعاليات والتسجيل والحضور."

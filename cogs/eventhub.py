@@ -677,6 +677,12 @@ def _seats_bar(registered: int, capacity: int, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def _format_capacity_count(registered: int, capacity: int) -> str:
+    if capacity == 0:
+        return f"`{registered}/∞` · مقاعد غير محدودة"
+    return f"`{registered}/{capacity}`"
+
+
 def _event_embed(event: dict, registered: int = 0, waitlist: int = 0) -> discord.Embed:
     raw_start = event.get("starts_at")
     if isinstance(raw_start, str):
@@ -714,12 +720,14 @@ def _event_embed(event: dict, registered: int = 0, waitlist: int = 0) -> discord
     if status == "OPEN" and not registration_open:
         registration_state += " — الفعالية مستمرة"
     embed.add_field(name="📝  التسجيل", value=registration_state, inline=True)
-    cap = event.get("capacity", 0)
-    spots_left = max(0, cap - registered)
-    bar = _seats_bar(registered, cap)
-    seats_val = f"`{registered}/{cap}` · متبقي **{spots_left}**\n{bar}"
-    if spots_left == 0 and waitlist > 0:
-        seats_val += f"\n⏳ {waitlist} في قائمة الانتظار"
+    cap = int(event.get("capacity", 0))
+    if cap == 0:
+        seats_val = f"♾️ {_format_capacity_count(registered, cap)}"
+    else:
+        spots_left = max(0, cap - registered)
+        seats_val = f"{_format_capacity_count(registered, cap)} · متبقي **{spots_left}**\n{_seats_bar(registered, cap)}"
+        if spots_left == 0 and waitlist > 0:
+            seats_val += f"\n⏳ {waitlist} في قائمة الانتظار"
     embed.add_field(name="🎟️  المقاعد", value=seats_val, inline=True)
     if event.get("location_channel_id"):
         embed.add_field(name="📍  المكان", value=f"<#{event['location_channel_id']}>", inline=True)
@@ -796,7 +804,7 @@ def _admin_embed(event: dict, registered: int = 0, waitlist: int = 0, creator: s
         embed.add_field(name="🕒  النهاية", value=f"<t:{int(end.timestamp())}:F>", inline=True)
     if event.get("registration_open") is False:
         embed.add_field(name="📝  حالة التسجيل", value="مغلق — الفعالية مستمرة", inline=True)
-    embed.add_field(name="🎟️  المسجلون", value=f"{registered}/{event['capacity']}", inline=True)
+    embed.add_field(name="🎟️  المسجلون", value=_format_capacity_count(registered, int(event["capacity"])), inline=True)
     embed.add_field(name="⏳  انتظار", value=str(waitlist), inline=True)
     embed.add_field(name="📋  التسجيل", value="نموذج مخصص" if event.get("registration_type") == "FORM" else "فوري", inline=True)
     embed.add_field(name="👤  أنشأها", value=creator, inline=True)
@@ -1364,7 +1372,7 @@ class EventEditModal(discord.ui.Modal, title="تعديل الفعالية"):
             max_length=1800,
         )
         self.capacity_input = discord.ui.TextInput(
-            label="عدد المقاعد الجديد (1–500)",
+            label="عدد المقاعد الجديد (0 = غير محدود)",
             default=str(event["capacity"]),
             min_length=1,
             max_length=3,
@@ -1401,13 +1409,13 @@ class EventEditModal(discord.ui.Modal, title="تعديل الفعالية"):
             return await interaction.response.send_message("اسم الفعالية ووصفها لا يمكن أن يكونا فارغين.", ephemeral=True)
         try:
             capacity = int(self.capacity_input.value.strip())
-            if not 1 <= capacity <= 500:
+            if not 0 <= capacity <= 500:
                 raise ValueError
             starts_at = _parse_event_datetime(self.starts_at_input.value)
             duration = _parse_event_duration(self.duration_input.value)
             ends_at = _event_end_datetime(starts_at, duration)
         except ValueError as exc:
-            message = str(exc) or "عدد المقاعد يجب أن يكون رقمًا بين 1 و500."
+            message = str(exc) or "عدد المقاعد يجب أن يكون 0 (غير محدود) أو رقمًا بين 1 و500."
             return await interaction.response.send_message(message, ephemeral=True)
 
         client = await interaction.client.db.get_client()  # type: ignore[attr-defined]
@@ -1435,7 +1443,7 @@ class EventEditModal(discord.ui.Modal, title="تعديل الفعالية"):
                 if result.get("reason") == "capacity":
                     registered = int(result.get("registered_count", 0))
                     await interaction.followup.send(
-                        f"لا يمكن خفض السعة إلى {capacity}؛ يوجد {registered} عضو مسجل حاليًا. يجب أن تكون السعة مساوية لعدد المسجلين على الأقل.",
+                        f"لا يمكن خفض السعة إلى {capacity}؛ يوجد {registered} عضو مسجل حاليًا. يجب أن تكون السعة مساوية لعدد المسجلين على الأقل أو 0 لغير المحدود.",
                         ephemeral=True,
                     )
                     return
@@ -1629,7 +1637,7 @@ class AdminView(discord.ui.View):
             await ch.send(
                 embed=discord.Embed(
                     title=f"⏰  تذكير · {ev['title']}",
-                    description=f"تبدأ الفعالية <t:{ts}:R>!\nالمسجلون: `{count}/{ev['capacity']}`",
+                    description=f"تبدأ الفعالية <t:{ts}:R>!\nالمسجلون: {_format_capacity_count(count, int(ev['capacity']))}",
                     color=discord.Color.gold(),
                 ),
                 allowed_mentions=discord.AllowedMentions.none(),
@@ -1828,7 +1836,7 @@ class ApplicationReviewView(discord.ui.View):
             await client.table("event_participants").select("id", count="exact")
             .eq("event_id", self.event_id).eq("status", "REGISTERED").execute()
         ).count or 0
-        new_status = "REGISTERED" if count < ev["capacity"] else "WAITLIST"
+        new_status = "REGISTERED" if ev["capacity"] == 0 or count < ev["capacity"] else "WAITLIST"
         res = (
             await client.table("event_participants")
             .update({"status": new_status, "reviewed_by": interaction.user.id})
@@ -2026,12 +2034,13 @@ class EventHubTimePickerView(discord.ui.View):
         end_ts = int(self.get_end_datetime().timestamp())
         role_name = _event_role_name(self.selected_role_slot) if self.selected_role_slot else "لم يتم اختيارها بعد"
         admin_info = f" · إشعارات الإدارة: {self.admin_channel.mention}" if self.admin_channel else ""
+        seat_limit = f"{self.capacity} مقعد" if self.capacity else "مقاعد غير محدودة ♾️"
         return (
             f"🎪 **تحديد موعد الفعالية: {self.title}**\n\n"
             f"📅 **البداية:** <t:{ts}:F> (<t:{ts}:R>)\n"
             f"🕒 **النهاية:** <t:{end_ts}:F> · المدة `{_format_event_duration(self.duration)}`\n"
             f"🏷️ **رتبة المشاركين:** `{role_name}`\n"
-            f"👥 **المقاعد:** `{self.capacity}`  ·  📢 **القناة:** {self.announce_channel.mention}{admin_info}\n\n"
+            f"👥 **المقاعد:** `{seat_limit}`  ·  📢 **القناة:** {self.announce_channel.mention}{admin_info}\n\n"
             "👇 **حدد الموعد والرتبة المناسبة من القوائم أدناه، ثم اضغط على زر التأكيد:**"
         )
 
@@ -2232,7 +2241,12 @@ class EventCreateModal(discord.ui.Modal, title="🎪  إنشاء فعالية ج
 
     f_title    = discord.ui.TextInput(label="اسم الفعالية", max_length=100, placeholder="مثال: بطولة فوت سيك")
     f_desc     = discord.ui.TextInput(label="الوصف", style=discord.TextStyle.paragraph, max_length=1500, placeholder="تفاصيل الفعالية...")
-    f_capacity = discord.ui.TextInput(label="عدد المقاعد", max_length=4, default="25", placeholder="25")
+    f_capacity = discord.ui.TextInput(
+        label="عدد المقاعد (0 = غير محدود)",
+        max_length=3,
+        default="25",
+        placeholder="0 أو رقم حتى 500",
+    )
     f_duration = discord.ui.TextInput(
         label="المدة (مثل 30m أو 1h أو 1d أو 1w)",
         max_length=5,
@@ -2254,9 +2268,11 @@ class EventCreateModal(discord.ui.Modal, title="🎪  إنشاء فعالية ج
         if not interaction.guild or not is_staff(interaction.user):
             return await interaction.response.send_message("للإدارة فقط.", ephemeral=True)
         try:
-            capacity = max(1, min(500, int(self.f_capacity.value.strip())))
+            capacity = int(self.f_capacity.value.strip())
+            if not 0 <= capacity <= 500:
+                raise ValueError
         except ValueError:
-            return await interaction.response.send_message("❌  عدد المقاعد يجب أن يكون رقماً بين 1 و500.", ephemeral=True)
+            return await interaction.response.send_message("❌  عدد المقاعد يجب أن يكون 0 (غير محدود) أو رقمًا بين 1 و500.", ephemeral=True)
         try:
             duration = _parse_event_duration(self.f_duration.value)
         except ValueError as exc:
@@ -2498,8 +2514,11 @@ async def send_admin_event_notification(
             description=f"سجّل **{user}** في فعالية **{event_title}** (#{event_id})",
             color=discord.Color.green(),
         )
-        embed.add_field(name="المقاعد المشغولة", value=f"`{registered} / {capacity}`", inline=True)
-        embed.add_field(name="المتبقي", value=f"`{capacity - registered}`", inline=True)
+        embed.add_field(name="المقاعد المشغولة", value=_format_capacity_count(registered, capacity), inline=True)
+        if capacity > 0:
+            embed.add_field(name="المتبقي", value=f"`{max(0, capacity - registered)}`", inline=True)
+        else:
+            embed.add_field(name="المقاعد المتبقية", value="غير محدودة ♾️", inline=True)
         embed.set_thumbnail(url=user.display_avatar.url)
         embed.set_footer(text=f"AdSentry EventHub  •  #{event_id}")
     elif kind == "event_closed":
@@ -2512,7 +2531,7 @@ async def send_admin_event_notification(
     elif kind == "reminder":
         embed = discord.Embed(
             title="⏰  تذكير: فعالية تبدأ قريبًا",
-            description=f"**{event_title}** (#{event_id})\nالمسجلون: **{registered} / {capacity}**",
+            description=f"**{event_title}** (#{event_id})\nالمسجلون: {_format_capacity_count(registered, capacity)}",
             color=discord.Color.gold(),
         )
         embed.set_footer(text="AdSentry EventHub")
@@ -2845,7 +2864,10 @@ class EventHub(commands.GroupCog, group_name="event"):
                 if isinstance(channel, discord.TextChannel):
                     remind_embed = discord.Embed(
                         title=f"⏰  تذكير · {event['title']}",
-                        description=f"تبدأ الفعالية <t:{int(start.timestamp())}:R>!\nالمقاعد: `{reg_count} / {event['capacity']}`",
+                        description=(
+                            f"تبدأ الفعالية <t:{int(start.timestamp())}:R>!\n"
+                            f"المقاعد: {_format_capacity_count(reg_count, int(event['capacity']))}"
+                        ),
                         color=discord.Color.gold(),
                     )
                     remind_embed.set_footer(text=f"رقم الفعالية: #{event['id']}  •  AdSentry EventHub")
@@ -2990,7 +3012,8 @@ class EventHub(commands.GroupCog, group_name="event"):
             embed.add_field(
                 name=f"#{ev['id']}  ·  {ev['title']}",
                 value=(
-                    f"<t:{ts}:F>\n`{count}/{ev['capacity']}` {bar}"
+                    f"<t:{ts}:F>\n{_format_capacity_count(count, int(ev['capacity']))}"
+                    + (f" {bar}" if ev["capacity"] > 0 else "")
                     + ("\n🔒 التسجيل مغلق" if not ev.get("registration_open", True) else "")
                 ),
                 inline=False,
