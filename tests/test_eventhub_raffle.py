@@ -263,6 +263,11 @@ def test_locking_publishes_only_one_wheel_message(monkeypatch) -> None:
     assert "embed" in channel.sent_messages[0]
     assert "file" in channel.sent_messages[0]
     assert "files" not in channel.sent_messages[0]
+    embed = channel.sent_messages[0]["embed"]
+    assert not embed.fields
+    assert "drand" not in embed.description.lower()
+    assert "بصمة" not in embed.description
+    assert "إثبات" not in embed.description
     assert database.spin_message_id == FakeMessage.id
     assert database.lock_message_id == FakeMessage.id
 
@@ -321,8 +326,41 @@ def test_raffle_result_updates_the_wheel_message_without_posting_another(monkeyp
     asyncio.run(cog._publish_raffle_result(interaction, raffle))
 
     assert "embed" in channel.wheel_message.edited
+    embed = channel.wheel_message.edited["embed"]
+    assert not embed.fields
+    assert "drand" not in embed.description.lower()
+    assert raffle["entrants_hash"] not in embed.description
     assert channel.wheel_message.edited["view"].children[0].disabled
     assert bot.db.result_message_id == FakeWheelMessage.id
+
+
+def test_existing_wheel_proof_is_removed_from_the_public_embed() -> None:
+    class FakeWheelMessage:
+        def __init__(self) -> None:
+            self.attachments = []
+            self.embeds = [discord.Embed(description="old public proof")]
+            self.embeds[0].add_field(name="إثبات السحب", value="drand round 42")
+
+        async def edit(self, **kwargs):
+            self.edited = kwargs
+
+    cog = EventHub(SimpleNamespace())
+    message = FakeWheelMessage()
+    raffle = {
+        "id": 2,
+        "title": "Test raffle",
+        "status": "LOCKED",
+        "winner_count": 1,
+        "entrants_snapshot": ENTRANTS,
+        "winner_ids": [],
+    }
+
+    asyncio.run(cog._refresh_raffle_wheel_without_proof(message, raffle))
+
+    embed = message.edited["embed"]
+    assert not embed.fields
+    assert "drand" not in embed.description.lower()
+    assert "إثبات" not in embed.description
 
 
 @pytest.mark.parametrize(
@@ -428,3 +466,52 @@ def test_drand_beacon_rejects_mismatched_signature(monkeypatch) -> None:
 
     with pytest.raises(ValueError):
         asyncio.run(_fetch_drand_beacon(12))
+
+
+def test_drand_fetch_uses_another_mirror_when_primary_fails(monkeypatch) -> None:
+    requested_urls: list[str] = []
+
+    class FakeResponse:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def raise_for_status(self) -> None:
+            if self.url.startswith("https://primary.example"):
+                raise eventhub.aiohttp.ClientError("primary unavailable")
+
+        async def json(self) -> dict:
+            return {"hash": "a" * 64}
+
+    class FakeSession:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def get(self, url: str) -> FakeResponse:
+            requested_urls.append(url)
+            return FakeResponse(url)
+
+    monkeypatch.setattr(eventhub, "DRAND_API_BASES", (
+        "https://primary.example",
+        "https://mirror.example",
+    ))
+    monkeypatch.setattr(eventhub.aiohttp, "ClientSession", FakeSession)
+
+    result = asyncio.run(eventhub._fetch_drand_json("/info"))
+
+    assert result == {"hash": "a" * 64}
+    assert requested_urls == [
+        "https://primary.example/info",
+        "https://mirror.example/info",
+    ]
