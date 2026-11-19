@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import discord
+from PIL import Image
 
 import cogs.eventhub as eventhub
 from cogs.dashboard import EventDashboardView, RaffleInitialEntrantsView, _get_raffle_ready_events
@@ -130,6 +131,20 @@ def test_raffle_wheel_renders_a_png_for_the_locked_entrants() -> None:
     assert image.read(8) == b"\x89PNG\r\n\x1a\n"
 
 
+def test_raffle_wheel_rotation_changes_the_rendered_orientation() -> None:
+    initial = _raffle_wheel_image(ENTRANTS, rotation_degrees=0).getvalue()
+    rotated = _raffle_wheel_image(ENTRANTS, rotation_degrees=90).getvalue()
+
+    assert initial != rotated
+
+
+def test_raffle_wheel_stops_selected_entrant_under_fixed_pointer() -> None:
+    image = Image.open(_raffle_wheel_image(ENTRANTS, pointer_index=2))
+    expected_color = tuple(bytes.fromhex(eventhub.WHEEL_COLORS[2][1:]))
+
+    assert image.getpixel((450, 150)) == expected_color
+
+
 def test_raffle_wheel_rejects_an_empty_entrant_list() -> None:
     with pytest.raises(ValueError):
         _raffle_wheel_image([])
@@ -155,6 +170,159 @@ def test_raffle_spin_is_limited_to_owner_admin_or_setup_staff(monkeypatch) -> No
     assert _can_spin_raffle(interaction_for(admin_id), raffle)
     assert _can_spin_raffle(interaction_for(creator_id), raffle)
     assert not _can_spin_raffle(interaction_for(other_staff_id), raffle)
+
+
+def test_locking_publishes_only_one_wheel_message(monkeypatch) -> None:
+    class FakeMessage:
+        id = 900
+
+    class FakeChannel:
+        def __init__(self) -> None:
+            self.sent_messages: list[dict] = []
+            self.mention = "#raffle"
+
+        async def send(self, **kwargs):
+            self.sent_messages.append(kwargs)
+            return FakeMessage()
+
+    class FakeDatabase:
+        def __init__(self, raffle: dict) -> None:
+            self.raffle = raffle
+            self.spin_message_id = None
+            self.lock_message_id = None
+
+        async def get_event_raffle(self, *_args):
+            return self.raffle
+
+        async def lock_event_raffle(self, *_args):
+            self.raffle["status"] = "LOCKED"
+            return self.raffle
+
+        async def prepare_event_raffle_beacon(self, **kwargs):
+            self.raffle.update({
+                "entrants_hash": kwargs["entrants_hash"],
+                "beacon_chain_hash": kwargs["chain_hash"],
+                "beacon_target_round": kwargs["target_round"],
+            })
+            return self.raffle
+
+        async def set_event_raffle_spin_message(self, _raffle_id, _guild_id, message_id):
+            self.spin_message_id = message_id
+            return True
+
+        async def set_event_raffle_lock_message(self, _raffle_id, _guild_id, message_id):
+            self.lock_message_id = message_id
+            return True
+
+    class FakeFollowup:
+        async def send(self, *_args, **_kwargs):
+            return None
+
+    raffle = {
+        "id": 2,
+        "guild_id": 1,
+        "event_id": 22,
+        "title": "Test raffle",
+        "channel_id": 10,
+        "created_by": 20,
+        "winner_count": 1,
+        "status": "OPEN",
+        "locked_at": datetime.now(timezone.utc).isoformat(),
+        "entrants_snapshot": ENTRANTS,
+        "entrants_hash": None,
+        "lock_message_id": None,
+        "spin_message_id": None,
+    }
+    channel = FakeChannel()
+    database = FakeDatabase(raffle)
+    bot = SimpleNamespace(
+        db=database,
+        add_view=lambda *_args, **_kwargs: None,
+        get_channel=lambda _channel_id: channel,
+    )
+    cog = EventHub(bot)
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=1),
+        user=SimpleNamespace(id=20),
+        followup=FakeFollowup(),
+    )
+
+    async def fetch_drand_info() -> dict:
+        return {
+            "period": 30,
+            "genesis_time": int(datetime.now(timezone.utc).timestamp()) - 60,
+            "hash": "a" * 64,
+        }
+
+    monkeypatch.setattr(eventhub, "_fetch_drand_info", fetch_drand_info)
+    monkeypatch.setattr(eventhub.discord, "TextChannel", FakeChannel)
+
+    asyncio.run(cog.lock_and_publish_raffle(interaction, raffle_id=2))
+
+    assert len(channel.sent_messages) == 1
+    assert "embed" in channel.sent_messages[0]
+    assert "file" in channel.sent_messages[0]
+    assert "files" not in channel.sent_messages[0]
+    assert database.spin_message_id == FakeMessage.id
+    assert database.lock_message_id == FakeMessage.id
+
+
+def test_raffle_result_updates_the_wheel_message_without_posting_another(monkeypatch) -> None:
+    class FakeWheelMessage:
+        id = 900
+        attachments = []
+
+        async def edit(self, **kwargs):
+            self.edited = kwargs
+
+    class FakeChannel:
+        def __init__(self) -> None:
+            self.wheel_message = FakeWheelMessage()
+            self.mention = "#raffle"
+
+        async def fetch_message(self, message_id: int):
+            assert message_id == self.wheel_message.id
+            return self.wheel_message
+
+        async def send(self, **_kwargs):
+            raise AssertionError("The result must update the existing wheel message.")
+
+    class FakeDatabase:
+        async def set_event_raffle_result_message(self, _raffle_id, _guild_id, message_id):
+            self.result_message_id = message_id
+            return True
+
+    class FakeFollowup:
+        async def send(self, *_args, **_kwargs):
+            return None
+
+    channel = FakeChannel()
+    bot = SimpleNamespace(
+        db=FakeDatabase(),
+        get_channel=lambda _channel_id: channel,
+    )
+    cog = EventHub(bot)
+    interaction = SimpleNamespace(followup=FakeFollowup())
+    raffle = {
+        "id": 2,
+        "guild_id": 1,
+        "channel_id": 10,
+        "spin_message_id": FakeWheelMessage.id,
+        "title": "Test raffle",
+        "winner_ids": [100],
+        "entrants_snapshot": ENTRANTS,
+        "entrants_hash": _raffle_entrants_hash(ENTRANTS),
+        "beacon_target_round": 42,
+        "result_message_id": None,
+    }
+
+    monkeypatch.setattr(eventhub.discord, "TextChannel", FakeChannel)
+
+    asyncio.run(cog._publish_raffle_result(interaction, raffle))
+
+    assert "embed" in channel.wheel_message.edited
+    assert channel.wheel_message.edited["view"].children[0].disabled
+    assert bot.db.result_message_id == FakeWheelMessage.id
 
 
 @pytest.mark.parametrize(
