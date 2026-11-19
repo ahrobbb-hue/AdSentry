@@ -749,8 +749,16 @@ class EventChannelPickerView(discord.ui.View):
         channel = interaction.guild.get_channel(ch_id)
         if not isinstance(channel, discord.TextChannel):
             await interaction.response.send_message("اختر قناة نصية.", ephemeral=True); return
-        if not channel.permissions_for(interaction.guild.me).send_messages:
-            await interaction.response.send_message(f"البوت لا يستطيع الإرسال في {channel.mention}.", ephemeral=True); return
+        permissions = channel.permissions_for(interaction.guild.me)
+        if (
+            not permissions.view_channel
+            or not permissions.send_messages
+            or not permissions.embed_links
+        ):
+            await interaction.response.send_message(
+                f"يحتاج البوت إلى صلاحيات عرض القناة وإرسال الرسائل وتضمين الروابط في {channel.mention} لإرسال الإشعارات.",
+                ephemeral=True,
+            ); return
         self.admin_channel = channel
         await interaction.response.edit_message(content=self._summary(), view=self)
 

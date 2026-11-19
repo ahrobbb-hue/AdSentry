@@ -1141,6 +1141,14 @@ class _ConfirmView(discord.ui.View):
         if result == "registered":
             role = await _grant_event_role(interaction.guild, interaction.user.id, self.event_id, client)
         await _refresh_embed(interaction.client, self.event_id)  # type: ignore[arg-type]
+        if result == "registered":
+            await _notify_admin_registration(
+                interaction.client,  # type: ignore[arg-type]
+                client,
+                self.event_id,
+                interaction.guild,
+                interaction.user,
+            )
         self.stop()
         msgs = {
             "registered": (
@@ -1205,6 +1213,13 @@ class FormModal(discord.ui.Modal):
             )
         if result == "registered":
             role = await _grant_event_role(interaction.guild, interaction.user.id, self.event_id, client)
+            await _notify_admin_registration(
+                interaction.client,  # type: ignore[arg-type]
+                client,
+                self.event_id,
+                interaction.guild,
+                interaction.user,
+            )
         else:
             role = None
         msgs = {
@@ -1227,8 +1242,10 @@ async def _send_application_card(
 ) -> None:
     if not ev.get("admin_channel_id"):
         return
-    ch = bot.get_channel(int(ev["admin_channel_id"]))
-    if not isinstance(ch, discord.TextChannel):
+    ch = await _resolve_event_admin_channel(
+        bot, int(ev["admin_channel_id"]), int(ev["id"]), guild.id
+    )
+    if ch is None:
         return
     embed = discord.Embed(title=f"📬  طلب تسجيل — {ev['title']}", color=discord.Color.orange())
     embed.set_thumbnail(url=user.display_avatar.url)
@@ -1242,6 +1259,48 @@ async def _send_application_card(
         bot.add_view(view, message_id=msg.id)
     except discord.HTTPException:
         logger.exception("Could not send application card")
+
+
+async def _notify_admin_registration(
+    bot: commands.Bot,
+    client: Any,
+    event_id: int,
+    guild: discord.Guild,
+    user: discord.abc.User,
+) -> None:
+    try:
+        rows = (
+            await client.table("events")
+            .select("title,capacity,admin_channel_id")
+            .eq("id", event_id)
+            .eq("guild_id", guild.id)
+            .limit(1)
+            .execute()
+        ).data or []
+        if not rows or not rows[0].get("admin_channel_id"):
+            return
+        event = rows[0]
+        count = (
+            await client.table("event_participants")
+            .select("id", count="exact")
+            .eq("event_id", event_id)
+            .eq("guild_id", guild.id)
+            .eq("status", "REGISTERED")
+            .execute()
+        ).count or 0
+        await send_admin_event_notification(
+            bot,
+            int(event["admin_channel_id"]),
+            event_id=event_id,
+            event_title=event["title"],
+            kind="new_registration",
+            user=user,
+            registered=count,
+            capacity=event["capacity"],
+            guild=guild,
+        )
+    except Exception:
+        logger.exception("Could not notify administrators about registration for event %s", event_id)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2365,6 +2424,40 @@ class RejectModal(discord.ui.Modal, title="رفض طلب التسجيل"):
         await interaction.followup.send("❌  تم الرفض وإشعار العضو.")
 
 
+async def _resolve_event_admin_channel(
+    bot: commands.Bot,
+    channel_id: int,
+    event_id: int,
+    guild_id: int | None,
+) -> discord.TextChannel | None:
+    channel = bot.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except discord.HTTPException:
+            logger.exception(
+                "Could not access the admin channel %s for event %s",
+                channel_id,
+                event_id,
+            )
+            return None
+    if not isinstance(channel, discord.TextChannel):
+        logger.warning(
+            "Admin channel %s for event %s is unavailable or is not a text channel",
+            channel_id,
+            event_id,
+        )
+        return None
+    if guild_id is not None and channel.guild.id != guild_id:
+        logger.warning(
+            "Admin channel %s for event %s belongs to a different server",
+            channel_id,
+            event_id,
+        )
+        return None
+    return channel
+
+
 async def send_admin_event_notification(
     bot: commands.Bot,
     admin_channel_id: int,
@@ -2372,14 +2465,16 @@ async def send_admin_event_notification(
     event_id: int,
     event_title: str,
     kind: str,  # "new_registration" | "event_closed" | "reminder"
-    user: discord.User | None = None,
+    user: discord.abc.User | None = None,
     registered: int = 0,
     capacity: int = 0,
     guild: discord.Guild | None = None,
 ) -> None:
     """Send a private staff notification to the admin channel."""
-    channel = bot.get_channel(admin_channel_id)
-    if not isinstance(channel, discord.TextChannel):
+    channel = await _resolve_event_admin_channel(
+        bot, admin_channel_id, event_id, guild.id if guild else None
+    )
+    if channel is None:
         return
     if kind == "new_registration" and user:
         embed = discord.Embed(
