@@ -383,13 +383,15 @@ async def _fetch_drand_json(path: str) -> dict[str, Any]:
                 errors.append(error)
                 logger.warning("drand endpoint %s failed for %s: %s", base_url, path, error)
 
-    if errors and all(
-        isinstance(error, aiohttp.ClientResponseError) and error.status == 404
-        for error in errors
-    ):
-        raise errors[0]
     if errors:
-        raise errors[-1]
+        unavailable_errors = [
+            error
+            for error in errors
+            if not (isinstance(error, aiohttp.ClientResponseError) and error.status == 404)
+        ]
+        if unavailable_errors:
+            raise unavailable_errors[-1]
+        raise errors[0]
     raise RuntimeError("No drand endpoints are configured.")
 
 
