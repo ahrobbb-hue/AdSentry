@@ -2,14 +2,16 @@ from datetime import datetime, timezone
 import asyncio
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import cogs.eventhub as eventhub
-from cogs.dashboard import EventDashboardView
+from cogs.dashboard import EventDashboardView, _get_raffle_ready_events
 from cogs.eventhub import (
     EventHub,
     _fetch_drand_beacon,
+    _raffle_event_is_ready,
     _raffle_entrants_hash,
     _raffle_wheel_image,
     _raffle_target_round,
@@ -88,6 +90,7 @@ def test_raffle_migration_freezes_entries_and_restricts_draw_rpc() -> None:
     assert "lock_event_raffle" in migration
     assert "record_event_raffle_result" in migration
     assert "status = 'CLOSED'" in migration
+    assert "registration_open = FALSE" in migration
     assert "set_event_raffle_spin_message" in migration
     assert "verify_event_raffle_claim" in migration
     assert "TO service_role" in migration
@@ -122,6 +125,66 @@ def test_raffle_wheel_renders_a_png_for_the_locked_entrants() -> None:
 def test_raffle_wheel_rejects_an_empty_entrant_list() -> None:
     with pytest.raises(ValueError):
         _raffle_wheel_image([])
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        ({"status": "OPEN", "registration_open": True}, False),
+        ({"status": "OPEN", "registration_open": False}, True),
+        ({"status": "CLOSED", "registration_open": True}, True),
+        ({"status": "CANCELLED", "registration_open": False}, False),
+    ],
+)
+def test_raffle_accepts_only_ended_or_registration_closed_events(
+    event: dict,
+    expected: bool,
+) -> None:
+    assert _raffle_event_is_ready(event) is expected
+
+
+def test_dashboard_raffle_event_picker_includes_registration_closed_events() -> None:
+    events = [
+        {"id": 18, "guild_id": 1, "status": "OPEN", "registration_open": False, "ends_at": "2026-11-20"},
+        {"id": 19, "guild_id": 1, "status": "OPEN", "registration_open": True, "ends_at": "2026-11-21"},
+        {"id": 20, "guild_id": 1, "status": "CLOSED", "registration_open": True, "ends_at": "2026-11-18"},
+        {"id": 21, "guild_id": 1, "status": "CANCELLED", "registration_open": False, "ends_at": "2026-11-17"},
+    ]
+
+    class EventQuery:
+        def __init__(self) -> None:
+            self.filters: dict[str, object] = {}
+            self.limit_value = 25
+
+        def select(self, *_args, **_kwargs):
+            return self
+
+        def eq(self, column: str, value: object):
+            self.filters[column] = value
+            return self
+
+        def order(self, *_args, **_kwargs):
+            return self
+
+        def limit(self, value: int):
+            self.limit_value = value
+            return self
+
+        async def execute(self):
+            result = [
+                event for event in events
+                if all(event.get(column) == value for column, value in self.filters.items())
+            ]
+            return SimpleNamespace(data=result[:self.limit_value])
+
+    class Client:
+        def table(self, name: str):
+            assert name == "events"
+            return EventQuery()
+
+    ready = asyncio.run(_get_raffle_ready_events(Client(), guild_id=1))
+
+    assert {event["id"] for event in ready} == {18, 20}
 
 
 def test_event_dashboard_buttons_are_grouped_by_workflow() -> None:

@@ -126,9 +126,14 @@ BEGIN
 
     IF p_event_id IS NOT NULL THEN
         SELECT * INTO v_event FROM public.events
-        WHERE id = p_event_id AND guild_id = p_guild_id AND status = 'CLOSED';
+        WHERE id = p_event_id
+          AND guild_id = p_guild_id
+          AND (
+              status = 'CLOSED'
+              OR (status = 'OPEN' AND registration_open = FALSE)
+          );
         IF NOT FOUND THEN
-            RAISE EXCEPTION 'Raffles can only be created for closed events in this server';
+            RAISE EXCEPTION 'Raffles require an ended event or closed registration in this server';
         END IF;
         IF EXISTS (
             SELECT 1 FROM public.event_raffles

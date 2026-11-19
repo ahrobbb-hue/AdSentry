@@ -55,6 +55,13 @@ def _safe_raffle_csv_text(value: Any) -> str:
     return text
 
 
+def _raffle_event_is_ready(event: dict[str, Any]) -> bool:
+    status = event.get("status")
+    return status == "CLOSED" or (
+        status == "OPEN" and event.get("registration_open") is False
+    )
+
+
 def _raffle_wheel_image(entrants: list[dict[str, Any]], pointer_index: int = 0) -> io.BytesIO:
     if not entrants:
         raise ValueError("Cannot render a raffle wheel without entrants.")
@@ -254,14 +261,14 @@ async def create_raffle_from_closed_event(
     client = await bot.db.get_client()
     events = (
         await client.table("events")
-        .select("id,title,status")
+        .select("id,title,status,registration_open")
         .eq("id", event_id)
         .eq("guild_id", guild.id)
         .limit(1)
         .execute()
     ).data or []
-    if not events or events[0].get("status") != "CLOSED":
-        raise ValueError("Only a closed event can be linked to a raffle.")
+    if not events or not _raffle_event_is_ready(events[0]):
+        raise ValueError("The event must be ended or have registration closed before creating a raffle.")
     event = events[0]
     raffle = await bot.db.create_event_raffle(
         guild_id=guild.id,
@@ -275,7 +282,7 @@ async def create_raffle_from_closed_event(
         title=f"🎟️ سحب الفعالية #{event_id} · {event['title']}",
         description=(
             f"عدد الفائزين: `{winner_count}`\n"
-            "أُغلقت الفعالية. ستُدرج الإدارة المؤهلين يدويًا، ثم تثبّت القائمة وتنشر بصمتها "
+            "أُغلق التسجيل أو انتهت الفعالية. ستُدرج الإدارة المؤهلين يدويًا، ثم تثبّت القائمة وتنشر بصمتها "
             "وسجل التغييرات قبل السحب. لا تختار العجلة الفائز؛ النتيجة تحسمها عشوائية عامة قابلة للتحقق."
         ),
         color=discord.Color.blurple(),
