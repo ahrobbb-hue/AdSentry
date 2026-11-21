@@ -1086,8 +1086,16 @@ class RegisterView(discord.ui.View):
     async def _on_register(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
             return await interaction.response.send_message("يجب استخدام الزر داخل السيرفر.", ephemeral=True)
-        client = await interaction.client.db.get_client()  # type: ignore[attr-defined]
-        ev = (await client.table("events").select("*").eq("id", self.event_id).limit(1).execute()).data
+        try:
+            client = await interaction.client.db.get_client()  # type: ignore[attr-defined]
+            ev = (await client.table("events").select("*").eq("id", self.event_id).limit(1).execute()).data
+        except Exception:
+            logger.exception("Could not load EventHub event %s for registration", self.event_id)
+            await interaction.response.send_message(
+                "تعذر فتح التسجيل الآن. تأكد من اتصال قاعدة البيانات وأعد المحاولة.",
+                ephemeral=True,
+            )
+            return
         if not ev:
             return await interaction.response.send_message("⚠️  الفعالية غير موجودة.", ephemeral=True)
         ev = ev[0]
@@ -1153,26 +1161,36 @@ class _ConfirmView(discord.ui.View):
         if not interaction.guild:
             return await interaction.response.send_message("خطأ.", ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        client = await interaction.client.db.get_client()  # type: ignore[attr-defined]
-        resp = await client.rpc("register_event_participant_advanced", {
-            "p_event_id": self.event_id, "p_guild_id": interaction.guild.id,
-            "p_user_id": interaction.user.id, "p_user_name": str(interaction.user),
-            "p_form_answers": {},
-        }).execute()
-        d = (resp.data[0] if isinstance(resp.data, list) else resp.data) or {}
-        result = d.get("result", "error")
-        role = None
-        if result == "registered":
-            role = await _grant_event_role(interaction.guild, interaction.user.id, self.event_id, client)
-        await _refresh_embed(interaction.client, self.event_id)  # type: ignore[arg-type]
-        if result == "registered":
-            await _notify_admin_registration(
-                interaction.client,  # type: ignore[arg-type]
-                client,
-                self.event_id,
-                interaction.guild,
-                interaction.user,
+        try:
+            client = await interaction.client.db.get_client()  # type: ignore[attr-defined]
+            resp = await client.rpc("register_event_participant_advanced", {
+                "p_event_id": self.event_id, "p_guild_id": interaction.guild.id,
+                "p_user_id": interaction.user.id, "p_user_name": str(interaction.user),
+                "p_form_answers": {},
+            }).execute()
+            d = (resp.data[0] if isinstance(resp.data, list) else resp.data) or {}
+            result = d.get("result", "error")
+            role = None
+            if result == "registered":
+                role = await _grant_event_role(interaction.guild, interaction.user.id, self.event_id, client)
+            await _refresh_embed(interaction.client, self.event_id)  # type: ignore[arg-type]
+            if result == "registered":
+                await _notify_admin_registration(
+                    interaction.client,  # type: ignore[arg-type]
+                    client,
+                    self.event_id,
+                    interaction.guild,
+                    interaction.user,
+                )
+        except Exception:
+            logger.exception("Could not complete direct EventHub registration for event %s", self.event_id)
+            self.stop()
+            await interaction.edit_original_response(
+                content="تعذر إتمام التسجيل بسبب خطأ في قاعدة البيانات أو السعة. أعد تشغيل البوت بعد تطبيق ترحيلات EventHub، ثم حاول مجددًا.",
+                embed=None,
+                view=None,
             )
+            return
         self.stop()
         msgs = {
             "registered": (
@@ -1217,13 +1235,22 @@ class FormModal(discord.ui.Modal):
             if i < len(self.children) and isinstance(self.children[i], discord.ui.TextInput)
         }
         await interaction.response.defer(ephemeral=True, thinking=True)
-        client = await interaction.client.db.get_client()  # type: ignore[attr-defined]
-        resp = await client.rpc("register_event_participant_advanced", {
-            "p_event_id": self.event_id, "p_guild_id": interaction.guild.id,
-            "p_user_id": interaction.user.id, "p_user_name": str(interaction.user),
-            "p_form_answers": answers,
-        }).execute()
-        d = (resp.data[0] if isinstance(resp.data, list) else resp.data) or {}
+        try:
+            client = await interaction.client.db.get_client()  # type: ignore[attr-defined]
+            resp = await client.rpc("register_event_participant_advanced", {
+                "p_event_id": self.event_id, "p_guild_id": interaction.guild.id,
+                "p_user_id": interaction.user.id, "p_user_name": str(interaction.user),
+                "p_form_answers": answers,
+            }).execute()
+            d = (resp.data[0] if isinstance(resp.data, list) else resp.data) or {}
+        except Exception:
+            logger.exception("Could not submit EventHub form registration for event %s", self.event_id)
+            await interaction.edit_original_response(
+                content="تعذر إرسال طلب التسجيل بسبب خطأ في قاعدة البيانات. تأكد من تطبيق ترحيلات EventHub وإعادة تشغيل البوت.",
+                embed=None,
+                view=None,
+            )
+            return
         result = d.get("result", "error")
         if result == "pending_approval":
             ev = (await client.table("events").select("*").eq("id", self.event_id).limit(1).execute()).data
