@@ -147,6 +147,22 @@ def test_unlimited_capacity_migration_removes_capacity_guards_from_registration(
     assert "IF p_capacity <> 0 AND p_capacity < v_registered THEN" in migration
 
 
+def test_registration_lifecycle_uses_end_time_not_start_time() -> None:
+    registration_migration = (
+        Path(__file__).parent.parent
+        / "database"
+        / "eventhub_registration_control_migration.sql"
+    ).read_text(encoding="utf-8")
+    unlimited_migration = (
+        Path(__file__).parent.parent
+        / "database"
+        / "eventhub_unlimited_capacity_migration.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "COALESCE(v_event.ends_at, v_event.starts_at) <= NOW()" in registration_migration
+    assert "COALESCE(v_event.ends_at, v_event.starts_at) <= NOW()" in unlimited_migration
+
+
 @pytest.mark.parametrize("value", ["0m", "5w", "tomorrow", ""])
 def test_event_duration_parser_rejects_invalid_or_overlong_values(value: str) -> None:
     with pytest.raises(ValueError):

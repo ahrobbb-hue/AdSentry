@@ -192,7 +192,8 @@ BEGIN
     IF NOT FOUND THEN
         RETURN jsonb_build_object('result', 'not_found');
     END IF;
-    IF v_event.status <> 'OPEN' OR v_event.starts_at <= NOW() THEN
+    IF v_event.status <> 'OPEN'
+       OR COALESCE(v_event.ends_at, v_event.starts_at) <= NOW() THEN
         RETURN jsonb_build_object('result', 'closed');
     END IF;
     IF NOT v_event.registration_open THEN
@@ -260,7 +261,8 @@ BEGIN
     IF NOT FOUND THEN
         RETURN jsonb_build_object('result', 'not_found');
     END IF;
-    IF v_event.status <> 'OPEN' OR v_event.starts_at <= NOW() THEN
+    IF v_event.status <> 'OPEN'
+       OR COALESCE(v_event.ends_at, v_event.starts_at) <= NOW() THEN
         RETURN jsonb_build_object('result', 'closed');
     END IF;
     IF NOT v_event.registration_open THEN

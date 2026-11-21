@@ -1048,6 +1048,86 @@ class EventDashboardView(discord.ui.View):
             return
         await interaction.followup.send("اختر الفعالية:", view=EventCloseSelectView(self.cog, rows), ephemeral=True)
 
+    @discord.ui.button(label="فتح التسجيل", emoji="🔓", style=discord.ButtonStyle.success, row=0)
+    async def open_registration(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not interaction.guild or not _staff(interaction):
+            await interaction.response.send_message("للإدارة فقط.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        client = await self.cog.bot.db.get_client()
+        rows = (
+            await client.table("events")
+            .select("id,title")
+            .eq("guild_id", interaction.guild.id)
+            .eq("status", "OPEN")
+            .eq("registration_open", False)
+            .order("starts_at")
+            .limit(25)
+            .execute()
+        ).data or []
+        if not rows:
+            await interaction.followup.send(
+                "لا توجد فعالية مفتوحة حاليًا والخاصية التسجيل فيها مغلق.",
+                ephemeral=True,
+            )
+            return
+        options = [
+            discord.SelectOption(
+                label=f"#{event['id']} · {event['title']}"[:100],
+                value=str(event["id"]),
+            )
+            for event in rows
+        ]
+
+        class OpenRegistrationSelectView(discord.ui.View):
+            def __init__(self) -> None:
+                super().__init__(timeout=120)
+                select = discord.ui.Select(
+                    placeholder="اختر الفعالية لإعادة فتح التسجيل",
+                    options=options,
+                )
+                select.callback = self.open_event
+                self.add_item(select)
+
+            async def open_event(self, select_interaction: discord.Interaction) -> None:
+                if not select_interaction.guild or not _staff(select_interaction):
+                    await select_interaction.response.send_message("للإدارة فقط.", ephemeral=True)
+                    return
+                await select_interaction.response.defer(ephemeral=True, thinking=True)
+                event_id = int(select_interaction.data["values"][0])
+                reopened = (
+                    await client.table("events")
+                    .update({"registration_open": True})
+                    .eq("id", event_id)
+                    .eq("guild_id", select_interaction.guild.id)
+                    .eq("status", "OPEN")
+                    .eq("registration_open", False)
+                    .execute()
+                ).data or []
+                if not reopened:
+                    await select_interaction.followup.send(
+                        "الفعالية غير موجودة أو أُعيد فتح التسجيل فيها مسبقًا.",
+                        ephemeral=True,
+                    )
+                    return
+                await refresh_event_announcement(
+                    self.cog.bot,
+                    client,
+                    event_id,
+                )
+                await select_interaction.followup.send(
+                    "تم إعادة فتح التسجيل للفعالية.",
+                    ephemeral=True,
+                )
+
+        view = OpenRegistrationSelectView()
+        view.cog = self.cog
+        await interaction.followup.send(
+            "اختر الفعالية لإعادة فتح التسجيل:",
+            view=view,
+            ephemeral=True,
+        )
+
     async def _choose_event_for_action(self, interaction: discord.Interaction, action: str) -> None:
         if not interaction.guild or not _staff(interaction):
             await interaction.response.send_message("هذه العملية للإدارة فقط.", ephemeral=True)
